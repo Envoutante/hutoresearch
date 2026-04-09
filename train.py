@@ -41,6 +41,7 @@ TIME_BUDGET = 1200  # 20min override
 TIME_BUDGET = 1200  # 20min override
 TIME_BUDGET = 1200  # 20min override
 TIME_BUDGET = 1200  # 20min override
+TIME_BUDGET = 1200  # 20min override
 
 # ---------------------------------------------------------------------------
 # GPT Model
@@ -449,13 +450,13 @@ class MuonAdamW(torch.optim.Optimizer):
 # Model architecture
 ASPECT_RATIO = 80# model_dim = depth * ASPECT_RATIO
 HEAD_DIM = 128          # target head dimension for attention
-WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context
+WINDOW_PATTERN = 'SLSL'# sliding window pattern: L=full, S=half context
 
 # Optimization
 TOTAL_BATCH_SIZE = 2**17# ~524K tokens per optimizer step
-EMBEDDING_LR = 0.22524# learning rate for token embeddings (Adam)
+EMBEDDING_LR = 0.18019# learning rate for token embeddings (Adam)
 UNEMBEDDING_LR = 0.004  # learning rate for lm_head (Adam)
-MATRIX_LR = 0.01582# learning rate for matrix parameters (Muon)
+MATRIX_LR = 0.00949# learning rate for matrix parameters (Muon)
 SCALAR_LR = 0.5         # learning rate for per-layer scalars (Adam)
 WEIGHT_DECAY = 0.2      # cautious weight decay for Muon
 ADAM_BETAS = (0.8, 0.95) # Adam beta1, beta2
