@@ -25,22 +25,6 @@ fa3 = get_kernel(repo).flash_attn_interface
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
 TIME_BUDGET = 1200  # 20min override
-TIME_BUDGET = 1200  # 20min override
-TIME_BUDGET = 1200  # 20min override
-TIME_BUDGET = 1200  # 20min override
-TIME_BUDGET = 1200  # 20min override
-TIME_BUDGET = 1200  # 20min override
-TIME_BUDGET = 1200  # 20min override
-TIME_BUDGET = 1200  # 20min override
-TIME_BUDGET = 1200  # 20min override
-TIME_BUDGET = 1200  # 20min override
-TIME_BUDGET = 1200  # 20min override
-TIME_BUDGET = 1200  # 20min override
-TIME_BUDGET = 1200  # 20min override
-TIME_BUDGET = 1200  # 20min override
-TIME_BUDGET = 1200  # 20min override
-TIME_BUDGET = 1200  # 20min override
-TIME_BUDGET = 1200  # 20min override
 
 # ---------------------------------------------------------------------------
 # GPT Model
@@ -113,26 +97,25 @@ class CausalSelfAttention(nn.Module):
         return y
 
 
-class MLP(nn.Module):
+class SwiGLUFeedForward(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.c_fc1 = nn.Linear(config.n_embd, 2 * config.n_embd, bias=False)
-        self.c_fc2 = nn.Linear(config.n_embd, 2 * config.n_embd, bias=False)
-        self.c_proj = nn.Linear(2 * config.n_embd, config.n_embd, bias=False)
+        hidden_dim = int(config.n_embd * 2.67)
+        self.c_fc1 = nn.Linear(config.n_embd, hidden_dim, bias=False)
+        self.c_fc2 = nn.Linear(config.n_embd, hidden_dim, bias=False)
+        self.c_proj = nn.Linear(hidden_dim, config.n_embd, bias=False)
 
     def forward(self, x):
         x1 = self.c_fc1(x)
         x2 = self.c_fc2(x)
-        x = F.silu(x1) * x2
-        x = self.c_proj(x)
-        return x
+        return self.c_proj(F.silu(x1) * x2)
 
 
 class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
-        self.mlp = MLP(config)
+        self.mlp = SwiGLUFeedForward(config)
 
     def forward(self, x, ve, cos_sin, window_size):
         x = x + self.attn(norm(x), ve, cos_sin, window_size)
@@ -178,7 +161,8 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
             torch.nn.init.zeros_(block.attn.c_proj.weight)
-            torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
+            torch.nn.init.uniform_(block.mlp.c_fc1.weight, -s, s)
+            torch.nn.init.uniform_(block.mlp.c_fc2.weight, -s, s)
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
         # Per-layer scalars
         self.resid_lambdas.fill_(1.0)
@@ -449,24 +433,24 @@ class MuonAdamW(torch.optim.Optimizer):
 # ---------------------------------------------------------------------------
 
 # Model architecture
-ASPECT_RATIO = 56# model_dim = depth * ASPECT_RATIO (scaled up from 48)
+ASPECT_RATIO = 80# model_dim = depth * ASPECT_RATIO
 HEAD_DIM = 128          # target head dimension for attention
-WINDOW_PATTERN = "LLLL" # sliding window pattern: L=full, S=half context
+WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context
 
 # Optimization
 TOTAL_BATCH_SIZE = 2**17# ~524K tokens per optimizer step
-EMBEDDING_LR = 0.13514# learning rate for token embeddings (Adam) - proven optimal
+EMBEDDING_LR = 0.22524# learning rate for token embeddings (Adam)
 UNEMBEDDING_LR = 0.004  # learning rate for lm_head (Adam)
-MATRIX_LR = 0.02215# learning rate for matrix parameters (Muon)
+MATRIX_LR = 0.01582# learning rate for matrix parameters (Muon)
 SCALAR_LR = 0.5         # learning rate for per-layer scalars (Adam)
-WEIGHT_DECAY = 0.1      # cautious weight decay for Muon
+WEIGHT_DECAY = 0.1      # reduced weight decay for SwiGLU compatibility
 ADAM_BETAS = (0.8, 0.95) # Adam beta1, beta2
-WARMUP_RATIO = 0.02    # fraction of time budget for LR warmup (proper schedule)
-WARMDOWN_RATIO = 0.3    # fraction of time budget for LR warmdown
+WARMUP_RATIO = 0.0      # fraction of time budget for LR warmup
+WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown
 FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 
 # Model size
-DEPTH = 10              # number of transformer layers
+DEPTH = 10              # reduced depth for SwiGLU efficiency
 DEVICE_BATCH_SIZE = 4# per-device batch size (reduce if OOM)
 
 # ---------------------------------------------------------------------------
