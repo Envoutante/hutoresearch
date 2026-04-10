@@ -25,22 +25,6 @@ fa3 = get_kernel(repo).flash_attn_interface
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
 TIME_BUDGET = 1200  # 20min override
-TIME_BUDGET = 1200  # 20min override
-TIME_BUDGET = 1200  # 20min override
-TIME_BUDGET = 1200  # 20min override
-TIME_BUDGET = 1200  # 20min override
-TIME_BUDGET = 1200  # 20min override
-TIME_BUDGET = 1200  # 20min override
-TIME_BUDGET = 1200  # 20min override
-TIME_BUDGET = 1200  # 20min override
-TIME_BUDGET = 1200  # 20min override
-TIME_BUDGET = 1200  # 20min override
-TIME_BUDGET = 1200  # 20min override
-TIME_BUDGET = 1200  # 20min override
-TIME_BUDGET = 1200  # 20min override
-TIME_BUDGET = 1200  # 20min override
-TIME_BUDGET = 1200  # 20min override
-TIME_BUDGET = 1200  # 20min override
 
 # ---------------------------------------------------------------------------
 # GPT Model
@@ -464,7 +448,7 @@ WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown
 FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 
 # Model size
-DEPTH = 11              # number of transformer layers
+DEPTH = 16              # number of transformer layers
 DEVICE_BATCH_SIZE = 4# per-device batch size (reduce if OOM)
 
 # ---------------------------------------------------------------------------
