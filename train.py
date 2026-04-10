@@ -25,6 +25,22 @@ fa3 = get_kernel(repo).flash_attn_interface
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
 TIME_BUDGET = 1200  # 20min override
+TIME_BUDGET = 1200  # 20min override
+TIME_BUDGET = 1200  # 20min override
+TIME_BUDGET = 1200  # 20min override
+TIME_BUDGET = 1200  # 20min override
+TIME_BUDGET = 1200  # 20min override
+TIME_BUDGET = 1200  # 20min override
+TIME_BUDGET = 1200  # 20min override
+TIME_BUDGET = 1200  # 20min override
+TIME_BUDGET = 1200  # 20min override
+TIME_BUDGET = 1200  # 20min override
+TIME_BUDGET = 1200  # 20min override
+TIME_BUDGET = 1200  # 20min override
+TIME_BUDGET = 1200  # 20min override
+TIME_BUDGET = 1200  # 20min override
+TIME_BUDGET = 1200  # 20min override
+TIME_BUDGET = 1200  # 20min override
 
 # ---------------------------------------------------------------------------
 # GPT Model
@@ -100,12 +116,14 @@ class CausalSelfAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+        self.c_fc1 = nn.Linear(config.n_embd, 2 * config.n_embd, bias=False)
+        self.c_fc2 = nn.Linear(config.n_embd, 2 * config.n_embd, bias=False)
+        self.c_proj = nn.Linear(2 * config.n_embd, config.n_embd, bias=False)
 
     def forward(self, x):
-        x = self.c_fc(x)
-        x = F.relu(x).square()
+        x1 = self.c_fc1(x)
+        x2 = self.c_fc2(x)
+        x = F.silu(x1) * x2
         x = self.c_proj(x)
         return x
 
@@ -431,24 +449,24 @@ class MuonAdamW(torch.optim.Optimizer):
 # ---------------------------------------------------------------------------
 
 # Model architecture
-ASPECT_RATIO = 96 # increased from 88: model_dim = depth * ASPECT_RATIO
+ASPECT_RATIO = 48# model_dim = depth * ASPECT_RATIO
 HEAD_DIM = 128          # target head dimension for attention
-WINDOW_PATTERN = "SSSS" # key change: all short windows for faster iteration
+WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context
 
 # Optimization
 TOTAL_BATCH_SIZE = 2**17# ~524K tokens per optimizer step
-EMBEDDING_LR = 0.15# learning rate for token embeddings (Adam)
+EMBEDDING_LR = 0.22524# learning rate for token embeddings (Adam)
 UNEMBEDDING_LR = 0.004  # learning rate for lm_head (Adam)
 MATRIX_LR = 0.01582# learning rate for matrix parameters (Muon)
 SCALAR_LR = 0.5         # learning rate for per-layer scalars (Adam)
 WEIGHT_DECAY = 0.1      # cautious weight decay for Muon
 ADAM_BETAS = (0.8, 0.95) # Adam beta1, beta2
-WARMUP_RATIO = 0.05      # fraction of time budget for LR warmup
+WARMUP_RATIO = 0.0      # fraction of time budget for LR warmup
 WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown
 FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 
 # Model size
-DEPTH = 16              # number of transformer layers
+DEPTH = 10              # number of transformer layers
 DEVICE_BATCH_SIZE = 4# per-device batch size (reduce if OOM)
 
 # ---------------------------------------------------------------------------
