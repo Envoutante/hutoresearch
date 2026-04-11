@@ -437,7 +437,7 @@ class MuonAdamW(torch.optim.Optimizer):
 # ---------------------------------------------------------------------------
 
 # Model architecture
-ASPECT_RATIO = 48        # model_dim = depth * ASPECT_RATIO (48 gives 5-head at 480-dim with depth 10, proven at ar=48)
+ASPECT_RATIO = 80        # model_dim = depth * ASPECT_RATIO (80 gives 6-head at 768-dim with depth 10, matching proven nanochat dims)
 HEAD_DIM = 128           # target head dimension for attention
 WINDOW_PATTERN = "SSSL"  # sliding window pattern: L=full, S=half context
 
@@ -447,7 +447,7 @@ EMBEDDING_LR = 0.22524   # learning rate for token embeddings (Adam)
 UNEMBEDDING_LR = 0.004   # learning rate for lm_head (Adam)
 MATRIX_LR = 0.01582      # learning rate for matrix parameters (Muon)
 SCALAR_LR = 0.5          # learning rate for per-layer scalars (Adam)
-WEIGHT_DECAY = 0.02      # light weight decay with ReLU squared
+WEIGHT_DECAY = 0.0       # no weight decay (SwiGLU has good implicit regularization)
 ADAM_BETAS = (0.8, 0.95) # Adam beta1, beta2
 WARMUP_RATIO = 0.02      # light LR warmup for early training stability
 WARMDOWN_RATIO = 0.5     # fraction of time budget for LR warmdown
