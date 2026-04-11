@@ -436,7 +436,7 @@ class MuonAdamW(torch.optim.Optimizer):
 # ---------------------------------------------------------------------------
 
 # Model architecture
-ASPECT_RATIO = 48        # model_dim = depth * ASPECT_RATIO (ar=48 with depth 10 gives 512-dim, close to proven 480-dim)
+ASPECT_RATIO = 56        # model_dim = depth * ASPECT_RATIO (ar=56 with depth 12 gives 768-dim with 6 heads, divisible by 2 for GQA)
 HEAD_DIM = 128           # target head dimension for attention
 WINDOW_PATTERN = "SSSL"  # interleaved sliding window pattern: S=half context (SSSL matches best SwiGLU run dd27fe2)
 
@@ -476,9 +476,10 @@ def build_model_config(depth):
     base_dim = depth * ASPECT_RATIO
     model_dim = ((base_dim + HEAD_DIM - 1) // HEAD_DIM) * HEAD_DIM
     num_heads = model_dim // HEAD_DIM
+    num_kv_heads = 2  # GQA: 2 KV heads shared across all query heads (3:1 ratio, explored for first time)
     return GPTConfig(
         sequence_len=MAX_SEQ_LEN, vocab_size=vocab_size,
-        n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
+        n_layer=depth, n_head=num_heads, n_kv_head=num_kv_heads, n_embd=model_dim,
         window_pattern=WINDOW_PATTERN,
     )
 
