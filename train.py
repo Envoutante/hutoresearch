@@ -101,11 +101,10 @@ class CausalSelfAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        mult = 2 * 4 * config.n_embd // 3
-        mult = ((mult + 63) // 64) * 64
-        self.c_fc1 = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_fc2 = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+        hidden_dim = int(4 * config.n_embd * 2 / 3)
+        self.c_fc1 = nn.Linear(config.n_embd, hidden_dim, bias=False)
+        self.c_fc2 = nn.Linear(config.n_embd, hidden_dim, bias=False)
+        self.c_proj = nn.Linear(hidden_dim, config.n_embd, bias=False)
 
     def forward(self, x):
         x1 = self.c_fc1(x)
@@ -439,7 +438,7 @@ class MuonAdamW(torch.optim.Optimizer):
 # Model architecture
 ASPECT_RATIO = 48        # model_dim = depth * ASPECT_RATIO (ar=48 with depth 10 gives 512-dim, close to proven 480-dim)
 HEAD_DIM = 128           # target head dimension for attention
-WINDOW_PATTERN = "SLLS"  # interleaved sliding window pattern: L=full, S=half context (SLLS helps gradient flow across layers)
+WINDOW_PATTERN = "SSSL"  # interleaved sliding window pattern: S=half context (SSSL matches best SwiGLU run dd27fe2)
 
 # Optimization
 TOTAL_BATCH_SIZE = 2**17 # ~524K tokens per optimizer step
