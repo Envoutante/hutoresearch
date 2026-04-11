@@ -1,0 +1,21 @@
+{
+  "iteration": 1,
+  "git_commit": "a8dc6c3",
+  "candidate_id": "cand_001",
+  "status": "crashed",
+  "metrics": {
+    "val_bpb": null,
+    "peak_vram_mb": null,
+    "training_seconds": null,
+    "mfu_percent": null,
+    "total_tokens_M": null,
+    "num_steps": null
+  },
+  "primary_metric": null,
+  "direction": "minimize",
+  "improved": false,
+  "decision": "discard",
+  "failure_type": "runtime",
+  "next_action": "stop_early",
+  "notes": "status=crashed, failure=runtime"
+}

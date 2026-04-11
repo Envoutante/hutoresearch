@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(claude -p --help)",
+      "Bash(python autorunner/loop_runner.py --help)",
+      "Bash(python -c ':*)",
+      "Bash(python autorunner/loop_runner.py --max-iterations 1 --time-budget 60)",
+      "Bash(python -c \"from autorunner.loop_runner import run_loop; print\\('import OK'\\)\")",
+      "Bash(python -m autorunner.loop_runner --help)",
+      "Bash(ls -t /mount/disk1/rl-hyr/autoresearch/autorunner/artifacts/llm_iter*.log)",
+      "Bash(claude --version)",
+      "Bash(claude -p \"Say exactly 'hello' and nothing else\" --dangerously-skip-permissions --output-format text)",
+      "Bash(claude -p \"Say exactly 'hello'\" --dangerously-skip-permissions --output-format text --allowed-tools Bash,Edit,Write,Read --add-dir /mount/disk1/rl-hyr/autoresearch --model MiniMax-M2.7)",
+      "Bash(python -c \"print\\(open\\('/mount/disk1/rl-hyr/autoresearch/train.py'\\).read\\(\\)[:3000]\\)\")",
+      "Bash(claude -p '你是 AI 研究员。参考以下代码：__TRACKED_VAR__:*)",
+      "Read(//tmp/**)",
+      "Bash(claude -p \"optimize training\" --dangerously-skip-permissions --output-format text --model MiniMax-M2.7)",
+      "Bash(claude -p \"say hello\" --dangerously-skip-permissions --output-format text --model MiniMax-M2.7)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('/mount/disk1/rl-hyr/autoresearch/autorunner/claude_code_agent.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('/mount/disk1/rl-hyr/autoresearch/autorunner/loop_runner.py'\\).read\\(\\)\\); print\\('OK'\\)\")"
+    ]
+  }
+}
