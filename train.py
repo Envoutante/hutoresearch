@@ -119,11 +119,11 @@ class Block(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x, ve, cos_sin, window_size):
-        # Post-norm: residual connection first, then normalize
+        # Pre-norm: normalize before attention/MLP, then add residual
+        x = norm(x)
         x = x + self.attn(x, ve, cos_sin, window_size)
         x = norm(x)
         x = x + self.mlp(x)
-        x = norm(x)
         return x
 
 
