@@ -474,9 +474,11 @@ print(f"Vocab size: {vocab_size:,}")
 
 def build_model_config(depth):
     base_dim = depth * ASPECT_RATIO
-    model_dim = ((base_dim + HEAD_DIM - 1) // HEAD_DIM) * HEAD_DIM
-    num_heads = model_dim // HEAD_DIM
-    num_kv_heads = 2  # GQA: 3:1 query-to-KV ratio for better parameter efficiency
+    num_kv_heads = 2  # GQA: 2 is fixed ratio target
+    # Round num_heads DOWN to nearest multiple of num_kv_heads so the GQA assertion always passes
+    num_heads_raw = (base_dim + HEAD_DIM - 1) // HEAD_DIM
+    num_heads = (num_heads_raw // num_kv_heads) * num_kv_heads
+    model_dim = num_heads * HEAD_DIM
     return GPTConfig(
         sequence_len=MAX_SEQ_LEN, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_kv_heads, n_embd=model_dim,
