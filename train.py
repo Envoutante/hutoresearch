@@ -453,7 +453,7 @@ WARMDOWN_RATIO = 0.5     # fraction of time budget for LR warmdown
 FINAL_LR_FRAC = 0.0      # final LR as fraction of initial
 
 # Model size
-DEPTH = 10               # number of transformer layers (depth 10 with ar 48 gives 3-head 480-dim, proven in best SwiGLU run)
+DEPTH = 12               # number of transformer layers (depth 12 with ar 48 gives 640-dim, more model capacity)
 DEVICE_BATCH_SIZE = 4    # per-device batch size (reduce if OOM)
 
 # ---------------------------------------------------------------------------
