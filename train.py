@@ -436,8 +436,8 @@ class MuonAdamW(torch.optim.Optimizer):
 # ---------------------------------------------------------------------------
 
 # Model architecture
-ASPECT_RATIO = 48        # exact 640-dim: 12*48=576, rounds to 640 with head_dim=128 -> 5 heads (matches b150f33 best run)
-HEAD_DIM = 128           # target head dimension for attention
+ASPECT_RATIO = 60        # 12*60=720 base_dim -> n_embd=768 with HEAD_DIM=64 and GQA (2 KV heads)
+HEAD_DIM = 64            # 12 heads at 64-dim = 768 total; more heads than 6x128 for richer attention patterns
 WINDOW_PATTERN = "SLLS"  # interleaved sliding window pattern: SLLS gave best result 1.005098 (b150f33), better than SSSL
 
 # Optimization
