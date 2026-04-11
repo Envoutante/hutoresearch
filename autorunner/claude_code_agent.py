@@ -198,7 +198,7 @@ class ClaudeCodeAgent:
 {extra_guidance}
 
 ## 执行要求（必须遵守）
-1. 使用 Read 工具读取 train.py。
+1. 使用 Read 工具读取 train.py 和 results.tsv。
 2. 使用 Edit/Write 工具直接修改 train.py（原地修改，不新建同义副本）。
 3. 可用 Bash 工具做轻量自检（例如 python -m py_compile train.py）。
 4. 不要只在对话里返回代码块；最终结果应体现在文件系统中的 train.py 里。
@@ -206,7 +206,6 @@ class ClaudeCodeAgent:
 ## 输出要求
 请按以下格式输出，且不要粘贴整份代码：
 DESCRIPTION: <一句话描述本轮实验改动，英文，5-18词，不含制表符>
-CHECK: <是否完成语法/运行自检，若未执行请明确写未执行>
 仅使用纯文本，不要使用任何 Markdown 语法符号（例如 #、-、*、```）。
 """
         return prompt
@@ -269,7 +268,6 @@ CHECK: <是否完成语法/运行自检，若未执行请明确写未执行>
 ## 输出要求
 请按以下格式输出，且不要粘贴整份代码：
 DESCRIPTION: <一句话描述本轮实验改动，英文，5-18词，不含制表符>
-CHECK: <是否完成语法/运行自检，若未执行请明确写未执行>
 仅使用纯文本，不要使用任何 Markdown 语法符号（例如 #、-、*、```）。
 """
         return prompt
@@ -301,7 +299,6 @@ CHECK: <是否完成语法/运行自检，若未执行请明确写未执行>
 ## 输出要求
 请按以下格式输出，且不要粘贴整份代码：
 DESCRIPTION: <一句话描述修复动作，英文，5-18词，不含制表符>
-CHECK: <是否完成语法/运行自检，若未执行请明确写未执行>
 仅使用纯文本，不要使用任何 Markdown 语法符号（例如 #、-、*、```）。
 """
         return prompt

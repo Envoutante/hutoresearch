@@ -49,25 +49,32 @@ def _load_baseline() -> float | None:
     return best
 
 
-def _extract_code(content: str) -> str:
-    """从 LLM 输出中提取 train.py 代码（去除 markdown fences）"""
-    lines = content.splitlines()
-    start = 0
-    for i, line in enumerate(lines):
-        if line.strip().startswith("```"):
-            start = i + 1
-            break
-    else:
-        start = 0
+def _load_best_keep_record() -> tuple[str | None, float | None]:
+    """从 results.tsv 读取 status=keep 的最佳记录（commit, val_bpb）。"""
+    results_tsv = WORKDIR / "results.tsv"
+    if not results_tsv.exists():
+        return None, None
 
-    end = len(lines)
-    for i in range(len(lines) - 1, -1, -1):
-        if lines[i].strip() == "```":
-            end = i
-            break
+    best_commit = None
+    best_bpb = None
+    for line in results_tsv.read_text().splitlines():
+        if line.startswith("commit"):
+            continue
+        parts = line.split("\t")
+        if len(parts) < 4:
+            continue
+        status = parts[3].strip()
+        if status != "keep":
+            continue
+        try:
+            bpb = float(parts[1])
+        except ValueError:
+            continue
+        if best_bpb is None or bpb < best_bpb:
+            best_bpb = bpb
+            best_commit = parts[0].strip() or None
 
-    code = "\n".join(lines[start:end])
-    return code.strip()
+    return best_commit, best_bpb
 
 
 def _git_commit(decision: str, description: str = "") -> str:
@@ -458,6 +465,7 @@ def run_loop(
 
     no_improve_count = 0
     agent = ClaudeCodeAgent(model=MODEL, timeout_sec=600)
+    best_commit, best_bpb_record = _load_best_keep_record()
 
     if topic is None:
         topic = (
@@ -486,15 +494,49 @@ def run_loop(
 
         train_py_content = (WORKDIR / "train.py").read_text()
         run_summaries = _build_run_summaries()
-        result = agent.refine(
-            current_files={"train.py": train_py_content},
-            run_summaries=run_summaries,
-            metric_key="val_bpb",
-            metric_direction="minimize",
-            topic=topic,
-            extra_hints="基于历史结果和当前代码，选择一个最可能降低 val_bpb 的改进方向。",
-            workdir=WORKDIR,
-        )
+        if iteration == 1:
+            if best_bpb_record is not None and best_commit:
+                exp_plan = (
+                    "提出一个候选实验，使 val_bpb 优于当前最佳 "
+                    f"{best_bpb_record:.6f}。"
+                )
+                extra_guidance = (
+                    "请先使用 Read 工具阅读 results.tsv，梳理此前每次尝试的改动与效果，"
+                    "避免重复无效方向。"
+                    "历史最佳参考："
+                    f"commit={best_commit}, val_bpb={best_bpb_record:.6f}。"
+                    "可以使用 Bash 读取该版本 train.py（例如："
+                    f"git show {best_commit}:train.py），"
+                    "并基于该最佳版本与当前代码进行候选实验设计。"
+                )
+            else:
+                exp_plan = "暂无历史最佳记录，先基于当前代码提出首个候选实验。"
+                extra_guidance = (
+                    "请先使用 Read 工具阅读 results.tsv，梳理此前每次尝试的改动与效果，"
+                    "优先规避已经证明无效的方向。"
+                    "当前没有可对照的历史最佳 commit，"
+                    "请先从模型结构、训练范式或归一化策略中选择一个最有潜力的方向。"
+                )
+
+            result = agent.generate(
+                exp_plan=exp_plan,
+                topic=topic,
+                metric_key="val_bpb",
+                pkg_hint=train_py_content[:3000],
+                compute_budget=f"单轮训练时间预算：{time_budget} 秒",
+                extra_guidance=extra_guidance,
+                workdir=WORKDIR,
+            )
+        else:
+            result = agent.refine(
+                current_files={"train.py": train_py_content},
+                run_summaries=run_summaries,
+                metric_key="val_bpb",
+                metric_direction="minimize",
+                topic=topic,
+                extra_hints="基于历史结果和当前代码，选择一个最可能降低 val_bpb 的改进方向。",
+                workdir=WORKDIR,
+            )
 
         elapsed = time.monotonic() - t0
 
