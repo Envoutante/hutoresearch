@@ -101,14 +101,13 @@ class CausalSelfAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        hidden_dim = 4 * config.n_embd
+        hidden_dim = int(4 * config.n_embd)
         self.c_fc1 = nn.Linear(config.n_embd, hidden_dim, bias=False)
+        self.c_fc3 = nn.Linear(config.n_embd, hidden_dim, bias=False)
         self.c_proj = nn.Linear(hidden_dim, config.n_embd, bias=False)
 
     def forward(self, x):
-        x = self.c_fc1(x)
-        x = F.relu(x)
-        x = x * x  # ReLU squared
+        x = F.silu(self.c_fc1(x)) * self.c_fc3(x)
         x = self.c_proj(x)
         return x
 
@@ -437,7 +436,7 @@ class MuonAdamW(torch.optim.Optimizer):
 # ---------------------------------------------------------------------------
 
 # Model architecture
-ASPECT_RATIO = 48        # model_dim = depth * ASPECT_RATIO (ar=48 with depth 12 gives 640-dim, proven in c11c3d4 at 1.005664)
+ASPECT_RATIO = 52        # exact 640-dim: 12*52=624, rounds to 640 with head_dim=128 -> 5 heads
 HEAD_DIM = 128           # target head dimension for attention
 WINDOW_PATTERN = "SLLS"  # interleaved sliding window pattern: SLLS gave best result 1.005098 (b150f33), better than SSSL
 
@@ -447,7 +446,7 @@ EMBEDDING_LR = 0.22524   # learning rate for token embeddings (Adam)
 UNEMBEDDING_LR = 0.004   # learning rate for lm_head (Adam)
 MATRIX_LR = 0.01582      # learning rate for matrix parameters (Muon)
 SCALAR_LR = 0.5          # learning rate for per-layer scalars (Adam)
-WEIGHT_DECAY = 0.1       # weight decay (ar=48 + wd=0.1 was 3rd best at 0.996562)
+WEIGHT_DECAY = 0.0       # weight decay (best result b150f33=1.005098 had no weight decay)
 ADAM_BETAS = (0.8, 0.95) # Adam beta1, beta2
 WARMUP_RATIO = 0.02      # light LR warmup for early training stability
 WARMDOWN_RATIO = 0.5     # fraction of time budget for LR warmdown
@@ -557,6 +556,7 @@ while True:
         train_loss = loss.detach()
         loss = loss / grad_accum_steps
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         x, y, epoch = next(train_loader)
 
     # Progress and schedules
