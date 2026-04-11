@@ -101,13 +101,12 @@ class CausalSelfAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        hidden_dim = 4 * config.n_embd
-        self.c_fc2 = nn.Linear(config.n_embd, hidden_dim, bias=False)
-        self.c_fc1 = nn.Linear(config.n_embd, hidden_dim, bias=False)
-        self.c_proj = nn.Linear(hidden_dim, config.n_embd, bias=False)
+        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
+        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
 
     def forward(self, x):
-        x = self.c_fc2(x) * F.silu(self.c_fc1(x))
+        x = self.c_fc(x)
+        x = F.relu(x).square()
         x = self.c_proj(x)
         return x
 
@@ -119,10 +118,8 @@ class Block(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x, ve, cos_sin, window_size):
-        # Pre-Norm: normalize input to sublayer, then add residual
         x = x + self.attn(norm(x), ve, cos_sin, window_size)
-        x = norm(x)
-        x = x + self.mlp(x)
+        x = x + self.mlp(norm(x))
         return x
 
 
@@ -164,8 +161,7 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
             torch.nn.init.zeros_(block.attn.c_proj.weight)
-            torch.nn.init.uniform_(block.mlp.c_fc2.weight, -s, s)
-            torch.nn.init.uniform_(block.mlp.c_fc1.weight, -s, s)
+            torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
         # Per-layer scalars
         self.resid_lambdas.fill_(1.0)
@@ -446,7 +442,7 @@ EMBEDDING_LR = 0.22524   # learning rate for token embeddings (Adam)
 UNEMBEDDING_LR = 0.004   # learning rate for lm_head (Adam)
 MATRIX_LR = 0.01582      # learning rate for matrix parameters (Muon)
 SCALAR_LR = 0.5          # learning rate for per-layer scalars (Adam)
-WEIGHT_DECAY = 0.02      # light weight decay with SwiGLU (combining best activation with mild regularization)
+WEIGHT_DECAY = 0.02      # light weight decay with ReLU squared
 ADAM_BETAS = (0.8, 0.95) # Adam beta1, beta2
 WARMUP_RATIO = 0.02      # light LR warmup for early training stability
 WARMDOWN_RATIO = 0.5     # fraction of time budget for LR warmdown
