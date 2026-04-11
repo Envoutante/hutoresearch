@@ -135,8 +135,10 @@ class Block(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x, ve, cos_sin, window_size):
+        # Pre-Norm: normalize input to sublayer, then add residual
         x = x + self.attn(norm(x), ve, cos_sin, window_size)
-        x = x + self.mlp(norm(x))
+        x = norm(x)
+        x = x + self.mlp(x)
         return x
 
 
