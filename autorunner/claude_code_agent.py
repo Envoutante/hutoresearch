@@ -19,7 +19,7 @@ def _to_text(data: bytes | None) -> str:
 
 
 def _collect_py_files(workdir: Path) -> dict[str, str]:
-    """Read all .py files from workdir (flat, no subdirs)."""
+    """读取 workdir 下所有顶层 .py 文件（不递归子目录）。"""
     files: dict[str, str] = {}
     for pyfile in sorted(workdir.glob("*.py")):
         if pyfile.name.startswith("_"):
@@ -32,7 +32,7 @@ def _collect_py_files(workdir: Path) -> dict[str, str]:
 class CodeAgentResult:
     """ClaudeCodeAgent 的返回结果"""
     success: bool
-    content: str  # train.py 代码内容
+    content: str  # Claude CLI 的文本回复（stdout）
     rc: int  # subprocess return code
     stderr: str
     elapsed: float  # seconds
@@ -116,18 +116,16 @@ class ClaudeCodeAgent:
         error = None
         if timed_out:
             error = f"Timed out after {elapsed:.0f}s"
-        elif returncode != 0 and not files:
+        elif returncode != 0:
             error = f"Exited {returncode}: {stderr[:500]}"
 
-        # 优先从 workdir 读 train.py，否则从 stdout 提取
-        content = ""
-        if "train.py" in files:
-            content = files["train.py"]
-        elif stdout.strip():
-            content = stdout.strip()
+        # 日志内容记录 Claude 文本回复，代码改动通过 files['train.py'] 读取
+        content = stdout.strip()
+        has_train_code = bool(files.get("train.py", "").strip())
+        has_reply = bool(content)
 
         return CodeAgentResult(
-            success=(error is None and bool(content)),
+            success=(error is None and (has_train_code or has_reply)),
             content=content,
             rc=returncode,
             stderr=stderr,
@@ -199,8 +197,17 @@ class ClaudeCodeAgent:
 ## 额外指导
 {extra_guidance}
 
+## 执行要求（必须遵守）
+1. 使用 Read 工具读取 train.py。
+2. 使用 Edit/Write 工具直接修改 train.py（原地修改，不新建同义副本）。
+3. 可用 Bash 工具做轻量自检（例如 python -m py_compile train.py）。
+4. 不要只在对话里返回代码块；最终结果应体现在文件系统中的 train.py 里。
+
 ## 输出要求
-请直接输出完整的新 train.py 代码。不要解释，直接给出代码。
+请按以下格式输出，且不要粘贴整份代码：
+DESCRIPTION: <一句话描述本轮实验改动，英文，5-18词，不含制表符>
+CHECK: <是否完成语法/运行自检，若未执行请明确写未执行>
+仅使用纯文本，不要使用任何 Markdown 语法符号（例如 #、-、*、```）。
 """
         return prompt
 
@@ -253,8 +260,17 @@ class ClaudeCodeAgent:
 ## 额外提示
 {extra_hints}
 
+## 执行要求（必须遵守）
+1. 使用 Read 工具读取 train.py。
+2. 使用 Edit/Write 工具直接修改 train.py（原地修改，不新建同义副本）。
+3. 可用 Bash 工具做轻量自检（例如 python -m py_compile train.py）。
+4. 不要只在对话里返回代码块；最终结果应体现在文件系统中的 train.py 里。
+
 ## 输出要求
-请直接输出完整的新 train.py 代码。不要解释，直接给出代码。
+请按以下格式输出，且不要粘贴整份代码：
+DESCRIPTION: <一句话描述本轮实验改动，英文，5-18词，不含制表符>
+CHECK: <是否完成语法/运行自检，若未执行请明确写未执行>
+仅使用纯文本，不要使用任何 Markdown 语法符号（例如 #、-、*、```）。
 """
         return prompt
 
@@ -276,8 +292,17 @@ class ClaudeCodeAgent:
 ## 问题描述
 {issues}
 
+## 执行要求（必须遵守）
+1. 使用 Read 工具读取 train.py。
+2. 根据问题描述定位 bug，并使用 Edit/Write 工具直接修复 train.py。
+3. 可用 Bash 工具做轻量自检（例如 python -m py_compile train.py）。
+4. 不要只在对话里返回代码块；最终结果应体现在文件系统中的 train.py 里。
+
 ## 输出要求
-请直接输出修复后的完整 train.py 代码。不要解释，直接给出代码。
+请按以下格式输出，且不要粘贴整份代码：
+DESCRIPTION: <一句话描述修复动作，英文，5-18词，不含制表符>
+CHECK: <是否完成语法/运行自检，若未执行请明确写未执行>
+仅使用纯文本，不要使用任何 Markdown 语法符号（例如 #、-、*、```）。
 """
         return prompt
 

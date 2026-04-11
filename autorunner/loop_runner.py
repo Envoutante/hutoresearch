@@ -15,6 +15,7 @@ if __name__ == "__main__":
 
 from autorunner.claude_code_agent import ClaudeCodeAgent
 from autorunner.experiment_executor import ExperimentResult, run as run_experiment
+from autorunner.failure_analyzer import analyze as analyze_failure
 from autorunner.metric_judge import judge as metric_judge
 
 
@@ -95,6 +96,7 @@ def _git_commit(decision: str, description: str = "") -> str:
 
 def _write_llm_log(iteration: int, phase: str, content: str):
     """LLM 回复写入日志文件"""
+    ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
     llm_log = ARTIFACTS_DIR / f"llm_iter-{iteration:03d}_{phase}.log"
     llm_log.write_text(content)
 
@@ -139,6 +141,7 @@ def _write_iter_artifacts(
     git_commit_hash: str,
 ):
     """写入单轮产物 iter-<n>.json"""
+    ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
     entry = {
         "iteration": iteration,
         "git_commit": git_commit_hash,
@@ -176,6 +179,7 @@ def _append_history(
     git_commit_hash: str,
 ):
     """追加到 history.jsonl"""
+    ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
     history_file = ARTIFACTS_DIR / "history.jsonl"
     entry = {
         "iteration": iteration,
@@ -196,6 +200,7 @@ def _update_best_candidate(
     git_commit_hash: str,
 ):
     """更新 best_candidate.json"""
+    ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
     best_file = ARTIFACTS_DIR / "best_candidate.json"
     if exp_result.val_bpb is None:
         return
@@ -222,6 +227,7 @@ def _update_best_candidate(
 
 def _write_run_summary(stop_reason: str, best_bpb: float):
     """写入 run_summary.json"""
+    ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
     summary_file = ARTIFACTS_DIR / "run_summary.json"
     entry = {
         "stop_reason": stop_reason,
@@ -286,16 +292,144 @@ def _append_results_tsv(
     exp_result: ExperimentResult,
     decision: str,
     iteration: int,
+    description: str,
 ):
     """追加一行到 results.tsv"""
     results_tsv = WORKDIR / "results.tsv"
     val_bpb = exp_result.val_bpb if exp_result.val_bpb is not None else 0.0
     peak_vram = exp_result.peak_vram_mb if exp_result.peak_vram_mb is not None else 0.0
     status = "keep" if decision == "keep" else "discard"
-    description = f"iter {iteration}"
     line = f"{git_commit_hash}\t{val_bpb:.6f}\t{peak_vram:.1f}\t{status}\t{description}\n"
     with results_tsv.open("a") as f:
         f.write(line)
+
+
+def _extract_description_from_llm_reply(reply: str, iteration: int, prefix: str = "") -> str:
+    """从 LLM 回复中提取 DESCRIPTION 字段，失败时回退到首行文本。"""
+    fallback = f"iter {iteration}"
+    if not reply:
+        return f"{prefix}{fallback}" if prefix else fallback
+
+    picked = ""
+    for raw in reply.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        upper = line.upper()
+        if upper.startswith("DESCRIPTION:"):
+            picked = line.split(":", 1)[1].strip()
+            break
+
+    if not picked:
+        for raw in reply.splitlines():
+            line = raw.strip()
+            if not line or line.startswith("```"):
+                continue
+            picked = line.lstrip("-•* ")
+            if picked:
+                break
+
+    if not picked:
+        picked = fallback
+
+    # 清理 TSV 敏感字符，避免破坏列结构
+    picked = picked.replace("\t", " ").replace("\n", " ").replace("\r", " ")
+    picked = " ".join(picked.split())
+    if prefix:
+        picked = f"{prefix}{picked}"
+    return picked[:160]
+
+
+def _repair_once_on_failure(
+    *,
+    agent: ClaudeCodeAgent,
+    iteration: int,
+    max_iterations: int,
+    exp_result: ExperimentResult,
+    time_budget: int,
+) -> tuple[ExperimentResult, bool, str | None, str | None]:
+    """失败时进行一次修复并重跑，返回（实验结果，是否已修复，修复提交哈希）。"""
+    # 仅对可修复失败（依赖/运行时）触发重试，避免 timeout/数值异常死循环
+    analysis = analyze_failure(exp_result.failure_type or "runtime", exp_result.log_tail)
+    if not analysis.should_retry:
+        return exp_result, False, None, None
+
+    _print_progress(iteration, max_iterations, "LLM (repair)", "start")
+    t0 = time.monotonic()
+
+    current_code = (WORKDIR / "train.py").read_text()
+    issues = (
+        f"failure_type: {analysis.failure_type}\n"
+        f"repair_strategy: {analysis.repair_strategy}\n\n"
+        "错误日志尾部（最多 50 行）：\n"
+        f"{exp_result.log_tail}"
+    )
+    repair_result = agent.repair(
+        files={"train.py": current_code},
+        issues=issues,
+        workdir=WORKDIR,
+    )
+
+    elapsed = time.monotonic() - t0
+    _write_llm_log(iteration, "repair", repair_result.content)
+
+    if not repair_result.success:
+        _print_progress(
+            iteration,
+            max_iterations,
+            "LLM (repair)",
+            "fail",
+            f"({elapsed:.1f}s) rc={repair_result.rc}",
+        )
+        return exp_result, False, None, None
+
+    # 仅接受 Claude 在工作区原地修改后的 train.py
+    repaired_code = repair_result.files.get("train.py", "").strip()
+    if not repaired_code:
+        _print_progress(
+            iteration,
+            max_iterations,
+            "LLM (repair)",
+            "fail",
+            "(train.py not updated)",
+        )
+        return exp_result, False, None, None
+
+    if repaired_code == current_code:
+        _print_progress(
+            iteration,
+            max_iterations,
+            "LLM (repair)",
+            "skip",
+            "(no code change)",
+        )
+        return exp_result, False, None, None
+
+    (WORKDIR / "train.py").write_text(repaired_code)
+    repair_git_hash = _git_commit("repair", f"iteration {iteration}")
+    _print_progress(iteration, max_iterations, "LLM (repair)", "done", f"({elapsed:.1f}s)")
+
+    # 修复后只重跑一次，若仍失败则放弃本轮
+    _print_progress(iteration, max_iterations, "Run experiment (after repair)", "start")
+    rerun_result = run_experiment(
+        train_py_path=WORKDIR / "train.py",
+        time_budget=time_budget,
+    )
+    runtime_min = rerun_result.runtime_seconds / 60
+    _print_progress(
+        iteration,
+        max_iterations,
+        "Run experiment (after repair)",
+        "done",
+        f"({runtime_min:.1f}m)",
+    )
+
+    repair_desc = _extract_description_from_llm_reply(
+        repair_result.content,
+        iteration=iteration,
+        prefix="repair: ",
+    )
+    return rerun_result, True, repair_git_hash or None, repair_desc
 
 
 def run_loop(
@@ -366,6 +500,10 @@ def run_loop(
 
         # 写 LLM 回复日志
         _write_llm_log(iteration, phase, result.content)
+        tsv_description = _extract_description_from_llm_reply(
+            result.content,
+            iteration=iteration,
+        )
 
         if not result.success:
             _print_progress(
@@ -382,10 +520,10 @@ def run_loop(
             iteration, max_iterations, f"LLM ({phase})", "done", f"({elapsed:.1f}s)"
         )
 
-        # === 提取并写入 train.py ===
-        new_code = _extract_code(result.content)
+        # === 仅接受工作区文件结果，不再解析对话文本代码 ===
+        new_code = result.files.get("train.py", "").strip()
         if not new_code:
-            print(f"       WARNING: Could not extract code from LLM output")
+            print(f"       WARNING: train.py was not updated by file tools")
             continue
 
         (WORKDIR / "train.py").write_text(new_code)
@@ -407,6 +545,22 @@ def run_loop(
             iteration, max_iterations, "Run experiment", "done", f"({runtime_min:.1f}m)"
         )
 
+        # 失败后给一次“诊断+修复+重跑”的机会，避免直接丢弃可修复的实验
+        if exp_result.status != "completed":
+            repaired_result, repaired, repair_git_hash, repair_desc = _repair_once_on_failure(
+                agent=agent,
+                iteration=iteration,
+                max_iterations=max_iterations,
+                exp_result=exp_result,
+                time_budget=time_budget,
+            )
+            if repaired:
+                exp_result = repaired_result
+                if repair_git_hash:
+                    git_hash = repair_git_hash
+                if repair_desc:
+                    tsv_description = repair_desc
+
         # === 判定 ===
         if exp_result.status == "completed" and exp_result.val_bpb is not None:
             improved, decision = metric_judge(baseline_bpb, exp_result.val_bpb)
@@ -416,10 +570,15 @@ def run_loop(
         else:
             improved = False
             decision = "discard"
-            no_improve_count += 1
 
         # === 追加 results.tsv ===
-        _append_results_tsv(git_hash, exp_result, decision, iteration)
+        _append_results_tsv(
+            git_commit_hash=git_hash,
+            exp_result=exp_result,
+            decision=decision,
+            iteration=iteration,
+            description=tsv_description,
+        )
 
         if improved:
             no_improve_count = 0

@@ -6,6 +6,8 @@ import re
 import subprocess
 import threading
 import time
+import os
+import signal
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -132,16 +134,33 @@ def run(
         killed.wait(timeout=time_budget)
         if not killed.is_set():
             timed_out = True
-            process.kill()
+            # uv 可能会再派生 python 子进程；超时时需要杀整个进程组
+            try:
+                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+            except ProcessLookupError:
+                return
+            except Exception:
+                # 兜底：至少确保父进程被终止
+                process.kill()
 
     with run_log_path.open("w", buffering=1) as log_file:
+        # 强制 Python 子进程无缓冲输出，避免 run.log 长时间为空
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+
         process = subprocess.Popen(
-            ["uv", "run", "train.py"],
+            ["uv", "run", "python", "-u", "train.py"],
             cwd=train_py_path.parent,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            bufsize=1,
+            env=env,
+            start_new_session=True,
         )
+
+        # 在“Run experiment”下一行打印当前实验进程 PID，便于排障
+        print(f"       pid: {process.pid}")
 
         killer = threading.Thread(target=kill_after_timeout, daemon=True)
         killer.start()
