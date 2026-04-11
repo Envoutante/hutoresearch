@@ -25,23 +25,7 @@ repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/fl
 fa3 = get_kernel(repo).flash_attn_interface
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
-TIME_BUDGET = 1200  # 20min override
-TIME_BUDGET = 1200  # 20min override
-TIME_BUDGET = 1200  # 20min override
-TIME_BUDGET = 1200  # 20min override
-TIME_BUDGET = 1200  # 20min override
-TIME_BUDGET = 1200  # 20min override
-TIME_BUDGET = 1200  # 20min override
-TIME_BUDGET = 1200  # 20min override
-TIME_BUDGET = 1200  # 20min override
-TIME_BUDGET = 1200  # 20min override
-TIME_BUDGET = 1200  # 20min override
-TIME_BUDGET = 1200  # 20min override
-TIME_BUDGET = 1200  # 20min override
-TIME_BUDGET = 1200  # 20min override
-TIME_BUDGET = 1200  # 20min override
-TIME_BUDGET = 1200  # 20min override
-TIME_BUDGET = 1200  # 20min override
+TIME_BUDGET = 30  # 30s
 
 # ---------------------------------------------------------------------------
 # GPT Model
@@ -452,7 +436,7 @@ class MuonAdamW(torch.optim.Optimizer):
 # ---------------------------------------------------------------------------
 
 # Model architecture
-ASPECT_RATIO = 48# model_dim = depth * ASPECT_RATIO
+ASPECT_RATIO = 64# model_dim = depth * ASPECT_RATIO (increased from 48 for depth=12 to get clean 6-head config)
 HEAD_DIM = 128          # target head dimension for attention
 WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context
 
@@ -469,7 +453,7 @@ WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown
 FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 
 # Model size
-DEPTH = 10              # number of transformer layers (depth=10 performed best in experiments)
+DEPTH = 12              # number of transformer layers (increased from 10 for more capacity)
 DEVICE_BATCH_SIZE = 4# per-device batch size (reduce if OOM)
 
 # ---------------------------------------------------------------------------
