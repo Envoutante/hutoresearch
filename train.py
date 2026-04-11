@@ -101,7 +101,7 @@ class CausalSelfAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        hidden_dim = int(4 * config.n_embd)
+        hidden_dim = int(4 * config.n_embd * 2 / 3)
         self.c_fc1 = nn.Linear(config.n_embd, hidden_dim, bias=False)
         self.c_fc3 = nn.Linear(config.n_embd, hidden_dim, bias=False)
         self.c_proj = nn.Linear(hidden_dim, config.n_embd, bias=False)
@@ -476,7 +476,7 @@ def build_model_config(depth):
     base_dim = depth * ASPECT_RATIO
     model_dim = ((base_dim + HEAD_DIM - 1) // HEAD_DIM) * HEAD_DIM
     num_heads = model_dim // HEAD_DIM
-    num_kv_heads = num_heads  # No GQA: matches best-performing configurations (b150f33, c11c3d4)
+    num_kv_heads = 2  # GQA: 3:1 query-to-KV ratio for better parameter efficiency
     return GPTConfig(
         sequence_len=MAX_SEQ_LEN, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_kv_heads, n_embd=model_dim,
