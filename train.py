@@ -103,9 +103,9 @@ class MLP(nn.Module):
         super().__init__()
         mult = 2 * 4 * config.n_embd // 3
         mult = ((mult + 63) // 64) * 64
-        self.c_fc1 = nn.Linear(config.n_embd, mult, bias=False)
+        self.c_fc1 = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
         self.c_fc2 = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj = nn.Linear(mult, config.n_embd, bias=False)
+        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
 
     def forward(self, x):
         x1 = self.c_fc1(x)
