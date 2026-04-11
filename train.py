@@ -103,13 +103,12 @@ class MLP(nn.Module):
         super().__init__()
         hidden_dim = 4 * config.n_embd
         self.c_fc1 = nn.Linear(config.n_embd, hidden_dim, bias=False)
-        self.c_fc2 = nn.Linear(config.n_embd, hidden_dim, bias=False)
         self.c_proj = nn.Linear(hidden_dim, config.n_embd, bias=False)
 
     def forward(self, x):
-        x1 = self.c_fc1(x)
-        x2 = self.c_fc2(x)
-        x = F.silu(x1) * x2
+        x = self.c_fc1(x)
+        x = F.relu(x)
+        x = x * x  # ReLU squared
         x = self.c_proj(x)
         return x
 
@@ -121,8 +120,11 @@ class Block(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x, ve, cos_sin, window_size):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size)
-        x = x + self.mlp(norm(x))
+        # Post-norm: residual connection first, then normalize
+        x = x + self.attn(x, ve, cos_sin, window_size)
+        x = norm(x)
+        x = x + self.mlp(x)
+        x = norm(x)
         return x
 
 
@@ -165,7 +167,6 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
             torch.nn.init.zeros_(block.attn.c_proj.weight)
             torch.nn.init.uniform_(block.mlp.c_fc1.weight, -s, s)
-            torch.nn.init.uniform_(block.mlp.c_fc2.weight, -s, s)
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
         # Per-layer scalars
         self.resid_lambdas.fill_(1.0)
@@ -438,7 +439,7 @@ class MuonAdamW(torch.optim.Optimizer):
 # Model architecture
 ASPECT_RATIO = 56        # model_dim = depth * ASPECT_RATIO (ar=56 with depth 12 gives 768-dim with 6 heads, divisible by 2 for GQA)
 HEAD_DIM = 128           # target head dimension for attention
-WINDOW_PATTERN = "SSSL"  # interleaved sliding window pattern: S=half context (SSSL matches best SwiGLU run dd27fe2)
+WINDOW_PATTERN = "SLLS"  # interleaved sliding window pattern: SLLS gave best result 1.005098 (b150f33), better than SSSL
 
 # Optimization
 TOTAL_BATCH_SIZE = 2**17 # ~524K tokens per optimizer step
