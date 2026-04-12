@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import re
 from pathlib import Path
 from typing import Any
 
@@ -113,50 +112,3 @@ def format_lessons_for_prompt(lessons: list[dict[str, Any]]) -> str:
         lines.append(f"- [{l['lesson_type']}] {l['text']}")
 
     return "\n".join(lines)
-
-
-def extract_lessons_from_history() -> list[dict[str, Any]]:
-    """
-    从 history.jsonl 中提取所有 lessons（兼容旧数据）。
-    """
-    history_file = ARTIFACTS_DIR / "history.jsonl"
-    if not history_file.exists():
-        return []
-
-    lessons = []
-    seen_types = set()
-
-    for line in history_file.read_text().splitlines():
-        if not line.strip():
-            continue
-        try:
-            entry = json.loads(line)
-            failure = entry.get("failure_type", "none")
-            status = entry.get("decision", "discard")
-
-            if status == "keep":
-                notes = f"kept, val_bpb={entry.get('primary_metric')}"
-            elif failure != "none":
-                notes = f"{failure} failure"
-            else:
-                notes = f"discarded, val_bpb={entry.get('primary_metric')}"
-
-            lesson_type = _extract_lesson_type(notes)
-
-            # 去重：同一类型只保留最新的
-            if lesson_type not in seen_types or status == "keep":
-                lessons.append({
-                    "iteration": entry.get("iteration", 0),
-                    "lesson_type": lesson_type,
-                    "text": f"iter{entry.get('iteration', '?')}: {notes}",
-                    "decision": status,
-                    "val_bpb": entry.get("primary_metric"),
-                    "improved": entry.get("improved", False),
-                })
-                if status == "keep":
-                    seen_types.add(lesson_type)
-
-        except json.JSONDecodeError:
-            continue
-
-    return lessons[-10:]

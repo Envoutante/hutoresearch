@@ -146,6 +146,7 @@ def _write_iter_artifacts(
     improved: bool,
     decision: str,
     git_commit_hash: str,
+    description: str,
 ):
     """写入单轮产物 iter-<n>.json"""
     ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -172,33 +173,10 @@ def _write_iter_artifacts(
             if improved
             else "stop_early" if decision == "discard" else "retry_with_fix"
         ),
-        "notes": f"status={exp_result.status}, failure={exp_result.failure_type}",
+        "notes": description,
     }
     iter_file = ARTIFACTS_DIR / f"iter-{iteration:03d}.json"
     iter_file.write_text(json.dumps(entry, indent=2))
-
-
-def _append_history(
-    iteration: int,
-    exp_result: ExperimentResult,
-    improved: bool,
-    decision: str,
-    git_commit_hash: str,
-):
-    """追加到 history.jsonl"""
-    ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
-    history_file = ARTIFACTS_DIR / "history.jsonl"
-    entry = {
-        "iteration": iteration,
-        "git_commit": git_commit_hash,
-        "primary_metric": exp_result.val_bpb,
-        "improved": improved,
-        "decision": decision,
-        "failure_type": exp_result.failure_type,
-        "notes": f"status={exp_result.status}",
-    }
-    with history_file.open("a") as f:
-        f.write(json.dumps(entry) + "\n")
 
 
 def _update_best_candidate(
@@ -244,56 +222,6 @@ def _write_run_summary(stop_reason: str, best_bpb: float):
     summary_file.write_text(json.dumps(entry, indent=2))
 
 
-def _sync_history_from_results_tsv():
-    """把 results.tsv 中的历史记录同步到 history.jsonl（按 commit 去重）"""
-    results_tsv = WORKDIR / "results.tsv"
-    history_file = ARTIFACTS_DIR / "history.jsonl"
-    if not results_tsv.exists():
-        return
-
-    # 已有 history.jsonl 中的 commit 集合
-    existing_commits = set()
-    if history_file.exists():
-        for line in history_file.read_text().splitlines():
-            if not line.strip():
-                continue
-            try:
-                entry = json.loads(line)
-                existing_commits.add(entry.get("git_commit", ""))
-            except json.JSONDecodeError:
-                continue
-
-    # 逐行读 results.tsv，追加不在 existing_commits 中的记录
-    history_lines = []
-    for line in results_tsv.read_text().splitlines():
-        if line.startswith("commit"):
-            continue
-        parts = line.split("\t")
-        if len(parts) < 5:
-            continue
-        commit = parts[0].strip()
-        if commit in existing_commits:
-            continue
-        try:
-            val_bpb = float(parts[1])
-        except ValueError:
-            val_bpb = None
-        status = parts[3].strip()
-        description = parts[4].strip()
-        entry = {
-            "git_commit": commit,
-            "primary_metric": val_bpb,
-            "decision": "keep" if status == "keep" else "discard",
-            "notes": f"from results.tsv: {description}",
-        }
-        history_lines.append(json.dumps(entry))
-
-    if history_lines:
-        with history_file.open("a") as f:
-            for line in history_lines:
-                f.write(line + "\n")
-
-
 def _append_results_tsv(
     git_commit_hash: str,
     exp_result: ExperimentResult,
@@ -304,9 +232,10 @@ def _append_results_tsv(
     """追加一行到 results.tsv"""
     results_tsv = WORKDIR / "results.tsv"
     val_bpb = exp_result.val_bpb if exp_result.val_bpb is not None else 0.0
-    peak_vram = exp_result.peak_vram_mb if exp_result.peak_vram_mb is not None else 0.0
+    peak_vram_mb = exp_result.peak_vram_mb if exp_result.peak_vram_mb is not None else 0.0
+    memory_gb = peak_vram_mb / 1024.0
     status = "keep" if decision == "keep" else "discard"
-    line = f"{git_commit_hash}\t{val_bpb:.6f}\t{peak_vram:.1f}\t{status}\t{description}\n"
+    line = f"{git_commit_hash}\t{val_bpb:.6f}\t{memory_gb:.1f}\t{status}\t{description}\n"
     with results_tsv.open("a") as f:
         f.write(line)
 
@@ -482,9 +411,6 @@ def run_loop(
     )
     print("─" * 50)
 
-    # 把 results.tsv 中的历史记录同步到 history.jsonl（去重）
-    _sync_history_from_results_tsv()
-
     for iteration in range(1, max_iterations + 1):
         phase = "generate" if iteration == 1 else "refine"
 
@@ -628,8 +554,14 @@ def run_loop(
             no_improve_count += 1
 
         # === 落盘产物 ===
-        _write_iter_artifacts(iteration, exp_result, improved, decision, git_hash)
-        _append_history(iteration, exp_result, improved, decision, git_hash)
+        _write_iter_artifacts(
+            iteration,
+            exp_result,
+            improved,
+            decision,
+            git_hash,
+            tsv_description,
+        )
         _update_best_candidate(iteration, exp_result, git_hash)
 
         # === 打印结果行 ===
