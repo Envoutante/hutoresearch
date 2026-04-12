@@ -436,9 +436,9 @@ class MuonAdamW(torch.optim.Optimizer):
 # ---------------------------------------------------------------------------
 
 # Model architecture
-ASPECT_RATIO = 60        # 12*60=720 base_dim -> n_embd=768 with HEAD_DIM=64 and GQA (2 KV heads)
+ASPECT_RATIO = 48        # 10*48=480 -> n_embd=512 (8 heads * 64), matches best run dd27fe2
 HEAD_DIM = 64            # 12 heads at 64-dim = 768 total; more heads than 6x128 for richer attention patterns
-WINDOW_PATTERN = "SLLS"  # interleaved sliding window pattern: SLLS gave best result 1.005098 (b150f33), better than SSSL
+WINDOW_PATTERN = "SSSL"  # interleaved sliding window pattern: best result 0.989 (dd27fe2) used SSSL
 
 # Optimization
 TOTAL_BATCH_SIZE = 2**17 # ~524K tokens per optimizer step
@@ -446,14 +446,14 @@ EMBEDDING_LR = 0.22524   # learning rate for token embeddings (Adam)
 UNEMBEDDING_LR = 0.004   # learning rate for lm_head (Adam)
 MATRIX_LR = 0.01582      # learning rate for matrix parameters (Muon)
 SCALAR_LR = 0.5          # learning rate for per-layer scalars (Adam)
-WEIGHT_DECAY = 0.0       # weight decay (best result b150f33=1.005098 had no weight decay)
+WEIGHT_DECAY = 0.1       # weight decay (best result dd27fe2=0.989 had wd=0.1)
 ADAM_BETAS = (0.8, 0.95) # Adam beta1, beta2
 WARMUP_RATIO = 0.02      # light LR warmup for early training stability
 WARMDOWN_RATIO = 0.5     # fraction of time budget for LR warmdown
 FINAL_LR_FRAC = 0.0      # final LR as fraction of initial
 
 # Model size
-DEPTH = 12               # number of transformer layers (depth 12 with ar 48 gives 640-dim, more model capacity)
+DEPTH = 10               # number of transformer layers (depth 10 with ar 48 gives 512-dim, matches best dd27fe2)
 DEVICE_BATCH_SIZE = 4    # per-device batch size (reduce if OOM)
 
 # ---------------------------------------------------------------------------
@@ -474,7 +474,7 @@ print(f"Vocab size: {vocab_size:,}")
 
 def build_model_config(depth):
     base_dim = depth * ASPECT_RATIO
-    num_kv_heads = 4  # GQA: 4 KV heads (3:1 Q/KV ratio vs prior 6:1, closer to best commit's 1:1 MHA)
+    num_kv_heads = 2  # GQA: 2 KV heads, matching best run dd27fe2
     # Round num_heads DOWN to nearest multiple of num_kv_heads so the GQA assertion always passes
     num_heads_raw = (base_dim + HEAD_DIM - 1) // HEAD_DIM
     num_heads = (num_heads_raw // num_kv_heads) * num_kv_heads
