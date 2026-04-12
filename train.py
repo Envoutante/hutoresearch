@@ -101,13 +101,14 @@ class CausalSelfAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        hidden_dim = int(4 * config.n_embd)
+        # SwiGLU: int(4 * n_embd * 2/3) hidden dim (proven in best run dd27fe2 with val_bpb=0.989)
+        hidden_dim = int(4 * config.n_embd * 2 / 3)
         self.c_fc1 = nn.Linear(config.n_embd, hidden_dim, bias=False)
-        self.c_fc3 = nn.Linear(config.n_embd, hidden_dim, bias=False)
+        self.c_fc2 = nn.Linear(config.n_embd, hidden_dim, bias=False)
         self.c_proj = nn.Linear(hidden_dim, config.n_embd, bias=False)
 
     def forward(self, x):
-        x = F.silu(self.c_fc1(x)) * self.c_fc3(x)
+        x = F.silu(self.c_fc1(x)) * self.c_fc2(x)
         x = self.c_proj(x)
         return x
 
@@ -166,6 +167,7 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
             torch.nn.init.zeros_(block.attn.c_proj.weight)
             torch.nn.init.uniform_(block.mlp.c_fc1.weight, -s, s)
+            torch.nn.init.uniform_(block.mlp.c_fc2.weight, -s, s)
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
         # Per-layer scalars
         self.resid_lambdas.fill_(1.0)
@@ -436,7 +438,7 @@ class MuonAdamW(torch.optim.Optimizer):
 # ---------------------------------------------------------------------------
 
 # Model architecture
-ASPECT_RATIO = 80        # 10*80=800 -> n_embd=768 (12 heads * 64), matching best-run dd27fe2 model capacity with MLP=3072 for stronger SwiGLU
+ASPECT_RATIO = 80        # 10*80=800 -> n_embd=768 (12 heads * 64), with MLP=int(8/3*768)=2048 (SwiGLU best-run dd27fe2 used MLP=2048 not 3072)
 HEAD_DIM = 64            # 12 heads at 64-dim = 768 total; more heads than 6x128 for richer attention patterns
 WINDOW_PATTERN = "SSSL"  # interleaved sliding window pattern: best result 0.989 (dd27fe2) used SSSL
 
