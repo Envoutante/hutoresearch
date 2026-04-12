@@ -438,8 +438,8 @@ class MuonAdamW(torch.optim.Optimizer):
 # ---------------------------------------------------------------------------
 
 # Model architecture
-ASPECT_RATIO = 80        # 10*80=800 -> n_embd=768 (12 heads * 64), with MLP=int(8/3*768)=2048 (SwiGLU best-run dd27fe2 used MLP=2048 not 3072)
-HEAD_DIM = 64            # 12 heads at 64-dim = 768 total; more heads than 6x128 for richer attention patterns
+ASPECT_RATIO = 72        # 10*72=720 -> n_embd=720 (10 heads * 72), lower ASPECT_RATIO matched best val_bpb in dd27fe2 (0.989)
+HEAD_DIM = 72            # 10 heads at 72-dim = 720 total; co-designed with ASPECT_RATIO=72 for clean divisibility
 WINDOW_PATTERN = "SSSL"  # interleaved sliding window pattern: best result 0.989 (dd27fe2) used SSSL
 
 # Optimization
