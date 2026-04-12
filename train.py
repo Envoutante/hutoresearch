@@ -139,6 +139,7 @@ class GPT(nn.Module):
         })
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # Weight tying: share input embedding and output head weights
+        del self.lm_head.weight  # remove registered param before re-assigning
         self.lm_head.weight = self.transformer.wte.weight
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
         self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))
