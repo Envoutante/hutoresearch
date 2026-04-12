@@ -448,12 +448,12 @@ MATRIX_LR = 0.01582      # learning rate for matrix parameters (Muon)
 SCALAR_LR = 0.5          # learning rate for per-layer scalars (Adam)
 WEIGHT_DECAY = 0.1       # weight decay (best result dd27fe2=0.989 had wd=0.1)
 ADAM_BETAS = (0.8, 0.95) # Adam beta1, beta2
-WARMUP_RATIO = 0.02      # light LR warmup for early training stability
+WARMUP_RATIO = 0.05      # longer LR warmup for more stable early training
 WARMDOWN_RATIO = 0.5     # fraction of time budget for LR warmdown
 FINAL_LR_FRAC = 0.0      # final LR as fraction of initial
 
 # Model size
-DEPTH = 10               # number of transformer layers (depth 10 with ar 48 gives 512-dim, matches best dd27fe2)
+DEPTH = 12               # number of transformer layers (matching best run dd27fe2)
 DEVICE_BATCH_SIZE = 4    # per-device batch size (reduce if OOM)
 
 # ---------------------------------------------------------------------------
@@ -474,7 +474,7 @@ print(f"Vocab size: {vocab_size:,}")
 
 def build_model_config(depth):
     base_dim = depth * ASPECT_RATIO
-    num_kv_heads = 2  # GQA: 2 KV heads, matching best run dd27fe2
+    num_kv_heads = 2  # GQA: 2 KV heads for higher KV capacity per head (proven in best run dd27fe2)
     # Round num_heads DOWN to nearest multiple of num_kv_heads so the GQA assertion always passes
     num_heads_raw = (base_dim + HEAD_DIM - 1) // HEAD_DIM
     num_heads = (num_heads_raw // num_kv_heads) * num_kv_heads
