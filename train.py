@@ -444,8 +444,8 @@ class MuonAdamW(torch.optim.Optimizer):
 # ---------------------------------------------------------------------------
 
 # Model architecture
-ASPECT_RATIO = 64        # 10*60=600 -> n_embd=600 (10 heads * 60), stepping toward proven-best n_embd=640
-HEAD_DIM = 60            # 10 heads at 60-dim = 600 total; balanced head count and dimension
+ASPECT_RATIO = 64        # n_embd=640 (10 heads * 64) matching best-performing architecture
+HEAD_DIM = 64            # 10 heads at 64-dim = 640 total; proven-best configuration
 WINDOW_PATTERN = "SSSL"  # interleaved sliding window pattern
 
 # Optimization
