@@ -256,11 +256,8 @@ class GPT(nn.Module):
         x0_params = [self.x0_lambdas]
         # Check: all model parameters are assigned to a param group (resid_lambdas and x0_lambdas
         # are already included in self.parameters() and are assigned via resid_params/x0_params)
-        # ve_gate parameters are in transformer.h.parameters() so we must subtract them from value_embeds_params
-        num_ve_layers = len(self.value_embeds)
-        ve_gate_params = num_ve_layers  # one ve_gate Linear weight per ve layer
         expected = (len(matrix_params) + len(embedding_params) + len(value_embeds_params)
-                    - 1 - ve_gate_params + len(resid_params) + len(x0_params))
+                    - 1 + len(resid_params) + len(x0_params))
         assert len(list(self.parameters())) == expected, f"Expected {expected} but got {len(list(self.parameters()))}"
         # Scale LR ∝ 1/√dmodel (tuned at 768 dim)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
