@@ -444,9 +444,9 @@ class MuonAdamW(torch.optim.Optimizer):
 # ---------------------------------------------------------------------------
 
 # Model architecture
-ASPECT_RATIO = 48        # 8*60=480 -> n_embd=480 (8 heads * 60), matching best-run dd27fe2 config
-HEAD_DIM = 60            # 8 heads at 60-dim = 480 total; best val_bpb=0.989 used this dimension
-WINDOW_PATTERN = "SSSL"  # interleaved sliding window pattern: best result 0.989 (dd27fe2) used SSSL
+ASPECT_RATIO = 64        # 10*60=600 -> n_embd=600 (10 heads * 60), stepping toward proven-best n_embd=640
+HEAD_DIM = 60            # 10 heads at 60-dim = 600 total; balanced head count and dimension
+WINDOW_PATTERN = "SSSL"  # interleaved sliding window pattern
 
 # Optimization
 TOTAL_BATCH_SIZE = 2**17 # ~524K tokens per optimizer step
