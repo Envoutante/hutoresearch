@@ -438,8 +438,8 @@ class MuonAdamW(torch.optim.Optimizer):
 # ---------------------------------------------------------------------------
 
 # Model architecture
-ASPECT_RATIO = 72        # 10*72=720 -> n_embd=720 (10 heads * 72), lower ASPECT_RATIO matched best val_bpb in dd27fe2 (0.989)
-HEAD_DIM = 72            # 10 heads at 72-dim = 720 total; co-designed with ASPECT_RATIO=72 for clean divisibility
+ASPECT_RATIO = 64        # 10*64=640 -> n_embd=640 (10 heads * 64), smaller clean dims for better generalization
+HEAD_DIM = 64            # 10 heads at 64-dim = 640 total; HEAD_DIM=64 is standard and matches best-run RoPE design
 WINDOW_PATTERN = "SSSL"  # interleaved sliding window pattern: best result 0.989 (dd27fe2) used SSSL
 
 # Optimization
