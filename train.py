@@ -436,7 +436,7 @@ class MuonAdamW(torch.optim.Optimizer):
 # ---------------------------------------------------------------------------
 
 # Model architecture
-ASPECT_RATIO = 64        # 10*64=640 -> n_embd=640 (10 heads * 64), wider MLP with hidden_dim=2560 for stronger SwiGLU
+ASPECT_RATIO = 80        # 10*80=800 -> n_embd=768 (12 heads * 64), matching best-run dd27fe2 model capacity with MLP=3072 for stronger SwiGLU
 HEAD_DIM = 64            # 12 heads at 64-dim = 768 total; more heads than 6x128 for richer attention patterns
 WINDOW_PATTERN = "SSSL"  # interleaved sliding window pattern: best result 0.989 (dd27fe2) used SSSL
 
