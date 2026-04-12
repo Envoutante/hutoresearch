@@ -474,7 +474,7 @@ print(f"Vocab size: {vocab_size:,}")
 
 def build_model_config(depth):
     base_dim = depth * ASPECT_RATIO
-    num_kv_heads = 2  # GQA: 2 is fixed ratio target
+    num_kv_heads = 4  # GQA: 4 KV heads (3:1 Q/KV ratio vs prior 6:1, closer to best commit's 1:1 MHA)
     # Round num_heads DOWN to nearest multiple of num_kv_heads so the GQA assertion always passes
     num_heads_raw = (base_dim + HEAD_DIM - 1) // HEAD_DIM
     num_heads = (num_heads_raw // num_kv_heads) * num_kv_heads
