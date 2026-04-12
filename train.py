@@ -258,7 +258,25 @@ class GPT(nn.Module):
         all_param_group_params = (matrix_params + embedding_params + value_embeds_params
                                   + resid_params + x0_params)
         expected = len(all_param_group_params)
-        assert len(list(self.parameters())) == expected, f"Expected {expected} but got {len(list(self.parameters()))}"
+        actual_params = list(self.parameters())
+        if len(actual_params) != expected:
+            actual_set = set(id(p) for p in actual_params)
+            expected_set = set(id(p) for p in all_param_group_params)
+            extra = [p for p in actual_params if id(p) not in expected_set]
+            missing = [p for p in all_param_group_params if id(p) not in actual_set]
+            print(f"DEBUG: Expected {expected}, got {len(actual_params)}")
+            print(f"DEBUG: Extra params: {len(extra)}")
+            for p in extra:
+                # Find which module owns this parameter
+                for mod_name, mod in self.named_modules():
+                    for param_name, param in mod.named_parameters(recurse=False):
+                        if param is p:
+                            print(f"  Extra: module={mod_name}.{param_name}, shape={p.shape}")
+                            break
+            print(f"DEBUG: Missing params: {len(missing)}")
+            for p in missing:
+                print(f"  Missing: shape={p.shape}")
+        assert len(actual_params) == expected, f"Expected {expected} but got {len(actual_params)}"
         # Scale LR ∝ 1/√dmodel (tuned at 768 dim)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         print(f"Scaling AdamW LRs by 1/sqrt({model_dim}/768) = {dmodel_lr_scale:.6f}")
@@ -456,7 +474,7 @@ MATRIX_LR = 0.01582      # learning rate for matrix parameters (Muon)
 SCALAR_LR = 0.5          # learning rate for per-layer scalars (Adam)
 WEIGHT_DECAY = 0.1       # weight decay (best result dd27fe2=0.989 had wd=0.1)
 ADAM_BETAS = (0.8, 0.95) # Adam beta1, beta2
-WARMUP_RATIO = 0.05      # longer LR warmup for more stable early training
+WARMUP_RATIO = 0.15      # longer LR warmup for more stable early training
 WARMDOWN_RATIO = 0.5     # fraction of time budget for LR warmdown
 FINAL_LR_FRAC = 0.0      # final LR as fraction of initial
 
