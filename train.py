@@ -252,9 +252,10 @@ class GPT(nn.Module):
         # lm_head is tied to wte, so no separate params
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
-        # Check: total params = matrix + embedding (wte tied to lm_head) + value_embeds + resid + x0
-        expected = len(matrix_params) + len(embedding_params) + len(value_embeds_params) + len(resid_params) + len(x0_params)
-        assert len(list(self.parameters())) == expected, f"Expected {expected} but got {len(list(self.parameters()))}"
+        # Check: all model parameters are assigned to a param group (resid_lambdas and x0_lambdas
+        # are already included in self.parameters() and are assigned via resid_params/x0_params)
+        expected = len(matrix_params) + len(embedding_params) + len(value_embeds_params)
+        assert len(list(self.parameters())) == expected + len(resid_params) + len(x0_params), f"Expected {expected + len(resid_params) + len(x0_params)} but got {len(list(self.parameters()))}"
         # Scale LR ∝ 1/√dmodel (tuned at 768 dim)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         print(f"Scaling AdamW LRs by 1/sqrt({model_dim}/768) = {dmodel_lr_scale:.6f}")
