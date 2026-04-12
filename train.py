@@ -254,10 +254,10 @@ class GPT(nn.Module):
         # lm_head is tied to wte, so no separate params
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
-        # Check: all model parameters are assigned to a param group (resid_lambdas and x0_lambdas
-        # are already included in self.parameters() and are assigned via resid_params/x0_params)
-        expected = (len(matrix_params) + len(embedding_params) + len(value_embeds_params)
-                    - 1 + len(resid_params) + len(x0_params))
+        # Check: all model parameters are assigned to a param group
+        all_param_group_params = (matrix_params + embedding_params + value_embeds_params
+                                  + resid_params + x0_params)
+        expected = len(all_param_group_params)
         assert len(list(self.parameters())) == expected, f"Expected {expected} but got {len(list(self.parameters()))}"
         # Scale LR ∝ 1/√dmodel (tuned at 768 dim)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
