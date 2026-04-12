@@ -251,14 +251,15 @@ class GPT(nn.Module):
         matrix_params = list(self.transformer.h.parameters())
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
-        # lm_head is tied to wte, so no separate params
+        # lm_head.weight is tied to wte.weight - exclude it to avoid double-counting
+        lm_head_weight = self.lm_head.weight
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         # Check: all model parameters are assigned to a param group
         all_param_group_params = (matrix_params + embedding_params + value_embeds_params
                                   + resid_params + x0_params)
         expected = len(all_param_group_params)
-        actual_params = list(self.parameters())
+        actual_params = [p for p in self.parameters() if p is not lm_head_weight]
         if len(actual_params) != expected:
             actual_set = set(id(p) for p in actual_params)
             expected_set = set(id(p) for p in all_param_group_params)
