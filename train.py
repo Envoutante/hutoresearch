@@ -255,7 +255,7 @@ class GPT(nn.Module):
         x0_params = [self.x0_lambdas]
         # Check: all model parameters are assigned to a param group (resid_lambdas and x0_lambdas
         # are already included in self.parameters() and are assigned via resid_params/x0_params)
-        expected = len(matrix_params) + len(embedding_params) + len(value_embeds_params)
+        expected = len(matrix_params) + len(embedding_params) + len(value_embeds_params) - 1
         assert len(list(self.parameters())) == expected + len(resid_params) + len(x0_params), f"Expected {expected + len(resid_params) + len(x0_params)} but got {len(list(self.parameters()))}"
         # Scale LR ∝ 1/√dmodel (tuned at 768 dim)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -442,8 +442,8 @@ class MuonAdamW(torch.optim.Optimizer):
 # ---------------------------------------------------------------------------
 
 # Model architecture
-ASPECT_RATIO = 60        # 10*60=600 -> n_embd=600 (10 heads * 60), closer to proven-best n_embd=640
-HEAD_DIM = 60            # 10 heads at 60-dim = 600 total; 10-head config matches best-run dd27fe2's head structure
+ASPECT_RATIO = 64        # 10*64=640 -> n_embd=640 (10 heads * 64), matching best-run 9885c3e config
+HEAD_DIM = 64            # 10 heads at 64-dim = 640 total; best val_bpb=1.022869 was at this dimension
 WINDOW_PATTERN = "SSSL"  # interleaved sliding window pattern: best result 0.989 (dd27fe2) used SSSL
 
 # Optimization
