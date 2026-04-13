@@ -145,6 +145,9 @@ class GPT(nn.Module):
             }
         )
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        # Weight tying: share input embedding and output head weights
+        del self.lm_head.weight  # remove registered param before re-assigning
+        self.lm_head.weight = self.transformer.wte.weight
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
         self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))
         # Value embeddings
@@ -245,7 +248,7 @@ class GPT(nn.Module):
     def num_scaling_params(self):
         wte = sum(p.numel() for p in self.transformer.wte.parameters())
         value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
-        lm_head = sum(p.numel() for p in self.lm_head.parameters())
+        lm_head = 0  # tied to wte
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel()
         total = wte + value_embeds + lm_head + transformer_matrices + scalars
