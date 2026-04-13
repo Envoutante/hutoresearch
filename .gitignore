@@ -22,3 +22,8 @@ dev/
 # Results file
 results.tsv
 autorunner/artifacts/
+large_tool_results/
+memory/
+skills/
+.vscode/
+.claude/
