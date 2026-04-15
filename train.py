@@ -201,7 +201,7 @@ class GPT(nn.Module):
         for ve in self.value_embeds.values():
             ve.to(dtype=torch.bfloat16)
 
-    def _precompute_rotary_embeddings(self, seq_len, head_dim, base=50000, device=None):
+    def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
         if device is None:
             device = self.transformer.wte.weight.device
         channel_range = torch.arange(0, head_dim, 2, dtype=torch.float32, device=device)
@@ -573,7 +573,7 @@ MATRIX_LR = 0.01582  # learning rate for matrix parameters (Muon)
 SCALAR_LR = 0.5  # learning rate for per-layer scalars (Adam)
 WEIGHT_DECAY = 0.2  # cautious weight decay for Muon
 ADAM_BETAS = (0.8, 0.95)  # Adam beta1, beta2
-WARMUP_RATIO = 0.0  # fraction of time budget for LR warmup
+WARMUP_RATIO = 0.05  # fraction of time budget for LR warmup
 WARMDOWN_RATIO = 0.5  # fraction of time budget for LR warmdown
 FINAL_LR_FRAC = 0.0  # final LR as fraction of initial
 
