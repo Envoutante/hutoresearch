@@ -581,6 +581,9 @@ FINAL_LR_FRAC = 0.0  # final LR as fraction of initial
 DEPTH = 8  # number of transformer layers
 DEVICE_BATCH_SIZE = 4  # per-device batch size (reduce if OOM)
 
+# Gradient clipping
+GRAD_CLIP_NORM = 1.0  # max gradient norm (0 = disabled)
+
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
 # ---------------------------------------------------------------------------
@@ -702,6 +705,8 @@ while True:
         if group["kind"] == "muon":
             group["momentum"] = muon_momentum
             group["weight_decay"] = muon_weight_decay
+    if GRAD_CLIP_NORM > 0:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
     optimizer.step()
     model.zero_grad(set_to_none=True)
 
