@@ -115,10 +115,14 @@ class Block(nn.Module):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
+        # LayerScale: learned per-layer scalars on sub-layer outputs
+        self.ls_attn = nn.Parameter(torch.ones(config.n_embd))
+        self.ls_mlp = nn.Parameter(0.5 * torch.ones(config.n_embd))
 
     def forward(self, x, ve, cos_sin, window_size):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size)
-        x = x + self.mlp(norm(x))
+        y_attn = self.attn(norm(x), ve, cos_sin, window_size)
+        y_mlp = self.mlp(norm(x))
+        x = x + self.ls_attn * y_attn + self.ls_mlp * y_mlp
         return x
 
 
@@ -164,7 +168,7 @@ class GPT(nn.Module):
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
         # Per-layer scalars
         self.resid_lambdas.fill_(1.0)
-        self.x0_lambdas.fill_(0.0)
+        self.x0_lambdas.fill_(0.1)
         # Value embeddings
         for ve in self.value_embeds.values():
             torch.nn.init.uniform_(ve.weight, -s, s)
@@ -210,8 +214,9 @@ class GPT(nn.Module):
         """Estimated FLOPs per token (forward + backward)."""
         nparams = sum(p.numel() for p in self.parameters())
         value_embeds_numel = sum(ve.weight.numel() for ve in self.value_embeds.values())
+        layerscale_numel = sum(p.numel() for block in self.transformer.h for p in [block.ls_attn, block.ls_mlp])
         nparams_exclude = (self.transformer.wte.weight.numel() + value_embeds_numel +
-                          self.resid_lambdas.numel() + self.x0_lambdas.numel())
+                          self.resid_lambdas.numel() + self.x0_lambdas.numel() + layerscale_numel)
         h = self.config.n_head
         q = self.config.n_embd // self.config.n_head
         t = self.config.sequence_len
