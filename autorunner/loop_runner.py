@@ -21,6 +21,10 @@ from autorunner.metric_judge import judge as metric_judge
 
 WORKDIR = Path("/mount/disk1/rl-hyr/autoresearch")
 ARTIFACTS_DIR = WORKDIR / "autorunner" / "artifacts"
+RUN_LOG_FILE = ARTIFACTS_DIR / "run.log"
+CURRENT_STATE_FILE = ARTIFACTS_DIR / "current_state.md"
+RESULTS_TSV_FILE = WORKDIR / "results.tsv"
+BEST_CANDIDATE_FILE = ARTIFACTS_DIR / "best_candidate.json"
 MODEL = "MiniMax-M2.7"
 
 
@@ -140,6 +144,31 @@ def _build_run_summaries() -> list[str]:
     return summaries
 
 
+def _latest_eval_file() -> Path | None:
+    """返回 artifacts 下最新的 eval-*.json。"""
+    if not ARTIFACTS_DIR.exists():
+        return None
+
+    files = sorted(ARTIFACTS_DIR.glob("eval-*.json"))
+    return files[-1] if files else None
+
+
+def _build_eval_guidance() -> str:
+    """构造给 Generator 的评估上下文读取提示。"""
+    latest_eval = _latest_eval_file()
+    if latest_eval is None:
+        return (
+            "请先读取 autorunner/artifacts/current_state.md（若存在）恢复上下文。"
+            "当前没有 eval-*.json，请基于 results.tsv 与 current_state 制定方向。"
+        )
+
+    return (
+        "请先读取 autorunner/artifacts/current_state.md（若存在）恢复上下文。"
+        f"最新评估文件：autorunner/artifacts/{latest_eval.name}。"
+        "必须重点参考 recommendation.next_action 与 diagnosis，再决定本轮方案。"
+    )
+
+
 def _write_iter_artifacts(
     iteration: int,
     exp_result: ExperimentResult,
@@ -232,15 +261,21 @@ def _append_results_tsv(
     """追加一行到 results.tsv"""
     results_tsv = WORKDIR / "results.tsv"
     val_bpb = exp_result.val_bpb if exp_result.val_bpb is not None else 0.0
-    peak_vram_mb = exp_result.peak_vram_mb if exp_result.peak_vram_mb is not None else 0.0
+    peak_vram_mb = (
+        exp_result.peak_vram_mb if exp_result.peak_vram_mb is not None else 0.0
+    )
     memory_gb = peak_vram_mb / 1024.0
     status = "keep" if decision == "keep" else "discard"
-    line = f"{git_commit_hash}\t{val_bpb:.6f}\t{memory_gb:.1f}\t{status}\t{description}\n"
+    line = (
+        f"{git_commit_hash}\t{val_bpb:.6f}\t{memory_gb:.1f}\t{status}\t{description}\n"
+    )
     with results_tsv.open("a") as f:
         f.write(line)
 
 
-def _extract_description_from_llm_reply(reply: str, iteration: int, prefix: str = "") -> str:
+def _extract_description_from_llm_reply(
+    reply: str, iteration: int, prefix: str = ""
+) -> str:
     """从 LLM 回复中提取 DESCRIPTION 字段，失败时回退到首行文本。"""
     fallback = f"iter {iteration}"
     if not reply:
@@ -283,10 +318,13 @@ def _repair_once_on_failure(
     max_iterations: int,
     exp_result: ExperimentResult,
     time_budget: int,
+    run_log_path: Path,
 ) -> tuple[ExperimentResult, bool, str | None, str | None]:
     """失败时进行一次修复并重跑，返回（实验结果，是否已修复，修复提交哈希）。"""
     # 仅对可修复失败（依赖/运行时）触发重试，避免 timeout/数值异常死循环
-    analysis = analyze_failure(exp_result.failure_type or "runtime", exp_result.log_tail)
+    analysis = analyze_failure(
+        exp_result.failure_type or "runtime", exp_result.log_tail
+    )
     if not analysis.should_retry:
         return exp_result, False, None, None
 
@@ -343,13 +381,16 @@ def _repair_once_on_failure(
 
     (WORKDIR / "train.py").write_text(repaired_code)
     repair_git_hash = _git_commit("repair", f"iteration {iteration}")
-    _print_progress(iteration, max_iterations, "LLM (repair)", "done", f"({elapsed:.1f}s)")
+    _print_progress(
+        iteration, max_iterations, "LLM (repair)", "done", f"({elapsed:.1f}s)"
+    )
 
     # 修复后只重跑一次，若仍失败则放弃本轮
     _print_progress(iteration, max_iterations, "Run experiment (after repair)", "start")
     rerun_result = run_experiment(
         train_py_path=WORKDIR / "train.py",
         time_budget=time_budget,
+        run_log_path=run_log_path,
     )
     runtime_min = rerun_result.runtime_seconds / 60
     _print_progress(
@@ -366,6 +407,87 @@ def _repair_once_on_failure(
         prefix="repair: ",
     )
     return rerun_result, True, repair_git_hash or None, repair_desc
+
+
+def _run_evaluator(
+    *,
+    agent: ClaudeCodeAgent,
+    iteration: int,
+    max_iterations: int,
+) -> Path | None:
+    """单轮实验结束后调用独立 Evaluator，产出 eval-<n>.json 与 current_state.md。"""
+    iter_artifact = ARTIFACTS_DIR / f"iter-{iteration:03d}.json"
+    eval_artifact = ARTIFACTS_DIR / f"eval-{iteration:03d}.json"
+
+    _print_progress(iteration, max_iterations, "LLM (evaluate)", "start")
+    t0 = time.monotonic()
+
+    train_before = (WORKDIR / "train.py").read_text()
+    eval_result = agent.evaluate(
+        iteration=iteration,
+        iter_artifact_path=iter_artifact,
+        run_log_path=RUN_LOG_FILE,
+        current_state_path=CURRENT_STATE_FILE,
+        results_tsv_path=RESULTS_TSV_FILE,
+        best_candidate_path=BEST_CANDIDATE_FILE,
+        eval_output_path=eval_artifact,
+        workdir=WORKDIR,
+    )
+    elapsed = time.monotonic() - t0
+    _write_llm_log(iteration, "evaluate", eval_result.content)
+
+    # Evaluator 只负责分析，不应改写 train.py；若误改则回滚。
+    train_after = (WORKDIR / "train.py").read_text()
+    if train_after != train_before:
+        (WORKDIR / "train.py").write_text(train_before)
+        print("       WARNING: evaluator modified train.py, reverted.")
+
+    if not eval_result.success and not eval_artifact.exists():
+        _print_progress(
+            iteration,
+            max_iterations,
+            "LLM (evaluate)",
+            "fail",
+            f"({elapsed:.1f}s) rc={eval_result.rc}",
+        )
+        if eval_result.stderr:
+            print(f"       stderr: {eval_result.stderr[:200]}")
+        return None
+
+    if not eval_artifact.exists():
+        _print_progress(
+            iteration,
+            max_iterations,
+            "LLM (evaluate)",
+            "fail",
+            "(eval json missing)",
+        )
+        return None
+
+    try:
+        json.loads(eval_artifact.read_text())
+    except json.JSONDecodeError as exc:
+        _print_progress(
+            iteration,
+            max_iterations,
+            "LLM (evaluate)",
+            "fail",
+            f"(invalid eval json: {exc})",
+        )
+        return None
+
+    _print_progress(
+        iteration,
+        max_iterations,
+        "LLM (evaluate)",
+        "done",
+        f"({elapsed:.1f}s)",
+    )
+
+    if not CURRENT_STATE_FILE.exists():
+        print("       WARNING: current_state.md was not updated by evaluator")
+
+    return eval_artifact
 
 
 def run_loop(
@@ -420,6 +542,7 @@ def run_loop(
 
         train_py_content = (WORKDIR / "train.py").read_text()
         run_summaries = _build_run_summaries()
+        eval_guidance = _build_eval_guidance()
         if iteration == 1:
             if best_bpb_record is not None and best_commit:
                 exp_plan = (
@@ -434,6 +557,7 @@ def run_loop(
                     "可以使用 Bash 读取该版本 train.py（例如："
                     f"git show {best_commit}:train.py），"
                     "并基于该最佳版本与当前代码进行候选实验设计。"
+                    f"{eval_guidance}"
                 )
             else:
                 exp_plan = "暂无历史最佳记录，先基于当前代码提出首个候选实验。"
@@ -442,6 +566,7 @@ def run_loop(
                     "优先规避已经证明无效的方向。"
                     "当前没有可对照的历史最佳 commit，"
                     "请先从模型结构、训练范式或归一化策略中选择一个最有潜力的方向。"
+                    f"{eval_guidance}"
                 )
 
             result = agent.generate(
@@ -460,7 +585,10 @@ def run_loop(
                 metric_key="val_bpb",
                 metric_direction="minimize",
                 topic=topic,
-                extra_hints="基于历史结果和当前代码，选择一个最可能降低 val_bpb 的改进方向。",
+                extra_hints=(
+                    "基于历史结果和当前代码，选择一个最可能降低 val_bpb 的改进方向。"
+                    f"{eval_guidance}"
+                ),
                 workdir=WORKDIR,
             )
 
@@ -506,6 +634,7 @@ def run_loop(
         exp_result = run_experiment(
             train_py_path=WORKDIR / "train.py",
             time_budget=time_budget,
+            run_log_path=RUN_LOG_FILE,
         )
 
         runtime_min = exp_result.runtime_seconds / 60
@@ -515,12 +644,15 @@ def run_loop(
 
         # 失败后给一次“诊断+修复+重跑”的机会，避免直接丢弃可修复的实验
         if exp_result.status != "completed":
-            repaired_result, repaired, repair_git_hash, repair_desc = _repair_once_on_failure(
-                agent=agent,
-                iteration=iteration,
-                max_iterations=max_iterations,
-                exp_result=exp_result,
-                time_budget=time_budget,
+            repaired_result, repaired, repair_git_hash, repair_desc = (
+                _repair_once_on_failure(
+                    agent=agent,
+                    iteration=iteration,
+                    max_iterations=max_iterations,
+                    exp_result=exp_result,
+                    time_budget=time_budget,
+                    run_log_path=RUN_LOG_FILE,
+                )
             )
             if repaired:
                 exp_result = repaired_result
@@ -564,6 +696,12 @@ def run_loop(
         )
         _update_best_candidate(iteration, exp_result, git_hash)
 
+        eval_artifact = _run_evaluator(
+            agent=agent,
+            iteration=iteration,
+            max_iterations=max_iterations,
+        )
+
         # === 打印结果行 ===
         if exp_result.val_bpb is not None:
             delta = baseline_bpb - exp_result.val_bpb
@@ -573,8 +711,10 @@ def run_loop(
             print(f"       val_bpb: None  status: {exp_result.status}")
         print(f"       status: {exp_result.status} | decision: {decision}")
         print(f"       artifacts/iter-{iteration:03d}.json written")
+        if eval_artifact is not None:
+            print(f"       {eval_artifact.relative_to(WORKDIR)} written")
         print(f"       llm_iter-{iteration:03d}_{phase}.log written")
-        print(f"       run.log written")
+        print(f"       {RUN_LOG_FILE.relative_to(WORKDIR)} written")
         print()
 
         # === 早停检查 ===

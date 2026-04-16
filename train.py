@@ -25,22 +25,6 @@ fa3 = get_kernel(repo).flash_attn_interface
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
 TIME_BUDGET = 1200  # 20min override
-TIME_BUDGET = 1200  # 20min override
-TIME_BUDGET = 1200  # 20min override
-TIME_BUDGET = 1200  # 20min override
-TIME_BUDGET = 1200  # 20min override
-TIME_BUDGET = 1200  # 20min override
-TIME_BUDGET = 1200  # 20min override
-TIME_BUDGET = 1200  # 20min override
-TIME_BUDGET = 1200  # 20min override
-TIME_BUDGET = 1200  # 20min override
-TIME_BUDGET = 1200  # 20min override
-TIME_BUDGET = 1200  # 20min override
-TIME_BUDGET = 1200  # 20min override
-TIME_BUDGET = 1200  # 20min override
-TIME_BUDGET = 1200  # 20min override
-TIME_BUDGET = 1200  # 20min override
-TIME_BUDGET = 1200  # 20min override
 
 # ---------------------------------------------------------------------------
 # GPT Model
@@ -489,7 +473,7 @@ def build_model_config(depth):
     num_heads = model_dim // HEAD_DIM
     return GPTConfig(
         sequence_len=MAX_SEQ_LEN, vocab_size=vocab_size,
-        n_layer=depth, n_head=num_heads, n_kv_head=1, n_embd=model_dim,
+        n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=WINDOW_PATTERN,
     )
 

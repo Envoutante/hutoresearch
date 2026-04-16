@@ -31,6 +31,7 @@ def _collect_py_files(workdir: Path) -> dict[str, str]:
 @dataclass
 class CodeAgentResult:
     """ClaudeCodeAgent 的返回结果"""
+
     success: bool
     content: str  # Claude CLI 的文本回复（stdout）
     rc: int  # subprocess return code
@@ -137,11 +138,15 @@ class ClaudeCodeAgent:
     def _build_cmd(self, prompt: str, workdir: Path) -> list[str]:
         cmd = [
             self._binary,
-            "-p", prompt,
+            "-p",
+            prompt,
             "--dangerously-skip-permissions",
-            "--output-format", "text",
-            "--allowed-tools", "Bash Edit Write Read",
-            "--add-dir", str(workdir),
+            "--output-format",
+            "text",
+            "--allowed-tools",
+            "Bash Edit Write Read",
+            "--add-dir",
+            str(workdir),
         ]
         if self._model:
             cmd += ["--model", self._model]
@@ -213,9 +218,12 @@ class ClaudeCodeAgent:
 
 ## 执行要求（必须遵守）
 1. 使用 Read 工具读取 train.py 和 results.tsv。
-2. 使用 Edit/Write 工具直接修改 train.py（原地修改，不新建同义副本）。
-3. 可用 Bash 工具做轻量自检（例如 python -m py_compile train.py）。
-4. 不要只在对话里返回代码块；最终结果应体现在文件系统中的 train.py 里。
+2. 在提出改动前，先读取 autorunner/artifacts/current_state.md（若文件存在）。
+3. 使用 Bash 工具定位最新的 autorunner/artifacts/eval-*.json（若存在），并用 Read 工具重点查看 recommendation 与 diagnosis。
+4. 若最新评估中的 recommendation.next_action 是 revert_and_retry 或 discard_and_pivot，必须在方案里显式响应该建议。
+5. 使用 Edit/Write 工具直接修改 train.py（原地修改，不新建同义副本）。
+6. 可用 Bash 工具做轻量自检（例如 python -m py_compile train.py）。
+7. 不要只在对话里返回代码块；最终结果应体现在文件系统中的 train.py 里。
 
 ## 输出要求
 请按以下格式输出，且不要粘贴整份代码：
@@ -234,7 +242,9 @@ DESCRIPTION: <一句话描述本轮实验改动，英文，5-18词，不含制�
         extra_hints: str,
     ) -> str:
         """生成 refine 的 prompt"""
-        summaries_text = "\n".join(run_summaries[-10:]) if run_summaries else "无历史记录"
+        summaries_text = (
+            "\n".join(run_summaries[-10:]) if run_summaries else "无历史记录"
+        )
         files_text = ""
         for name, content in current_files.items():
             files_text += f"\n=== {name} ===\n{content[:3000]}"
@@ -289,9 +299,12 @@ DESCRIPTION: <一句话描述本轮实验改动，英文，5-18词，不含制�
 
 ## 执行要求（必须遵守）
 1. 使用 Read 工具读取 train.py。
-2. 使用 Edit/Write 工具直接修改 train.py（原地修改，不新建同义副本）。
-3. 可用 Bash 工具做轻量自检（例如 python -m py_compile train.py）。
-4. 不要只在对话里返回代码块；最终结果应体现在文件系统中的 train.py 里。
+2. 使用 Read 工具读取 autorunner/artifacts/current_state.md（若文件存在）。
+3. 使用 Bash 工具定位最新的 autorunner/artifacts/eval-*.json（若存在），并用 Read 工具重点查看 recommendation 与 diagnosis。
+4. 在改动方案中显式说明如何响应最新评估建议（continue/revert_and_retry/discard_and_pivot/investigate）。
+5. 使用 Edit/Write 工具直接修改 train.py（原地修改，不新建同义副本）。
+6. 可用 Bash 工具做轻量自检（例如 python -m py_compile train.py）。
+7. 不要只在对话里返回代码块；最终结果应体现在文件系统中的 train.py 里。
 
 ## 输出要求
 请按以下格式输出，且不要粘贴整份代码：
@@ -331,6 +344,74 @@ DESCRIPTION: <一句话描述修复动作，英文，5-18词，不含制表符>
 """
         return prompt
 
+    def _evaluate_prompt(
+        self,
+        *,
+        iteration: int,
+        iter_artifact_path: Path,
+        run_log_path: Path,
+        current_state_path: Path,
+        results_tsv_path: Path,
+        best_candidate_path: Path,
+        eval_output_path: Path,
+    ) -> str:
+        """生成独立 Evaluator 的 prompt。"""
+        return f"""你是 AutoResearch 项目的独立 Evaluator Agent。
+
+你的任务：对刚刚结束的实验进行批判性分析，不要宽容，不要假设作者是正确的。
+
+当前轮次: {iteration}
+
+请按以下顺序执行：
+1. 使用 Read 工具读取 {iter_artifact_path}
+2. 使用 Read 工具读取 {run_log_path}（完整日志，不要只看尾部）
+3. 使用 Bash 工具运行 git diff HEAD~1 train.py，查看本轮代码改动
+4. 使用 Read 工具读取 {current_state_path}（如果存在）
+5. 使用 Read 工具读取 {results_tsv_path}
+6. 使用 Read 工具读取 {best_candidate_path}（如果存在）
+
+分析维度：
+A. 实验结果归类：completed_success / completed_anomaly / crashed / timeout / oom
+B. 指标对比：本轮 val_bpb 与历史 best 的差异及百分比
+C. 训练健康度：从 run.log 诊断是否有 loss spike、梯度异常、I/O 瓶颈
+D. 代码审查：本轮 diff 是否合理、是否有 bug、是否过度复杂
+E. 下一轮建议：从 continue / revert_and_retry / discard_and_pivot / investigate 中选择，并给出理由
+
+输出要求（必须遵守）：
+1. 必须写 JSON 文件到 {eval_output_path}，并严格包含以下字段：
+{{
+    "iteration": {iteration},
+    "evaluated_at": "ISO8601 时间",
+    "outcome": "completed_success|completed_anomaly|crashed|timeout|oom",
+    "metrics": {{
+        "val_bpb": "number|null",
+        "best_val_bpb": "number|null",
+        "relative_change_percent": "number|null",
+        "peak_vram_mb": "number|null",
+        "mfu_percent": "number|null"
+    }},
+    "metrics_healthy": "bool",
+    "diagnosis": {{
+        "summary": "string",
+        "issues": ["string", "..."],
+        "root_cause": "string"
+    }},
+    "code_review": {{
+        "diff_summary": "string",
+        "risks": ["string", "..."],
+        "consistency": "bool"
+    }},
+    "recommendation": {{
+        "next_action": "continue|revert_and_retry|discard_and_pivot|investigate",
+        "reasoning": "string",
+        "suggested_directions": ["string", "..."]
+    }}
+}}
+2. 必须更新 {current_state_path}，追加本轮结论、主要问题和下一轮推荐方向。
+3. 不要修改 train.py。
+4. 终端输出只需一句话总结本轮结论。
+"""
+
     def generate(
         self,
         *,
@@ -344,11 +425,18 @@ DESCRIPTION: <一句话描述修复动作，英文，5-18词，不含制表符>
         timeout_sec: int | None = None,
     ) -> CodeAgentResult:
         prompt = self._generate_prompt(
-            topic, exp_plan, metric_key, pkg_hint, compute_budget, extra_guidance,
+            topic,
+            exp_plan,
+            metric_key,
+            pkg_hint,
+            compute_budget,
+            extra_guidance,
         )
         cmd = self._build_cmd(prompt, workdir)
         rc, stdout, stderr, elapsed, to = self._run_subprocess(
-            cmd, workdir, timeout_sec or self._timeout_sec,
+            cmd,
+            workdir,
+            timeout_sec or self._timeout_sec,
         )
         return self._build_result(workdir, rc, stdout, stderr, elapsed, to)
 
@@ -365,12 +453,18 @@ DESCRIPTION: <一句话描述修复动作，英文，5-18词，不含制表符>
         timeout_sec: int | None = None,
     ) -> CodeAgentResult:
         prompt = self._refine_prompt(
-            current_files, run_summaries, metric_key, metric_direction,
-            topic, extra_hints,
+            current_files,
+            run_summaries,
+            metric_key,
+            metric_direction,
+            topic,
+            extra_hints,
         )
         cmd = self._build_cmd(prompt, workdir)
         rc, stdout, stderr, elapsed, to = self._run_subprocess(
-            cmd, workdir, timeout_sec or self._timeout_sec,
+            cmd,
+            workdir,
+            timeout_sec or self._timeout_sec,
         )
         return self._build_result(workdir, rc, stdout, stderr, elapsed, to)
 
@@ -385,6 +479,38 @@ DESCRIPTION: <一句话描述修复动作，英文，5-18词，不含制表符>
         prompt = self._repair_prompt(files, issues)
         cmd = self._build_cmd(prompt, workdir)
         rc, stdout, stderr, elapsed, to = self._run_subprocess(
-            cmd, workdir, timeout_sec or self._timeout_sec,
+            cmd,
+            workdir,
+            timeout_sec or self._timeout_sec,
+        )
+        return self._build_result(workdir, rc, stdout, stderr, elapsed, to)
+
+    def evaluate(
+        self,
+        *,
+        iteration: int,
+        iter_artifact_path: Path,
+        run_log_path: Path,
+        current_state_path: Path,
+        results_tsv_path: Path,
+        best_candidate_path: Path,
+        eval_output_path: Path,
+        workdir: Path,
+        timeout_sec: int | None = None,
+    ) -> CodeAgentResult:
+        prompt = self._evaluate_prompt(
+            iteration=iteration,
+            iter_artifact_path=iter_artifact_path,
+            run_log_path=run_log_path,
+            current_state_path=current_state_path,
+            results_tsv_path=results_tsv_path,
+            best_candidate_path=best_candidate_path,
+            eval_output_path=eval_output_path,
+        )
+        cmd = self._build_cmd(prompt, workdir)
+        rc, stdout, stderr, elapsed, to = self._run_subprocess(
+            cmd,
+            workdir,
+            timeout_sec or self._timeout_sec,
         )
         return self._build_result(workdir, rc, stdout, stderr, elapsed, to)
