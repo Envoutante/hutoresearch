@@ -196,6 +196,42 @@ def _extract_content_from_stream_json(stdout: str) -> str:
     return "".join(text_parts).strip()
 
 
+def _extract_error_from_stream_json(stdout: str) -> str:
+    """Extract human-readable error details from stream-json stdout lines."""
+    error_text = ""
+
+    for raw in stdout.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+        kind = obj.get("type")
+        if kind == "result":
+            if bool(obj.get("is_error")):
+                result_text = str(obj.get("result") or "").strip()
+                if result_text:
+                    error_text = result_text
+            continue
+
+        if kind == "assistant" and obj.get("error"):
+            message = obj.get("message") or {}
+            blocks = message.get("content") or []
+            for block in blocks:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") != "text":
+                    continue
+                text = str(block.get("text") or "").strip()
+                if text:
+                    error_text = text
+
+    return error_text
+
+
 @dataclass
 class CodeAgentResult:
     """ClaudeCodeAgent 的返回结果"""
@@ -754,11 +790,15 @@ class ClaudeCodeAgent:
     ) -> CodeAgentResult:
         """Collect .py files from workdir and build result."""
         files = _collect_py_files(workdir)
+        effective_stderr = stderr.strip()
+        if returncode != 0 and not effective_stderr:
+            effective_stderr = _extract_error_from_stream_json(stdout)
+
         error = None
         if timed_out:
             error = f"Timed out after {elapsed:.0f}s"
         elif returncode != 0:
-            error = f"Exited {returncode}: {stderr[:500]}"
+            error = f"Exited {returncode}: {effective_stderr[:500]}"
 
         # 日志内容记录 Claude 文本回复，代码改动通过 files['train.py'] 读取
         content = _extract_content_from_stream_json(stdout)
@@ -769,7 +809,7 @@ class ClaudeCodeAgent:
             success=(error is None and (has_train_code or has_reply)),
             content=content,
             rc=returncode,
-            stderr=stderr,
+            stderr=effective_stderr,
             elapsed=elapsed,
             timed_out=timed_out,
             files=files,

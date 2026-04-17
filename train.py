@@ -74,9 +74,7 @@ class CausalSelfAttention(nn.Module):
         self.n_embd = config.n_embd
         self.head_dim = self.n_embd // self.n_head
         assert self.n_embd % self.n_head == 0
-        assert self.n_kv_head <= self.n_head
-        # GQA compatibility: FlashAttention3 requires n_kv_head divides n_head
-        self._use_fa3 = (self.n_head % self.n_kv_head == 0)
+        assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
         self.c_q = nn.Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
         self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
@@ -104,19 +102,7 @@ class CausalSelfAttention(nn.Module):
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
 
-        if self._use_fa3:
-            y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
-        else:
-            # Fallback: repeat KV heads to match Q heads for standard attention
-            q_heads = self.n_head // self.n_kv_head
-            k = k.repeat_interleave(q_heads, dim=2)
-            v = v.repeat_interleave(q_heads, dim=2)
-            scale = self.head_dim ** -0.5
-            attn_weights = torch.einsum("bthd,bThd->bhtT", q * scale, k * scale)
-            mask = torch.triu(torch.ones(T, T, device=attn_weights.device, dtype=torch.bool), diagonal=1)
-            attn_weights = attn_weights.masked_fill(mask, float("-inf"))
-            attn_weights = F.softmax(attn_weights.float(), dim=-1).to(q.dtype)
-            y = torch.einsum("bhtT,bThd->bthd", attn_weights, v)
+        y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
         return y
@@ -158,7 +144,6 @@ class GPT(nn.Module):
                 "h": nn.ModuleList([Block(config, i) for i in range(config.n_layer)]),
             }
         )
-        # Separate wte and lm_head (best val_bpb d1cfbe5 had no tying)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
         self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))
@@ -180,8 +165,8 @@ class GPT(nn.Module):
 
     @torch.no_grad()
     def init_weights(self):
-        # Embedding and unembedding (matching d1cfbe5 best config)
-        torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=0.9)
+        # Embedding and unembedding
+        torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
         torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
         # Transformer blocks
         n_embd = self.config.n_embd
@@ -259,15 +244,15 @@ class GPT(nn.Module):
 
     def num_scaling_params(self):
         wte = sum(p.numel() for p in self.transformer.wte.parameters())
-        lm_head = sum(p.numel() for p in self.lm_head.parameters())
         value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
+        lm_head = sum(p.numel() for p in self.lm_head.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel()
-        total = wte + lm_head + value_embeds + transformer_matrices + scalars
+        total = wte + value_embeds + lm_head + transformer_matrices + scalars
         return {
             "wte": wte,
-            "lm_head": lm_head,
             "value_embeds": value_embeds,
+            "lm_head": lm_head,
             "transformer_matrices": transformer_matrices,
             "scalars": scalars,
             "total": total,
@@ -303,16 +288,16 @@ class GPT(nn.Module):
         param_groups = [
             dict(
                 kind="adamw",
-                params=embedding_params,
-                lr=embedding_lr * dmodel_lr_scale,
+                params=lm_head_params,
+                lr=unembedding_lr * dmodel_lr_scale,
                 betas=adam_betas,
                 eps=1e-10,
                 weight_decay=0.0,
             ),
             dict(
                 kind="adamw",
-                params=lm_head_params,
-                lr=unembedding_lr * dmodel_lr_scale,
+                params=embedding_params,
+                lr=embedding_lr * dmodel_lr_scale,
                 betas=adam_betas,
                 eps=1e-10,
                 weight_decay=0.0,
@@ -572,15 +557,15 @@ class MuonAdamW(torch.optim.Optimizer):
 # ---------------------------------------------------------------------------
 
 # Model architecture
-ASPECT_RATIO = 80  # model_dim = depth * ASPECT_RATIO
+ASPECT_RATIO = 64  # model_dim = depth * ASPECT_RATIO
 HEAD_DIM = 128  # target head dimension for attention
 WINDOW_PATTERN = "SSSL"  # sliding window pattern: L=full, S=half context
 
 # Optimization
-TOTAL_BATCH_SIZE = 2**17  # ~524K tokens per optimizer step
-EMBEDDING_LR = 0.22524  # learning rate for token embeddings (Adam)
+TOTAL_BATCH_SIZE = 2**19  # ~524K tokens per optimizer step
+EMBEDDING_LR = 0.6  # learning rate for token embeddings (Adam)
 UNEMBEDDING_LR = 0.004  # learning rate for lm_head (Adam)
-MATRIX_LR = 0.01582  # learning rate for matrix parameters (Muon)
+MATRIX_LR = 0.04  # learning rate for matrix parameters (Muon)
 SCALAR_LR = 0.5  # learning rate for per-layer scalars (Adam)
 WEIGHT_DECAY = 0.2  # cautious weight decay for Muon
 ADAM_BETAS = (0.8, 0.95)  # Adam beta1, beta2
@@ -590,7 +575,7 @@ FINAL_LR_FRAC = 0.0  # final LR as fraction of initial
 
 # Model size
 DEPTH = 8  # number of transformer layers
-DEVICE_BATCH_SIZE = 4  # per-device batch size (reduce if OOM)
+DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
@@ -613,17 +598,12 @@ def build_model_config(depth):
     base_dim = depth * ASPECT_RATIO
     model_dim = ((base_dim + HEAD_DIM - 1) // HEAD_DIM) * HEAD_DIM
     num_heads = model_dim // HEAD_DIM
-    # GQA: n_kv_head must divide n_head for the fallback attention path
-    n_kv = max(1, num_heads // 2)
-    while num_heads % n_kv != 0:
-        n_kv -= 1
-    n_kv_head = max(1, n_kv)
     return GPTConfig(
         sequence_len=MAX_SEQ_LEN,
         vocab_size=vocab_size,
         n_layer=depth,
         n_head=num_heads,
-        n_kv_head=n_kv_head,
+        n_kv_head=num_heads,
         n_embd=model_dim,
         window_pattern=WINDOW_PATTERN,
     )

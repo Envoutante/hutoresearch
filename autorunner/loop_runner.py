@@ -10,6 +10,7 @@ from datetime import datetime
 from pathlib import Path
 
 from rich.console import Console
+from rich.live import Live
 from rich.panel import Panel
 from rich.text import Text
 
@@ -34,6 +35,18 @@ RESULTS_TSV_FILE = WORKDIR / "results.tsv"
 BEST_CANDIDATE_FILE = ARTIFACTS_DIR / "best_candidate.json"
 MODEL = "MiniMax-M2.7"
 console = Console()
+_nvidia_live: Live | None = None
+
+
+def _clear_nvidia_smi_panel():
+    global _nvidia_live
+    if _nvidia_live is None:
+        return
+    try:
+        _nvidia_live.stop()
+    except Exception:
+        pass
+    _nvidia_live = None
 
 
 def print_auto_research_banner(
@@ -164,6 +177,9 @@ def _print_progress(
     iteration: int, max_iter: int, label: str, status: str, extra: str = ""
 ):
     """终端打印一行进度"""
+    if status == "start" and not label.startswith("Run experiment"):
+        _clear_nvidia_smi_panel()
+
     symbols = {"start": "⏳", "done": "🗸", "fail": "🗴", "skip": "»"}
     sym = symbols.get(status, "  ")
     line = Text()
@@ -177,6 +193,7 @@ def _print_progress(
 
 def _print_nvidia_smi_snapshot(pid: int):
     """训练进程启动后打印一次 nvidia-smi 快照，辅助确认实验是否正常运行。"""
+    global _nvidia_live
     title = Text("nvidia-smi", style="bold cyan")
     title.append(f" (after start, pid={pid})", style="dim")
 
@@ -209,6 +226,34 @@ def _print_nvidia_smi_snapshot(pid: int):
 
     output = (result.stdout or "").strip()
     err = (result.stderr or "").strip()
+
+    def _extract_processes_table(text: str) -> str:
+        lines = text.splitlines()
+        if not lines:
+            return ""
+
+        proc_idx = -1
+        for i, line in enumerate(lines):
+            if "Processes:" in line:
+                proc_idx = i
+                break
+        if proc_idx < 0:
+            return ""
+
+        start = proc_idx
+        for i in range(proc_idx, -1, -1):
+            if lines[i].lstrip().startswith("+"):
+                start = i
+                break
+
+        end = len(lines) - 1
+        for i in range(proc_idx + 1, len(lines)):
+            if lines[i].lstrip().startswith("+"):
+                end = i
+                break
+
+        return "\n".join(lines[start : end + 1]).strip()
+
     if result.returncode != 0 and err:
         body = Text(err[:2000], style="red")
         border = "red"
@@ -216,10 +261,22 @@ def _print_nvidia_smi_snapshot(pid: int):
         body = Text("(no output)", style="dim")
         border = "yellow"
     else:
-        body = Text(output[:5000])
-        border = "blue"
+        processes_table = _extract_processes_table(output)
+        if processes_table:
+            body = Text(processes_table[:5000])
+            border = "blue"
+        else:
+            body = Text("(Processes table not found)", style="yellow")
+            border = "yellow"
 
-    console.print(Panel(body, title=title, border_style=border))
+    _clear_nvidia_smi_panel()
+    panel = Panel(body, title=title, border_style=border)
+    try:
+        live = Live(panel, console=console, refresh_per_second=4, transient=True)
+        live.start()
+        _nvidia_live = live
+    except Exception:
+        console.print(panel)
 
 
 def _build_run_summaries() -> list[str]:
@@ -420,95 +477,123 @@ def _repair_once_on_failure(
     exp_result: ExperimentResult,
     time_budget: int,
     run_log_path: Path,
+    pre_iteration_code: str,
 ) -> tuple[ExperimentResult, bool, str | None, str | None]:
-    """失败时进行一次修复并重跑，返回（实验结果，是否已修复，修复提交哈希）。"""
-    # 仅对可修复失败（依赖/运行时）触发重试，避免 timeout/数值异常死循环
-    analysis = analyze_failure(
-        exp_result.failure_type or "runtime", exp_result.log_tail
-    )
-    if not analysis.should_retry:
-        return exp_result, False, None, None
+    """失败时最多修复 3 次并重跑；均失败则回退到本轮开始前代码。"""
+    max_repair_attempts = 3
+    current_result = exp_result
+    last_repair_git_hash: str | None = None
+    last_repair_desc: str | None = None
+    attempted_repairs = False
 
-    _print_progress(iteration, max_iterations, "LLM (repair)", "start")
-    t0 = time.monotonic()
+    for attempt in range(1, max_repair_attempts + 1):
+        # 仅对可修复失败（依赖/运行时）触发重试，避免 timeout/数值异常死循环
+        analysis = analyze_failure(
+            current_result.failure_type or "runtime", current_result.log_tail
+        )
+        if not analysis.should_retry:
+            break
 
-    current_code = (WORKDIR / "train.py").read_text()
-    issues = (
-        f"failure_type: {analysis.failure_type}\n"
-        f"repair_strategy: {analysis.repair_strategy}\n\n"
-        "错误日志尾部（最多 50 行）：\n"
-        f"{exp_result.log_tail}"
-    )
-    repair_result = agent.repair(
-        files={"train.py": current_code},
-        issues=issues,
-        workdir=WORKDIR,
-    )
+        attempted_repairs = True
+        stage = f"LLM (repair {attempt}/{max_repair_attempts})"
+        _print_progress(iteration, max_iterations, stage, "start")
+        t0 = time.monotonic()
 
-    elapsed = time.monotonic() - t0
-    _write_llm_log(iteration, "repair", repair_result.content)
+        current_code = (WORKDIR / "train.py").read_text()
+        issues = (
+            f"failure_type: {analysis.failure_type}\n"
+            f"repair_strategy: {analysis.repair_strategy}\n\n"
+            "错误日志尾部（最多 50 行）：\n"
+            f"{current_result.log_tail}"
+        )
+        repair_result = agent.repair(
+            files={"train.py": current_code},
+            issues=issues,
+            workdir=WORKDIR,
+        )
 
-    if not repair_result.success:
+        elapsed = time.monotonic() - t0
+        _write_llm_log(iteration, "repair", repair_result.content)
+
+        if not repair_result.success:
+            _print_progress(
+                iteration,
+                max_iterations,
+                stage,
+                "fail",
+                f"({elapsed:.1f}s) rc={repair_result.rc}",
+            )
+            err = (repair_result.stderr or repair_result.content or "").strip()
+            if err:
+                console.print(Text(f"       error: {err[:300]}", style="red"))
+            continue
+
+        # 仅接受 Claude 在工作区原地修改后的 train.py
+        repaired_code = repair_result.files.get("train.py", "").strip()
+        if not repaired_code:
+            _print_progress(
+                iteration,
+                max_iterations,
+                stage,
+                "fail",
+                "(train.py not updated)",
+            )
+            continue
+
+        if repaired_code == current_code:
+            _print_progress(
+                iteration,
+                max_iterations,
+                stage,
+                "skip",
+                "(no code change)",
+            )
+            continue
+
+        (WORKDIR / "train.py").write_text(repaired_code)
+        last_repair_git_hash = _git_commit("repair", f"iteration {iteration}")
+        _print_progress(iteration, max_iterations, stage, "done", f"({elapsed:.1f}s)")
+
         _print_progress(
             iteration,
             max_iterations,
-            "LLM (repair)",
-            "fail",
-            f"({elapsed:.1f}s) rc={repair_result.rc}",
+            f"Run experiment (after repair {attempt}/{max_repair_attempts})",
+            "start",
         )
-        return exp_result, False, None, None
-
-    # 仅接受 Claude 在工作区原地修改后的 train.py
-    repaired_code = repair_result.files.get("train.py", "").strip()
-    if not repaired_code:
+        rerun_result = run_experiment(
+            train_py_path=WORKDIR / "train.py",
+            time_budget=time_budget,
+            run_log_path=run_log_path,
+            on_process_started=_print_nvidia_smi_snapshot,
+        )
+        runtime_min = rerun_result.runtime_seconds / 60
         _print_progress(
             iteration,
             max_iterations,
-            "LLM (repair)",
-            "fail",
-            "(train.py not updated)",
+            f"Run experiment (after repair {attempt}/{max_repair_attempts})",
+            "done",
+            f"({runtime_min:.1f}m)",
         )
-        return exp_result, False, None, None
 
-    if repaired_code == current_code:
-        _print_progress(
-            iteration,
-            max_iterations,
-            "LLM (repair)",
-            "skip",
-            "(no code change)",
+        last_repair_desc = _extract_description_from_llm_reply(
+            repair_result.content,
+            iteration=iteration,
+            prefix="repair: ",
         )
-        return exp_result, False, None, None
 
-    (WORKDIR / "train.py").write_text(repaired_code)
-    repair_git_hash = _git_commit("repair", f"iteration {iteration}")
-    _print_progress(
-        iteration, max_iterations, "LLM (repair)", "done", f"({elapsed:.1f}s)"
-    )
+        if rerun_result.status == "completed":
+            return rerun_result, True, last_repair_git_hash, last_repair_desc
 
-    # 修复后只重跑一次，若仍失败则放弃本轮
-    _print_progress(iteration, max_iterations, "Run experiment (after repair)", "start")
-    rerun_result = run_experiment(
-        train_py_path=WORKDIR / "train.py",
-        time_budget=time_budget,
-        run_log_path=run_log_path,
-        on_process_started=_print_nvidia_smi_snapshot,
-    )
-    runtime_min = rerun_result.runtime_seconds / 60
-    _print_progress(
-        iteration,
-        max_iterations,
-        "Run experiment (after repair)",
-        "done",
-        f"({runtime_min:.1f}m)",
-    )
+        current_result = rerun_result
 
-    repair_desc = _extract_description_from_llm_reply(
-        repair_result.content,
-        iteration=iteration,
-        prefix="repair: ",
-    )
-    return rerun_result, True, repair_git_hash or None, repair_desc
+    # 3 次修复均失败：回退到本轮迭代开始前代码，避免带着坏代码进入下一轮。
+    if attempted_repairs:
+        current_code = (WORKDIR / "train.py").read_text()
+        if current_code != pre_iteration_code:
+            (WORKDIR / "train.py").write_text(pre_iteration_code)
+            print("       rollback: train.py restored to pre-iteration version")
+
+    return current_result, False, None, None
 
 
 def _run_evaluator(
@@ -552,8 +637,9 @@ def _run_evaluator(
             "fail",
             f"({elapsed:.1f}s) rc={eval_result.rc}",
         )
-        if eval_result.stderr:
-            print(f"       stderr: {eval_result.stderr[:200]}")
+        err = (eval_result.stderr or eval_result.content or "").strip()
+        if err:
+            console.print(Text(f"       error: {err[:300]}", style="red"))
         return None
 
     if not eval_artifact.exists():
@@ -728,7 +814,16 @@ def run_loop(
                 "fail",
                 f"({elapsed:.1f}s) rc={result.rc}",
             )
-            print(f"       stderr: {result.stderr[:200]}")
+            err = (result.stderr or result.content or "").strip()
+            if err:
+                console.print(Text(f"       error: {err[:300]}", style="red"))
+            else:
+                console.print(
+                    Text(
+                        "       error: (empty) see autorunner/artifacts/live_stream_*.jsonl",
+                        style="red",
+                    )
+                )
             continue
 
         _print_progress(
@@ -772,6 +867,7 @@ def run_loop(
                     exp_result=exp_result,
                     time_budget=time_budget,
                     run_log_path=RUN_LOG_FILE,
+                    pre_iteration_code=train_py_content,
                 )
             )
             if repaired:
