@@ -197,35 +197,8 @@ def _print_nvidia_smi_snapshot(pid: int):
     title = Text("nvidia-smi", style="bold cyan")
     title.append(f" (after start, pid={pid})", style="dim")
 
-    try:
-        result = subprocess.run(
-            ["nvidia-smi"],
-            cwd=WORKDIR,
-            capture_output=True,
-            text=True,
-            timeout=12,
-        )
-    except FileNotFoundError:
-        console.print(
-            Panel(
-                Text("nvidia-smi command not found", style="yellow"),
-                title=title,
-                border_style="yellow",
-            )
-        )
-        return
-    except subprocess.TimeoutExpired:
-        console.print(
-            Panel(
-                Text("nvidia-smi timed out", style="yellow"),
-                title=title,
-                border_style="yellow",
-            )
-        )
-        return
-
-    output = (result.stdout or "").strip()
-    err = (result.stderr or "").strip()
+    max_attempts = 6
+    retry_interval_sec = 1.0
 
     def _extract_processes_table(text: str) -> str:
         lines = text.splitlines()
@@ -254,20 +227,102 @@ def _print_nvidia_smi_snapshot(pid: int):
 
         return "\n".join(lines[start : end + 1]).strip()
 
-    if result.returncode != 0 and err:
+    def _extract_numeric_tokens(text: str) -> set[int]:
+        nums: set[int] = set()
+        for token in text.replace("|", " ").split():
+            if token.isdigit():
+                nums.add(int(token))
+        return nums
+
+    def _get_child_pids(parent_pid: int) -> set[int]:
+        try:
+            result = subprocess.run(
+                ["ps", "-o", "pid=", "--ppid", str(parent_pid)],
+                cwd=WORKDIR,
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+        except Exception:
+            return set()
+
+        children: set[int] = set()
+        for raw in (result.stdout or "").splitlines():
+            s = raw.strip()
+            if s.isdigit():
+                children.add(int(s))
+        return children
+
+    output = ""
+    err = ""
+    result_code = 0
+    timeout_happened = False
+    target_visible = False
+    processes_table = ""
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            result = subprocess.run(
+                ["nvidia-smi"],
+                cwd=WORKDIR,
+                capture_output=True,
+                text=True,
+                timeout=12,
+            )
+        except FileNotFoundError:
+            console.print(
+                Panel(
+                    Text("nvidia-smi command not found", style="yellow"),
+                    title=title,
+                    border_style="yellow",
+                )
+            )
+            return
+        except subprocess.TimeoutExpired:
+            timeout_happened = True
+            break
+
+        output = (result.stdout or "").strip()
+        err = (result.stderr or "").strip()
+        result_code = result.returncode
+
+        if result_code != 0 and err:
+            break
+
+        processes_table = _extract_processes_table(output)
+        if processes_table:
+            running_ids = _extract_numeric_tokens(processes_table)
+            target_ids = {pid} | _get_child_pids(pid)
+            if target_ids & running_ids:
+                target_visible = True
+                break
+
+        if attempt < max_attempts:
+            time.sleep(retry_interval_sec)
+
+    if timeout_happened:
+        body = Text("nvidia-smi timed out", style="yellow")
+        border = "yellow"
+    elif result_code != 0 and err:
         body = Text(err[:2000], style="red")
         border = "red"
     elif not output:
         body = Text("(no output)", style="dim")
         border = "yellow"
-    else:
-        processes_table = _extract_processes_table(output)
-        if processes_table:
+    elif processes_table:
+        if target_visible:
             body = Text(processes_table[:5000])
             border = "blue"
         else:
-            body = Text("(Processes table not found)", style="yellow")
+            note = f"target pid {pid} not visible after {max_attempts} checks\n\n"
+            body = Text((note + processes_table)[:5000], style="yellow")
             border = "yellow"
+    else:
+        body = Text(
+            f"(Processes table not found after {max_attempts} checks)",
+            style="yellow",
+        )
+        border = "yellow"
 
     _clear_nvidia_smi_panel()
     panel = Panel(body, title=title, border_style=border)
