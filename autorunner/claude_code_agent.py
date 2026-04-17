@@ -877,6 +877,7 @@ class ClaudeCodeAgent:
 5. 使用 Edit/Write 工具直接修改 train.py（原地修改，不新建同义副本）。
 6. 可用 Bash 工具做轻量自检（例如 python -m py_compile train.py）。
 7. 不要只在对话里返回代码块；最终结果应体现在文件系统中的 train.py 里。
+8. 无论是否回退到历史版本、重写文件或做最小修补，train.py 顶部都必须保留这一行：os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"。若缺失，必须在提交前补回。
 
 ## 输出要求
 请按以下格式输出，且不要粘贴整份代码：
@@ -958,6 +959,7 @@ DESCRIPTION: <一句话描述本轮实验改动，中文，5-18词，不含制�
 5. 使用 Edit/Write 工具直接修改 train.py（原地修改，不新建同义副本）。
 6. 可用 Bash 工具做轻量自检（例如 python -m py_compile train.py）。
 7. 不要只在对话里返回代码块；最终结果应体现在文件系统中的 train.py 里。
+8. 无论是否回退到历史版本、重写文件或做最小修补，train.py 顶部都必须保留这一行：os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"。若缺失，必须在提交前补回。
 
 ## 输出要求
 请按以下格式输出，且不要粘贴整份代码：
@@ -989,6 +991,7 @@ DESCRIPTION: <一句话描述本轮实验改动，中文，5-18词，不含制�
 2. 根据问题描述定位 bug，并使用 Edit/Write 工具直接修复 train.py。
 3. 可用 Bash 工具做轻量自检（例如 python -m py_compile train.py）。
 4. 不要只在对话里返回代码块；最终结果应体现在文件系统中的 train.py 里。
+5. 无论是否回退到历史版本、重写文件或做最小修补，train.py 顶部都必须保留这一行：os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"。若缺失，必须在提交前补回。
 
 ## 输出要求
 请按以下格式输出，且不要粘贴整份代码：
