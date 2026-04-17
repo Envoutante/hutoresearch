@@ -144,7 +144,8 @@ class GPT(nn.Module):
                 "h": nn.ModuleList([Block(config, i) for i in range(config.n_layer)]),
             }
         )
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        # Weight tying: share weights between token embeddings and lm_head
+        self.lm_head = self.transformer.wte
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
         self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))
         # Value embeddings
@@ -165,9 +166,8 @@ class GPT(nn.Module):
 
     @torch.no_grad()
     def init_weights(self):
-        # Embedding and unembedding
+        # Embedding and unembedding (weight tying: wte and lm_head share weights)
         torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
-        torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
         # Transformer blocks
         n_embd = self.config.n_embd
         s = 3**0.5 * n_embd**-0.5
@@ -245,7 +245,8 @@ class GPT(nn.Module):
     def num_scaling_params(self):
         wte = sum(p.numel() for p in self.transformer.wte.parameters())
         value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
-        lm_head = sum(p.numel() for p in self.lm_head.parameters())
+        # Weight tying: lm_head shares weights with wte, so don't double-count
+        lm_head = 0
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel()
         total = wte + value_embeds + lm_head + transformer_matrices + scalars
@@ -260,7 +261,6 @@ class GPT(nn.Module):
 
     def setup_optimizer(
         self,
-        unembedding_lr=0.004,
         embedding_lr=0.2,
         matrix_lr=0.02,
         weight_decay=0.0,
@@ -271,13 +271,12 @@ class GPT(nn.Module):
         matrix_params = list(self.transformer.h.parameters())
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
-        lm_head_params = list(self.lm_head.parameters())
+        # Weight tying: lm_head and wte share the same parameter
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         assert len(list(self.parameters())) == (
             len(matrix_params)
             + len(embedding_params)
-            + len(lm_head_params)
             + len(value_embeds_params)
             + len(resid_params)
             + len(x0_params)
@@ -285,19 +284,13 @@ class GPT(nn.Module):
         # Scale LR ∝ 1/√dmodel (tuned at 768 dim)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         print(f"Scaling AdamW LRs by 1/sqrt({model_dim}/768) = {dmodel_lr_scale:.6f}")
+        # Weight tying: use embedding LR for shared wte/lm_head
+        tied_lr = embedding_lr * dmodel_lr_scale
         param_groups = [
             dict(
                 kind="adamw",
-                params=lm_head_params,
-                lr=unembedding_lr * dmodel_lr_scale,
-                betas=adam_betas,
-                eps=1e-10,
-                weight_decay=0.0,
-            ),
-            dict(
-                kind="adamw",
                 params=embedding_params,
-                lr=embedding_lr * dmodel_lr_scale,
+                lr=tied_lr,
                 betas=adam_betas,
                 eps=1e-10,
                 weight_decay=0.0,
@@ -557,15 +550,15 @@ class MuonAdamW(torch.optim.Optimizer):
 # ---------------------------------------------------------------------------
 
 # Model architecture
-ASPECT_RATIO = 64  # model_dim = depth * ASPECT_RATIO
+ASPECT_RATIO = 80  # model_dim = depth * ASPECT_RATIO
 HEAD_DIM = 128  # target head dimension for attention
 WINDOW_PATTERN = "SSSL"  # sliding window pattern: L=full, S=half context
 
 # Optimization
 TOTAL_BATCH_SIZE = 2**19  # ~524K tokens per optimizer step
-EMBEDDING_LR = 0.6  # learning rate for token embeddings (Adam)
+EMBEDDING_LR = 0.22524  # learning rate for token embeddings (Adam)
 UNEMBEDDING_LR = 0.004  # learning rate for lm_head (Adam)
-MATRIX_LR = 0.04  # learning rate for matrix parameters (Muon)
+MATRIX_LR = 0.01582  # learning rate for matrix parameters (Muon)
 SCALAR_LR = 0.5  # learning rate for per-layer scalars (Adam)
 WEIGHT_DECAY = 0.2  # cautious weight decay for Muon
 ADAM_BETAS = (0.8, 0.95)  # Adam beta1, beta2
@@ -630,7 +623,6 @@ assert TOTAL_BATCH_SIZE % tokens_per_fwdbwd == 0
 grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
 
 optimizer = model.setup_optimizer(
-    unembedding_lr=UNEMBEDDING_LR,
     embedding_lr=EMBEDDING_LR,
     scalar_lr=SCALAR_LR,
     adam_betas=ADAM_BETAS,
