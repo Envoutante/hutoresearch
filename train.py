@@ -75,6 +75,8 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = self.n_embd // self.n_head
         assert self.n_embd % self.n_head == 0
         assert self.n_kv_head <= self.n_head
+        # GQA compatibility: FlashAttention3 requires n_kv_head divides n_head
+        self._use_fa3 = (self.n_head % self.n_kv_head == 0)
         self.c_q = nn.Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
         self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
@@ -102,7 +104,19 @@ class CausalSelfAttention(nn.Module):
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
 
-        y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        if self._use_fa3:
+            y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        else:
+            # Fallback: repeat KV heads to match Q heads for standard attention
+            q_heads = self.n_head // self.n_kv_head
+            k = k.repeat_interleave(q_heads, dim=2)
+            v = v.repeat_interleave(q_heads, dim=2)
+            scale = self.head_dim ** -0.5
+            attn_weights = torch.einsum("bthd,bThd->bhtT", q * scale, k * scale)
+            mask = torch.triu(torch.ones(T, T, device=attn_weights.device, dtype=torch.bool), diagonal=1)
+            attn_weights = attn_weights.masked_fill(mask, float("-inf"))
+            attn_weights = F.softmax(attn_weights.float(), dim=-1).to(q.dtype)
+            y = torch.einsum("bhtT,bThd->bthd", attn_weights, v)
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
         return y
