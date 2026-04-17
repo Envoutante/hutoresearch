@@ -111,16 +111,12 @@ class CausalSelfAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        # SwiGLU: c_fc1 + c_fc2, SiLU gate
-        self.c_fc1 = nn.Linear(config.n_embd, 2 * config.n_embd, bias=False)
-        self.c_fc2 = nn.Linear(config.n_embd, 2 * config.n_embd, bias=False)
-        self.c_proj = nn.Linear(2 * config.n_embd, config.n_embd, bias=False)
+        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
+        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
 
     def forward(self, x):
-        x1 = self.c_fc1(x)
-        x2 = self.c_fc2(x)
-        # SwiGLU: SiLU gate
-        x = F.silu(x1) * x2[..., : x1.size(-1)]
+        x = self.c_fc(x)
+        x = F.relu(x).square()
         x = self.c_proj(x)
         return x
 
@@ -180,7 +176,7 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
             torch.nn.init.zeros_(block.attn.c_proj.weight)
-            torch.nn.init.uniform_(block.mlp.c_fc1.weight, -s, s)
+            torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
         # Per-layer scalars
         self.resid_lambdas.fill_(1.0)
@@ -561,7 +557,7 @@ class MuonAdamW(torch.optim.Optimizer):
 # ---------------------------------------------------------------------------
 
 # Model architecture
-ASPECT_RATIO = 64  # model_dim = depth * ASPECT_RATIO
+ASPECT_RATIO = 80  # model_dim = depth * ASPECT_RATIO
 HEAD_DIM = 128  # target head dimension for attention
 WINDOW_PATTERN = "SSSL"  # sliding window pattern: L=full, S=half context
 
@@ -569,9 +565,9 @@ WINDOW_PATTERN = "SSSL"  # sliding window pattern: L=full, S=half context
 TOTAL_BATCH_SIZE = 2**19  # ~2M tokens per optimizer step
 EMBEDDING_LR = 0.22524  # learning rate for token embeddings (Adam)
 UNEMBEDDING_LR = 0.004  # learning rate for lm_head (Adam)
-MATRIX_LR = 0.04  # learning rate for matrix parameters (Muon)
+MATRIX_LR = 0.01582  # learning rate for matrix parameters (Muon)
 SCALAR_LR = 0.5  # learning rate for per-layer scalars (Adam)
-WEIGHT_DECAY = 0.1  # cautious weight decay for Muon
+WEIGHT_DECAY = 0.2  # cautious weight decay for Muon
 ADAM_BETAS = (0.8, 0.95)  # Adam beta1, beta2
 WARMUP_RATIO = 0.0  # fraction of time budget for LR warmup
 WARMDOWN_RATIO = 0.5  # fraction of time budget for LR warmdown
