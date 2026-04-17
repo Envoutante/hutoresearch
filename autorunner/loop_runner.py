@@ -9,14 +9,21 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+from rich.console import Console
+from rich.panel import Panel
+from rich.text import Text
+
 # 支持直接运行: python autorunner/loop_runner.py
 if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from autorunner.claude_code_agent import ClaudeCodeAgent
-from autorunner.experiment_executor import ExperimentResult, run as run_experiment
-from autorunner.failure_analyzer import analyze as analyze_failure
-from autorunner.metric_judge import judge as metric_judge
+from autorunner.experiment_executor import (
+    ExperimentResult,
+    analyze_failure,
+    judge as metric_judge,
+    run as run_experiment,
+)
 
 
 WORKDIR = Path("/mount/disk1/rl-hyr/autoresearch")
@@ -26,6 +33,47 @@ CURRENT_STATE_FILE = ARTIFACTS_DIR / "current_state.md"
 RESULTS_TSV_FILE = WORKDIR / "results.tsv"
 BEST_CANDIDATE_FILE = ARTIFACTS_DIR / "best_candidate.json"
 MODEL = "MiniMax-M2.7"
+console = Console()
+
+
+def print_auto_research_banner(
+    model: str | None = None,
+    provider: str | None = None,
+    mode: str | None = None,
+):
+    logo_lines = [
+        " █████╗ ██╗   ██╗████████╗ ██████╗     ██████╗ ███████╗███████╗███████╗ █████╗ ██████╗  ██████╗██╗  ██╗",
+        "██╔══██╗██║   ██║╚══██╔══╝██╔═══██╗    ██╔══██╗██╔════╝██╔════╝██╔════╝██╔══██╗██╔══██╗██╔════╝██║  ██║",
+        "███████║██║   ██║   ██║   ██║   ██║    ██████╔╝█████╗  ███████╗█████╗  ███████║██████╔╝██║     ███████║",
+        "██╔══██║██║   ██║   ██║   ██║   ██║    ██╔══██╗██╔══╝  ╚════██║██╔══╝  ██╔══██║██╔══██╗██║     ██╔══██║",
+        "██║  ██║╚██████╔╝   ██║   ╚██████╔╝    ██║  ██║███████╗███████║███████╗██║  ██║██║  ██║╚██████╗██║  ██║",
+        "╚═╝  ╚═╝ ╚═════╝    ╚═╝    ╚═════╝     ╚═╝  ╚═╝╚══════╝╚══════╝╚══════╝╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝",
+    ]
+    gradient = ["#1a237e", "#1565c0", "#1e88e5", "#42a5f5", "#64b5f6", "#90caf9"]
+
+    for line, color in zip(logo_lines, gradient, strict=False):
+        console.print(Text(line, style=f"bold {color}"))
+
+    console.print(
+        Text("  Auto Research · Autonomous Discovery Engine", style="dim italic")
+    )
+
+    info_parts: list[tuple[str, str]] = []
+    if model:
+        info_parts.append(("Model", model))
+    if provider:
+        info_parts.append(("Provider", provider))
+    if mode:
+        info_parts.append(("Mode", mode))
+
+    if info_parts:
+        info = Text("  ", style="dim")
+        for i, (k, v) in enumerate(info_parts):
+            if i > 0:
+                info.append("  ", style="dim")
+            info.append(f"{k}: ", style="dim")
+            info.append(v, style="magenta")
+        console.print(info)
 
 
 def _load_baseline() -> float | None:
@@ -118,7 +166,60 @@ def _print_progress(
     """终端打印一行进度"""
     symbols = {"start": "⏳", "done": "🗸", "fail": "🗴", "skip": "»"}
     sym = symbols.get(status, "  ")
-    print(f"[{iteration}/{max_iter}] {label} {sym} {extra}")
+    line = Text()
+    line.append(f"[{iteration}/{max_iter}] ", style="bold cyan")
+    line.append(f"{label} ", style="bold")
+    line.append(f"{sym}", style="yellow")
+    if extra:
+        line.append(f" {extra}", style="dim")
+    console.print(line)
+
+
+def _print_nvidia_smi_snapshot(pid: int):
+    """训练进程启动后打印一次 nvidia-smi 快照，辅助确认实验是否正常运行。"""
+    title = Text("nvidia-smi", style="bold cyan")
+    title.append(f" (after start, pid={pid})", style="dim")
+
+    try:
+        result = subprocess.run(
+            ["nvidia-smi"],
+            cwd=WORKDIR,
+            capture_output=True,
+            text=True,
+            timeout=12,
+        )
+    except FileNotFoundError:
+        console.print(
+            Panel(
+                Text("nvidia-smi command not found", style="yellow"),
+                title=title,
+                border_style="yellow",
+            )
+        )
+        return
+    except subprocess.TimeoutExpired:
+        console.print(
+            Panel(
+                Text("nvidia-smi timed out", style="yellow"),
+                title=title,
+                border_style="yellow",
+            )
+        )
+        return
+
+    output = (result.stdout or "").strip()
+    err = (result.stderr or "").strip()
+    if result.returncode != 0 and err:
+        body = Text(err[:2000], style="red")
+        border = "red"
+    elif not output:
+        body = Text("(no output)", style="dim")
+        border = "yellow"
+    else:
+        body = Text(output[:5000])
+        border = "blue"
+
+    console.print(Panel(body, title=title, border_style=border))
 
 
 def _build_run_summaries() -> list[str]:
@@ -391,6 +492,7 @@ def _repair_once_on_failure(
         train_py_path=WORKDIR / "train.py",
         time_budget=time_budget,
         run_log_path=run_log_path,
+        on_process_started=_print_nvidia_smi_snapshot,
     )
     runtime_min = rerun_result.runtime_seconds / 60
     _print_progress(
@@ -510,9 +612,16 @@ def run_loop(
     baseline_bpb = _load_baseline()
     if baseline_bpb is None:
         baseline_bpb = float("inf")
-        print(f"[loop_runner] No baseline found, starting from scratch")
+        console.print(
+            Text(
+                "[loop_runner] No baseline found, starting from scratch", style="yellow"
+            )
+        )
     else:
-        print(f"[loop_runner] Baseline val_bpb: {baseline_bpb:.6f}")
+        line = Text("[loop_runner] ", style="dim")
+        line.append("Baseline val_bpb: ", style="bold")
+        line.append(f"{baseline_bpb:.6f}", style="bold green")
+        console.print(line)
 
     no_improve_count = 0
     agent = ClaudeCodeAgent(model=MODEL, timeout_sec=600)
@@ -526,12 +635,22 @@ def run_loop(
         )
 
     # 打印 header
-    print()
-    print("=== AutoResearch Loop Runner ===")
-    print(
-        f"baseline: {baseline_bpb:.6f} | max_iter: {max_iterations} | early_stop: {early_stop} | time_budget: {time_budget}s"
-    )
-    print("─" * 50)
+    console.print()
+    print_auto_research_banner(model=MODEL, provider="Claude Code CLI", mode="loop")
+    console.print(Text("=== AutoResearch Loop Runner ===", style="bold white"))
+    summary = Text("baseline: ", style="dim")
+    summary.append(f"{baseline_bpb:.6f}", style="bold green")
+    summary.append(" | ", style="dim")
+    summary.append("max_iter: ", style="dim")
+    summary.append(str(max_iterations), style="bold")
+    summary.append(" | ", style="dim")
+    summary.append("early_stop: ", style="dim")
+    summary.append(str(early_stop), style="bold")
+    summary.append(" | ", style="dim")
+    summary.append("time_budget: ", style="dim")
+    summary.append(f"{time_budget}s", style="bold")
+    console.print(summary)
+    console.print(Text("─" * 50, style="dim"))
 
     for iteration in range(1, max_iterations + 1):
         phase = "generate" if iteration == 1 else "refine"
@@ -635,6 +754,7 @@ def run_loop(
             train_py_path=WORKDIR / "train.py",
             time_budget=time_budget,
             run_log_path=RUN_LOG_FILE,
+            on_process_started=_print_nvidia_smi_snapshot,
         )
 
         runtime_min = exp_result.runtime_seconds / 60

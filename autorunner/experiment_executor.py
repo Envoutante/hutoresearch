@@ -10,11 +10,14 @@ import os
 import signal
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 
+# ===== 数据结构 =====
 @dataclass
 class ExperimentResult:
     """单次实验结果"""
+
     status: str  # 'completed' | 'timeout' | 'crashed'
     val_bpb: float | None
     peak_vram_mb: float | None
@@ -25,11 +28,74 @@ class ExperimentResult:
     num_steps: int | None
     num_params_M: float | None
     depth: int | None
-    failure_type: str | None  # 'none' | 'timeout' | 'dependency' | 'runtime' | 'metric_anomaly'
+    failure_type: (
+        str | None
+    )  # 'none' | 'timeout' | 'dependency' | 'runtime' | 'metric_anomaly'
     log_tail: str
     runtime_seconds: float
 
 
+# 失败类型 -> 修复策略
+FAILURE_RETRY = {
+    "dependency": "retry",  # 依赖缺失，修复后重试
+    "runtime": "retry",  # 运行报错，修复后重试
+    "timeout": "skip",  # 超时不重试
+    "metric_anomaly": "skip",  # NaN/Inf 不重试
+}
+
+
+@dataclass
+class FailureAnalysis:
+    failure_type: str
+    should_retry: bool
+    repair_strategy: str  # 修复建议
+
+
+# ===== 失败分析与重试策略 =====
+def analyze_failure(failure_type: str, log_tail: str = "") -> FailureAnalysis:
+    """分析失败类型，返回是否应该重试及修复策略。"""
+    if failure_type not in FAILURE_RETRY:
+        failure_type = "runtime"
+
+    should_retry = FAILURE_RETRY.get(failure_type, "skip") == "retry"
+
+    if failure_type == "dependency":
+        strategy = (
+            "检查 ImportError/ModuleNotFoundError，安装缺失依赖或修复 import 语句"
+        )
+    elif failure_type == "runtime":
+        strategy = "检查 Traceback，修复 Python 运行时错误（类型错误、属性错误等）"
+    elif failure_type == "timeout":
+        strategy = "训练超时，考虑减少模型规模/批量大小/步数，或增加 time_budget"
+    elif failure_type == "metric_anomaly":
+        strategy = "检测到 NaN/Inf，检查梯度爆炸、学习率过大、初始化问题"
+    else:
+        strategy = "未知错误"
+
+    return FailureAnalysis(
+        failure_type=failure_type,
+        should_retry=should_retry,
+        repair_strategy=strategy,
+    )
+
+
+# ===== 指标判定策略 =====
+def judge(
+    baseline_bpb: float,
+    new_bpb: float,
+    direction: str = "minimize",
+) -> tuple[bool, str]:
+    """判定新候选是否优于基线。"""
+    if direction == "minimize":
+        improved = new_bpb < baseline_bpb
+    else:
+        improved = new_bpb > baseline_bpb
+
+    decision = "keep" if improved else "discard"
+    return improved, decision
+
+
+# ===== 日志解析与失败分类 =====
 def _parse_log(log_content: str) -> dict:
     """从 run.log 解析实验结果"""
     result = {}
@@ -106,10 +172,12 @@ def _classify_failure(log_content: str) -> str:
     return "none"
 
 
+# ===== 训练执行入口 =====
 def run(
     train_py_path: Path,
     time_budget: int = 600,
     run_log_path: Path | None = None,
+    on_process_started: Callable[[int], None] | None = None,
 ) -> ExperimentResult:
     """
     运行 train.py，实时写入 run.log。
@@ -118,6 +186,7 @@ def run(
         train_py_path: train.py 文件路径
         time_budget: 训练时间预算（秒）
         run_log_path: run.log 写入路径（默认 train.py 同目录下 run.log）
+        on_process_started: 子进程启动后回调，参数为 pid
     """
     if run_log_path is None:
         run_log_path = train_py_path.parent / "run.log"
@@ -161,6 +230,11 @@ def run(
 
         # 在“Run experiment”下一行打印当前实验进程 PID，便于排障
         print(f"       pid: {process.pid}")
+        if on_process_started is not None:
+            try:
+                on_process_started(process.pid)
+            except Exception:
+                pass
 
         killer = threading.Thread(target=kill_after_timeout, daemon=True)
         killer.start()

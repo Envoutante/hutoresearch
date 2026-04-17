@@ -4,12 +4,145 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import signal
 import subprocess
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from rich.text import Text
+
+from autorunner.terminal_box import AgentOutputBox, StreamRenderConfig
+
+
+CHINESE_THINKING_SYSTEM_PROMPT = (
+    "请在整个会话中使用中文进行分析与思考。"
+    "如果任务要求某个输出字段有固定格式（例如 DESCRIPTION），请严格遵守该格式要求。"
+)
+
+
+@dataclass
+class StreamEvent:
+    type: str
+    data: dict[str, Any]
+
+
+class Emitter:
+    @staticmethod
+    def tool_call(
+        name: str,
+        args: dict[str, Any],
+        tool_id: str = "",
+        *,
+        index: int | None = None,
+    ) -> StreamEvent:
+        payload: dict[str, Any] = {
+            "type": "tool_call",
+            "name": name,
+            "args": args,
+            "id": tool_id,
+        }
+        if index is not None:
+            payload["index"] = index
+        return StreamEvent(type="tool_call", data=payload)
+
+    @staticmethod
+    def tool_result(
+        name: str,
+        content: str,
+        success: bool,
+        *,
+        tool_id: str = "",
+    ) -> StreamEvent:
+        return StreamEvent(
+            type="tool_result",
+            data={
+                "type": "tool_result",
+                "name": name,
+                "content": content,
+                "success": success,
+                "id": tool_id,
+            },
+        )
+
+
+def normalize_raw_messages(raw: dict[str, Any]) -> list[StreamEvent]:
+    events: list[StreamEvent] = []
+    kind = raw.get("type")
+
+    if kind == "stream_event":
+        event = raw.get("event") or {}
+        if event.get("type") == "content_block_start":
+            block = event.get("content_block") or {}
+            if block.get("type") == "tool_use":
+                idx = event.get("index")
+                events.append(
+                    Emitter.tool_call(
+                        name=str(block.get("name") or "unknown"),
+                        args=(block.get("input") or {}),
+                        tool_id=str(block.get("id") or ""),
+                        index=idx if isinstance(idx, int) else None,
+                    )
+                )
+        return events
+
+    if kind == "assistant":
+        message = raw.get("message") or {}
+        for block in message.get("content") or []:
+            if not isinstance(block, dict):
+                continue
+            block_type = block.get("type")
+            if block_type == "tool_use":
+                events.append(
+                    Emitter.tool_call(
+                        name=str(block.get("name") or "unknown"),
+                        args=(block.get("input") or {}),
+                        tool_id=str(block.get("id") or ""),
+                    )
+                )
+                continue
+            if block_type == "tool_result":
+                content = block.get("content")
+                if isinstance(content, str):
+                    rendered = content
+                else:
+                    rendered = str(content or "")
+                events.append(
+                    Emitter.tool_result(
+                        name=str(block.get("name") or "unknown"),
+                        content=rendered,
+                        success=not bool(block.get("is_error", False)),
+                        tool_id=str(block.get("tool_use_id") or ""),
+                    )
+                )
+        return events
+
+    if kind == "user":
+        message = raw.get("message") or {}
+        for block in message.get("content") or []:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") != "tool_result":
+                continue
+            content = block.get("content")
+            if isinstance(content, str):
+                rendered = content
+            else:
+                rendered = str(content or "")
+            events.append(
+                Emitter.tool_result(
+                    name=str(block.get("name") or "unknown"),
+                    content=rendered,
+                    success=not bool(block.get("is_error", False)),
+                    tool_id=str(block.get("tool_use_id") or ""),
+                )
+            )
+        return events
+
+    return events
 
 
 def _to_text(data: bytes | None) -> str:
@@ -26,6 +159,41 @@ def _collect_py_files(workdir: Path) -> dict[str, str]:
             continue
         files[pyfile.name] = pyfile.read_text(encoding="utf-8")
     return files
+
+
+def _extract_content_from_stream_json(stdout: str) -> str:
+    """Extract final assistant text from stream-json output lines."""
+    final_result = ""
+    text_parts: list[str] = []
+
+    for raw in stdout.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+        if obj.get("type") == "result":
+            final_result = (obj.get("result") or "").strip()
+            continue
+
+        if obj.get("type") != "stream_event":
+            continue
+
+        event = obj.get("event") or {}
+        if event.get("type") != "content_block_delta":
+            continue
+
+        delta = event.get("delta") or {}
+        if delta.get("type") == "text_delta":
+            text_parts.append(delta.get("text") or "")
+
+    if final_result:
+        return final_result
+
+    return "".join(text_parts).strip()
 
 
 @dataclass
@@ -45,6 +213,9 @@ def _run_subprocess(
     cmd: list[str],
     workdir: Path,
     timeout_sec: int,
+    render_title: str = "Claude Agent Output",
+    stream_output: bool = True,
+    transient_output: bool = False,
 ) -> tuple[int, str, str, float, bool]:
     """Run command as subprocess with process-group cleanup on timeout.
 
@@ -53,6 +224,14 @@ def _run_subprocess(
     workdir.mkdir(parents=True, exist_ok=True)
     start = time.monotonic()
     timed_out = False
+    artifacts_dir = workdir / "autorunner" / "artifacts"
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    safe_title = (
+        render_title.lower().replace(" ", "_").replace("(", "").replace(")", "")
+    )
+    live_stream_log = artifacts_dir / f"live_stream_{safe_title}_{int(start)}.jsonl"
+
+    # 调用 Agent
     proc = subprocess.Popen(
         cmd,
         stdin=subprocess.DEVNULL,
@@ -61,23 +240,482 @@ def _run_subprocess(
         cwd=workdir,
         env={**os.environ},
         start_new_session=True,
+        text=True,
+        bufsize=1,
     )
-    try:
-        stdout_bytes, stderr_bytes = proc.communicate(timeout=timeout_sec)
-    except subprocess.TimeoutExpired:
-        timed_out = True
+
+    stdout_lines: list[str] = []
+    stderr_lines: list[str] = []
+    events: queue.Queue[tuple[str, str | None]] = queue.Queue()
+    tool_index_to_id: dict[int, str] = {}
+    tool_call_state: dict[str, dict[str, bool]] = {}
+    tool_call_meta: dict[str, dict[str, Any]] = {}
+    thinking_buffer: list[str] = []
+    current_assistant_stream_id: str | None = None
+
+    def _format_tool_compact(name: str, args: dict[str, Any] | None) -> str:
+        if not args:
+            return name
         try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-        except OSError:
-            pass
+            compact = json.dumps(args, ensure_ascii=False, separators=(",", ":"))
+        except TypeError:
+            compact = str(args)
+        if len(compact) > 120:
+            compact = compact[:117] + "..."
+        return f"{name} {compact}"
+
+    def _is_success(content: str, success_flag: bool) -> bool:
+        if not success_flag:
+            return False
+        lowered = content.lower()
+        return (
+            "<tool_use_error>" not in lowered and "inputvalidationerror" not in lowered
+        )
+
+    def _render_tool_call_line(
+        name: str, args: dict[str, Any], tr: dict[str, Any] | None
+    ) -> Text:
+        is_task = name.lower() == "task"
+        if tr is not None:
+            content = str(tr.get("content") or "")
+            if _is_success(content, bool(tr.get("success", True))):
+                style = "bold green"
+                indicator = "✓"
+            else:
+                style = "bold red"
+                indicator = "✗"
+        else:
+            style = "bold cyan" if is_task else "bold yellow"
+            indicator = "▶"
+
+        tool_text = Text()
+        tool_text.append(f"{indicator} ", style=style)
+        tool_text.append(_format_tool_compact(name, args), style=style)
+        return tool_text
+
+    def _format_tool_result_compact(
+        name: str,
+        content: str,
+        max_lines: int = 10,
+        *,
+        success: bool,
+    ) -> list[Text]:
+        elements: list[Text] = []
+        if not content.strip():
+            elements.append(Text(" └ (empty)", style="dim"))
+            return elements
+
+        lines = content.strip().split("\n")
+        display_lines = lines[:max_lines]
+
+        for i, line in enumerate(display_lines):
+            prefix = "└" if i == 0 else " "
+            rendered = line
+            if len(rendered) > 80:
+                rendered = rendered[:77] + "..."
+            if success:
+                elements.append(Text(f" {prefix} {rendered}", style="dim"))
+            else:
+                elements.append(Text(f" {prefix} {rendered}", style="red dim"))
+
+        remaining = len(lines) - max_lines
+        if remaining > 0:
+            elements.append(Text(f" ... +{remaining} lines", style="dim italic"))
+
+        return elements
+
+    def _start_tool_call_block(call_id: str, tool_name: str):
+        state = tool_call_state.get(call_id)
+        if state is not None:
+            return
+        tool_call_state[call_id] = {
+            "input_written": False,
+            "result_header_written": False,
+        }
+        tool_call_meta[call_id] = {
+            "name": tool_name,
+            "args": {},
+            "input_chunks": [],
+            "result_written": False,
+        }
+        renderer.add_ordered_tools_renderable(
+            _render_tool_call_line(tool_name, {}, None)
+        )
+
+    def _append_tool_input_delta(call_id: str, partial: str):
+        if not partial:
+            return
+        state = tool_call_state.setdefault(
+            call_id,
+            {"input_written": False, "result_header_written": False},
+        )
+        state["input_written"] = True
+        meta = tool_call_meta.setdefault(
+            call_id,
+            {
+                "name": "unknown",
+                "args": {},
+                "input_chunks": [],
+                "result_written": False,
+            },
+        )
+        chunks = meta.setdefault("input_chunks", [])
+        if isinstance(chunks, list):
+            chunks.append(partial)
+
+    def _set_tool_input_object(call_id: str, tool_input: Any):
+        state = tool_call_state.setdefault(
+            call_id,
+            {"input_written": False, "result_header_written": False},
+        )
+        if state["input_written"]:
+            return
+        meta = tool_call_meta.setdefault(
+            call_id,
+            {
+                "name": "unknown",
+                "args": {},
+                "input_chunks": [],
+                "result_written": False,
+            },
+        )
+        if isinstance(tool_input, dict):
+            meta["args"] = tool_input
+        else:
+            meta["args"] = {}
+        state["input_written"] = True
+
+    def _ensure_tool_result_header(call_id: str):
+        return
+
+    def _append_tool_result(call_id: str, result_content: Any, *, success: bool = True):
+        meta = tool_call_meta.setdefault(
+            call_id,
+            {
+                "name": "unknown",
+                "args": {},
+                "input_chunks": [],
+                "result_written": False,
+            },
+        )
+        if bool(meta.get("result_written")):
+            return
+
+        chunks = meta.get("input_chunks")
+        if (not meta.get("args")) and isinstance(chunks, list) and chunks:
+            joined = "".join(str(x) for x in chunks)
+            try:
+                parsed = json.loads(joined)
+                if isinstance(parsed, dict):
+                    meta["args"] = parsed
+            except json.JSONDecodeError:
+                pass
+
+        if isinstance(result_content, list):
+            parts = []
+            for item in result_content:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    parts.append(str(item.get("text") or ""))
+                else:
+                    parts.append(str(item))
+            result_text = "\n".join(p for p in parts if p)
+        elif isinstance(result_content, dict):
+            try:
+                result_text = json.dumps(result_content, ensure_ascii=False, indent=2)
+            except TypeError:
+                result_text = str(result_content)
+        else:
+            result_text = str(result_content or "")
+
+        tool_name = str(meta.get("name") or "unknown")
+        tool_args = meta.get("args")
+        tr = {"name": tool_name, "content": result_text, "success": success}
+        renderer.add_ordered_tools_renderable(
+            _render_tool_call_line(tool_name, tool_args, tr)
+        )
+        is_ok = _is_success(result_text, success)
+        if not is_ok:
+            for line in _format_tool_result_compact(
+                tool_name,
+                result_text,
+                max_lines=10,
+                success=is_ok,
+            ):
+                renderer.add_ordered_tools_renderable(line)
+        meta["result_written"] = True
+
+    def _flush_thinking_buffer():
+        if not thinking_buffer:
+            return
+        text = "".join(thinking_buffer).strip()
+        thinking_buffer.clear()
+        if not text:
+            return
+        renderer.add_ordered_thinking(text)
+
+    def _handle_normalized_event(event: StreamEvent):
+        if event.type == "tool_call":
+            tool_name = str(event.data.get("name") or "unknown")
+            tool_args = event.data.get("args") or {}
+            tool_call_id = str(event.data.get("id") or "")
+            raw_index = event.data.get("index")
+
+            if not tool_call_id:
+                tool_call_id = f"anon_{len(tool_call_state) + 1}"
+
+            if isinstance(raw_index, int):
+                tool_index_to_id[raw_index] = tool_call_id
+
+            _start_tool_call_block(tool_call_id, tool_name)
+            _set_tool_input_object(tool_call_id, tool_args)
+            meta = tool_call_meta.get(tool_call_id)
+            if meta is not None:
+                meta["name"] = tool_name
+                if isinstance(tool_args, dict):
+                    meta["args"] = tool_args
+            return
+
+        if event.type == "tool_result":
+            tool_call_id = str(event.data.get("id") or "")
+            tool_name = str(event.data.get("name") or "unknown")
+            content = event.data.get("content") or ""
+            success = bool(event.data.get("success", True))
+            if not tool_call_id:
+                tool_call_id = f"result_{len(tool_call_state) + 1}"
+                _start_tool_call_block(tool_call_id, tool_name)
+                _set_tool_input_object(tool_call_id, {})
+            elif tool_call_id not in tool_call_state:
+                _start_tool_call_block(tool_call_id, tool_name)
+                _set_tool_input_object(tool_call_id, {})
+
+            _ensure_tool_result_header(tool_call_id)
+            meta = tool_call_meta.get(tool_call_id)
+            if meta is not None and not meta.get("name"):
+                meta["name"] = tool_name
+            _append_tool_result(tool_call_id, content, success=success)
+
+    def _reader_thread(name: str, stream):
         try:
-            stdout_bytes, stderr_bytes = proc.communicate(timeout=5)
+            for line in iter(stream.readline, ""):
+                events.put((name, line))
+        finally:
+            events.put((name, None))
+
+    stdout_thread = threading.Thread(
+        target=_reader_thread,
+        args=("stdout", proc.stdout),
+        daemon=True,
+    )
+    stderr_thread = threading.Thread(
+        target=_reader_thread,
+        args=("stderr", proc.stderr),
+        daemon=True,
+    )
+    stdout_thread.start()
+    stderr_thread.start()
+
+    stream_closed = {"stdout": False, "stderr": False}
+    deadline = start + timeout_sec
+    kill_deadline: float | None = None
+
+    with AgentOutputBox(
+        StreamRenderConfig(
+            title=render_title,
+            enabled=stream_output,
+            full_output_path=str(live_stream_log),
+            transient=transient_output,
+        )
+    ) as renderer:
+        while True:
+            if (
+                proc.poll() is not None
+                and stream_closed["stdout"]
+                and stream_closed["stderr"]
+            ):
+                _flush_thinking_buffer()
+                break
+
+            now = time.monotonic()
+            if now >= deadline and not timed_out:
+                timed_out = True
+                kill_deadline = now + 5.0
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                except OSError:
+                    pass
+
+            if (
+                timed_out
+                and kill_deadline is not None
+                and now >= kill_deadline
+                and proc.poll() is None
+            ):
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except OSError:
+                    pass
+                kill_deadline = None
+
+            renderer.update_elapsed(int(now - start))
+
+            try:
+                name, payload = events.get(timeout=0.2)
+            except queue.Empty:
+                continue
+
+            if payload is None:
+                stream_closed[name] = True
+                continue
+
+            if name == "stdout":
+                stdout_lines.append(payload)
+                try:
+                    with live_stream_log.open("a", encoding="utf-8") as fp:
+                        fp.write(payload)
+                except OSError:
+                    pass
+                text = payload.strip()
+                if not text:
+                    continue
+
+                try:
+                    item = json.loads(text)
+                except json.JSONDecodeError:
+                    renderer.add_stdout(payload)
+                    continue
+
+                kind = item.get("type")
+                event = item.get("event") or {}
+                event_type = event.get("type")
+                delta = event.get("delta") or {}
+                delta_type = delta.get("type")
+
+                # Keep thinking buffered and flush when event type changes.
+                if (
+                    kind == "stream_event"
+                    and event_type == "content_block_delta"
+                    and delta_type == "thinking_delta"
+                ):
+                    thinking_buffer.append(delta.get("thinking") or "")
+                    continue
+
+                _flush_thinking_buffer()
+
+                for normalized_event in normalize_raw_messages(item):
+                    _handle_normalized_event(normalized_event)
+
+                """解析 stream-json 输出"""
+                if kind == "system":
+                    status = item.get("status")
+                    subtype = item.get("subtype")
+                    if status:
+                        renderer.set_status(status)
+                    elif subtype:
+                        renderer.set_status(subtype)
+                    continue
+
+                if kind == "stream_event":
+                    if event_type == "content_block_start":
+                        continue
+
+                    if event_type == "message_start":
+                        message = event.get("message") or {}
+                        msg_id = message.get("id")
+                        current_assistant_stream_id = (
+                            str(msg_id) if msg_id is not None else None
+                        )
+                        continue
+
+                    if event_type == "message_stop":
+                        current_assistant_stream_id = None
+                        continue
+
+                    if event_type == "content_block_delta":
+                        if delta_type == "text_delta":
+                            chunk = delta.get("text") or ""
+                            if chunk:
+                                renderer.add_ordered_assistant(
+                                    chunk,
+                                    stream_id=current_assistant_stream_id,
+                                )
+                        elif delta_type == "input_json_delta":
+                            partial = delta.get("partial_json") or ""
+                            if partial:
+                                renderer.set_status("tool input streaming")
+                            block_index = event.get("index")
+                            if isinstance(block_index, int):
+                                tool_call_id = tool_index_to_id.get(block_index)
+                                if tool_call_id:
+                                    _append_tool_input_delta(tool_call_id, partial)
+                        continue
+
+                    if event_type == "content_block_stop":
+                        block_index = event.get("index")
+                        if isinstance(block_index, int):
+                            tool_call_id = tool_index_to_id.get(block_index)
+                            if tool_call_id:
+                                _ensure_tool_result_header(tool_call_id)
+                        continue
+
+                    if event_type == "message_delta":
+                        stop_reason = (event.get("delta") or {}).get("stop_reason")
+                        renderer.set_usage(event.get("usage"))
+                        if stop_reason:
+                            renderer.set_status(f"stop_reason={stop_reason}")
+                        continue
+
+                    continue
+
+                if kind == "assistant":
+                    message = item.get("message") or {}
+                    for block in message.get("content") or []:
+                        if not isinstance(block, dict):
+                            continue
+                        if block.get("type") == "tool_use":
+                            tool_name = block.get("name") or "tool"
+                            renderer.set_status(f"tool_use={tool_name}")
+                    continue
+
+                if kind == "user":
+                    continue
+
+                if kind == "result":
+                    subtype = item.get("subtype")
+                    if subtype:
+                        renderer.set_status(f"result={subtype}")
+                    renderer.set_usage(
+                        item.get("usage"),
+                        total_cost_usd=item.get("total_cost_usd"),
+                    )
+                    continue
+
+                renderer.add_stdout(payload)
+            else:
+                stderr_lines.append(payload)
+                try:
+                    with live_stream_log.open("a", encoding="utf-8") as fp:
+                        fp.write(payload)
+                except OSError:
+                    pass
+                renderer.add_stderr(payload)
+
+    if timed_out and proc.poll() is None:
+        try:
+            proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             try:
                 os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
             except OSError:
                 pass
-            stdout_bytes, stderr_bytes = proc.communicate(timeout=5)
+            proc.wait(timeout=5)
+
+    if proc.stdout is not None:
+        proc.stdout.close()
+    if proc.stderr is not None:
+        proc.stderr.close()
+
+    stdout_bytes = "".join(stdout_lines).encode("utf-8", errors="replace")
+    stderr_bytes = "".join(stderr_lines).encode("utf-8", errors="replace")
 
     elapsed = time.monotonic() - start
     return (
@@ -97,11 +735,13 @@ class ClaudeCodeAgent:
         model: str = "sonnet",
         timeout_sec: int = 600,
         extra_args: list[str] | None = None,
+        stream_output: bool = True,
     ):
         self._model = model
         self._timeout_sec = timeout_sec
         self._extra_args = extra_args or []
         self._binary = "claude"
+        self._stream_output = stream_output
 
     def _build_result(
         self,
@@ -121,7 +761,7 @@ class ClaudeCodeAgent:
             error = f"Exited {returncode}: {stderr[:500]}"
 
         # 日志内容记录 Claude 文本回复，代码改动通过 files['train.py'] 读取
-        content = stdout.strip()
+        content = _extract_content_from_stream_json(stdout)
         has_train_code = bool(files.get("train.py", "").strip())
         has_reply = bool(content)
 
@@ -140,9 +780,13 @@ class ClaudeCodeAgent:
             self._binary,
             "-p",
             prompt,
+            "--append-system-prompt",
+            CHINESE_THINKING_SYSTEM_PROMPT,
             "--dangerously-skip-permissions",
             "--output-format",
-            "text",
+            "stream-json",
+            "--include-partial-messages",
+            "--verbose",
             "--allowed-tools",
             "Bash Edit Write Read",
             "--add-dir",
@@ -158,8 +802,17 @@ class ClaudeCodeAgent:
         cmd: list[str],
         workdir: Path,
         timeout_sec: int,
+        render_title: str,
+        transient_output: bool = False,
     ) -> tuple[int, str, str, float, bool]:
-        return _run_subprocess(cmd, workdir, timeout_sec)
+        return _run_subprocess(
+            cmd,
+            workdir,
+            timeout_sec,
+            render_title=render_title,
+            stream_output=self._stream_output,
+            transient_output=transient_output,
+        )
 
     def _generate_prompt(
         self,
@@ -227,7 +880,7 @@ class ClaudeCodeAgent:
 
 ## 输出要求
 请按以下格式输出，且不要粘贴整份代码：
-DESCRIPTION: <一句话描述本轮实验改动，英文，5-18词，不含制表符>
+DESCRIPTION: <一句话描述本轮实验改动，中文，5-18词，不含制表符>
 仅使用纯文本，不要使用任何 Markdown 语法符号（例如 #、-、*、```）。
 """
         return prompt
@@ -308,7 +961,7 @@ DESCRIPTION: <一句话描述本轮实验改动，英文，5-18词，不含制�
 
 ## 输出要求
 请按以下格式输出，且不要粘贴整份代码：
-DESCRIPTION: <一句话描述本轮实验改动，英文，5-18词，不含制表符>
+DESCRIPTION: <一句话描述本轮实验改动，中文，5-18词，不含制表符>
 仅使用纯文本，不要使用任何 Markdown 语法符号（例如 #、-、*、```）。
 """
         return prompt
@@ -339,7 +992,7 @@ DESCRIPTION: <一句话描述本轮实验改动，英文，5-18词，不含制�
 
 ## 输出要求
 请按以下格式输出，且不要粘贴整份代码：
-DESCRIPTION: <一句话描述修复动作，英文，5-18词，不含制表符>
+DESCRIPTION: <一句话描述修复动作，中文，5-18词，不含制表符>
 仅使用纯文本，不要使用任何 Markdown 语法符号（例如 #、-、*、```）。
 """
         return prompt
@@ -437,6 +1090,8 @@ E. 下一轮建议：从 continue / revert_and_retry / discard_and_pivot / inves
             cmd,
             workdir,
             timeout_sec or self._timeout_sec,
+            render_title="Generator (generate)",
+            transient_output=True,
         )
         return self._build_result(workdir, rc, stdout, stderr, elapsed, to)
 
@@ -465,6 +1120,8 @@ E. 下一轮建议：从 continue / revert_and_retry / discard_and_pivot / inves
             cmd,
             workdir,
             timeout_sec or self._timeout_sec,
+            render_title="Generator (refine)",
+            transient_output=True,
         )
         return self._build_result(workdir, rc, stdout, stderr, elapsed, to)
 
@@ -482,6 +1139,8 @@ E. 下一轮建议：从 continue / revert_and_retry / discard_and_pivot / inves
             cmd,
             workdir,
             timeout_sec or self._timeout_sec,
+            render_title="Generator (repair)",
+            transient_output=True,
         )
         return self._build_result(workdir, rc, stdout, stderr, elapsed, to)
 
@@ -512,5 +1171,7 @@ E. 下一轮建议：从 continue / revert_and_retry / discard_and_pivot / inves
             cmd,
             workdir,
             timeout_sec or self._timeout_sec,
+            render_title="Evaluator",
+            transient_output=True,
         )
         return self._build_result(workdir, rc, stdout, stderr, elapsed, to)
