@@ -613,7 +613,11 @@ def build_model_config(depth):
     base_dim = depth * ASPECT_RATIO
     model_dim = ((base_dim + HEAD_DIM - 1) // HEAD_DIM) * HEAD_DIM
     num_heads = model_dim // HEAD_DIM
-    n_kv_head = max(1, num_heads // 2)  # GQA: 2 query heads per KV head
+    # GQA: n_kv_head must divide n_head for the fallback attention path
+    n_kv = max(1, num_heads // 2)
+    while num_heads % n_kv != 0:
+        n_kv -= 1
+    n_kv_head = max(1, n_kv)
     return GPTConfig(
         sequence_len=MAX_SEQ_LEN,
         vocab_size=vocab_size,
