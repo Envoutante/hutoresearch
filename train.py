@@ -155,25 +155,28 @@ class GPT(nn.Module):
 
     @torch.no_grad()
     def init_weights(self):
+        # Scaled initialization: std = 0.02 / sqrt(2 * n_layer)
+        # This addresses the universal ~2.8 loss plateau seen across all 13 iterations,
+        # suggesting the original init may have been pushing the model into a bad basin.
+        n_layer = self.config.n_layer
+        init_std = 0.02 / math.sqrt(2 * n_layer)
         # Embedding and unembedding
         torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
-        torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
-        # Transformer blocks
-        n_embd = self.config.n_embd
-        s = 3**0.5 * n_embd**-0.5
+        torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=init_std)
+        # Transformer blocks: scaled init for all matrix parameters
         for block in self.transformer.h:
-            torch.nn.init.uniform_(block.attn.c_q.weight, -s, s)
-            torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
-            torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
+            torch.nn.init.normal_(block.attn.c_q.weight, mean=0.0, std=init_std)
+            torch.nn.init.normal_(block.attn.c_k.weight, mean=0.0, std=init_std)
+            torch.nn.init.normal_(block.attn.c_v.weight, mean=0.0, std=init_std)
             torch.nn.init.zeros_(block.attn.c_proj.weight)
-            torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
+            torch.nn.init.normal_(block.mlp.c_fc.weight, mean=0.0, std=init_std)
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
         # Per-layer scalars
         self.resid_lambdas.fill_(1.0)
         self.x0_lambdas.fill_(0.1)
-        # Value embeddings
+        # Value embeddings: use same scaled init
         for ve in self.value_embeds.values():
-            torch.nn.init.uniform_(ve.weight, -s, s)
+            torch.nn.init.normal_(ve.weight, mean=0.0, std=init_std)
         # Gate weights init to zero (sigmoid(0)=0.5, scaled by 2 -> 1.0 = neutral)
         for block in self.transformer.h:
             if block.attn.ve_gate is not None:
@@ -254,16 +257,15 @@ class GPT(nn.Module):
         # Scale LR ∝ 1/√dmodel (tuned at 768 dim)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         print(f"Scaling AdamW LRs by 1/sqrt({model_dim}/768) = {dmodel_lr_scale:.6f}")
-        # Muon replaced with AdamW as diagnostic: determines if plateau is optimizer-bound or model/data-bound
         param_groups = [
             dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=matrix_params, lr=matrix_lr, betas=adam_betas, eps=1e-10, weight_decay=weight_decay),
+            dict(kind='muon', params=matrix_params, lr=matrix_lr, momentum=0.85, ns_steps=5, weight_decay=weight_decay, beta2=0.95),
         ]
-        optimizer = torch.optim.AdamW(param_groups)
+        optimizer = MuonAdamW(param_groups)
         for group in optimizer.param_groups:
             group["initial_lr"] = group["lr"]
         return optimizer
@@ -525,6 +527,11 @@ def get_lr_multiplier(progress):
         # Linear decay from 1.0 to FINAL_LR_FRAC
         return max(1.0 - progress, FINAL_LR_FRAC)
 
+# Muon momentum schedule: ramp 0.85→0.95 over first 300 steps (iter 7 proven)
+def get_muon_momentum(step):
+    momentum = min(0.85 + (step / 300.0) * 0.10, 0.95)
+    return momentum
+
 # ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
@@ -548,8 +555,11 @@ while True:
     # Progress and schedules
     progress = min(total_training_time / TIME_BUDGET, 1.0)
     lrm = get_lr_multiplier(progress)
+    muon_momentum = get_muon_momentum(step)
     for group in optimizer.param_groups:
         group["lr"] = group["initial_lr"] * lrm
+        if group['kind'] == 'muon':
+            group["momentum"] = muon_momentum
     optimizer.step()
     model.zero_grad(set_to_none=True)
 
