@@ -155,8 +155,31 @@ class GPT(nn.Module):
 
     @torch.no_grad()
     def init_weights(self):
-        # iter 7 exact validated config: PyTorch default initialization for all parameters
-        # (no explicit init override — eliminates GPT-3 scaled init that caused 3+ catastrophic failures)
+        # GPT-3 scaled initialization: std = 0.02 / sqrt(2 * n_layer)
+        # This configuration produced the best historical result (iter 7, val_bpb=1.001131)
+        n_layer = self.config.n_layer
+        init_std = 0.02 / math.sqrt(2 * n_layer)
+        # Embedding and unembedding
+        torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=init_std)
+        torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=init_std)
+        # Transformer blocks: scaled init for all matrix parameters
+        for block in self.transformer.h:
+            torch.nn.init.normal_(block.attn.c_q.weight, mean=0.0, std=init_std)
+            torch.nn.init.normal_(block.attn.c_k.weight, mean=0.0, std=init_std)
+            torch.nn.init.normal_(block.attn.c_v.weight, mean=0.0, std=init_std)
+            torch.nn.init.zeros_(block.attn.c_proj.weight)
+            torch.nn.init.normal_(block.mlp.c_fc.weight, mean=0.0, std=init_std)
+            torch.nn.init.zeros_(block.mlp.c_proj.weight)
+        # Per-layer scalars
+        self.resid_lambdas.fill_(1.0)
+        self.x0_lambdas.fill_(0.1)
+        # Value embeddings: use same scaled init
+        for ve in self.value_embeds.values():
+            torch.nn.init.normal_(ve.weight, mean=0.0, std=init_std)
+        # Gate weights init to zero (sigmoid(0)=0.5, scaled by 2 -> 1.0 = neutral)
+        for block in self.transformer.h:
+            if block.attn.ve_gate is not None:
+                torch.nn.init.zeros_(block.attn.ve_gate.weight)
         # Rotary embeddings (must be recomputed after device placement)
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
