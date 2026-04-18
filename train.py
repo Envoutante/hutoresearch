@@ -248,10 +248,11 @@ class GPT(nn.Module):
     def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02,
                         weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
         model_dim = self.config.n_embd
-        # All 2D transformer.h params (square AND non-square) go to Muon for Newton-Schmidt
-        # coordination — iter 7's exact validated config restored here
+        # 2D square transformer.h params go to Muon for Newton-Schmidt coordination.
+        # Non-square params (MLP c_fc [4d,d], c_proj [d,4d]) must stay with AdamW
+        # because muon.stack_grads requires equal-sized tensors.
         all_h_params = list(self.transformer.h.parameters())
-        matrix_params = [p for p in all_h_params if p.ndim == 2]
+        matrix_params = [p for p in all_h_params if p.ndim == 2 and p.shape[0] == p.shape[1]]
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
