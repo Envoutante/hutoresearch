@@ -405,8 +405,15 @@ class MuonAdamW(torch.optim.Optimizer):
         params = group['params']
         if not params:
             return
-        # Single flat param group — iter 7 proven best (Newton-Schmidt cross-matrix coordination)
-        self._step_muon_single_shape(group, params, params[0].shape)
+        # Group params by shape — each shape needs its own stack/stacked-ops
+        shape_to_params = {}
+        for p in params:
+            shape_key = p.shape
+            if shape_key not in shape_to_params:
+                shape_to_params[shape_key] = []
+            shape_to_params[shape_key].append(p)
+        for shape, ps in shape_to_params.items():
+            self._step_muon_single_shape(group, ps, shape)
 
     def _step_muon_single_shape(self, group, params, shape):
         p = params[0]
