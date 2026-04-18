@@ -30,7 +30,7 @@ fa3 = get_kernel(repo).flash_attn_interface
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
 
-TIME_BUDGET = 1200  # 20min override
+TIME_BUDGET = 2400  # 40min override — extended from 1200s to let model finish converging (LR was still descending at 1200s)
 
 # ---------------------------------------------------------------------------
 # GPT Model
