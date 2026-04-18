@@ -248,7 +248,7 @@ class GPT(nn.Module):
         model_dim = self.config.n_embd
         # All 2D transformer.h params (square AND non-square) go to Muon for Newton-Schmidt coordination
         all_h_params = list(self.transformer.h.parameters())
-        matrix_params = [p for p in all_h_params if p.ndim == 2]
+        matrix_params = [p for p in all_h_params if p.ndim == 2 and p.shape[-2] == p.shape[-1]]
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
