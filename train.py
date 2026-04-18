@@ -405,10 +405,19 @@ class MuonAdamW(torch.optim.Optimizer):
         params = group['params']
         if not params:
             return
+        # Group params by shape since muon requires same-shape stacking
+        from collections import defaultdict
+        params_by_shape = defaultdict(list)
+        for p in params:
+            params_by_shape[p.shape].append(p)
+        for shape, ps in params_by_shape.items():
+            self._step_muon_single_shape(group, ps, shape)
+
+    def _step_muon_single_shape(self, group, params, shape):
         p = params[0]
         state = self.state[p]
         num_params = len(params)
-        shape, device, dtype = p.shape, p.device, p.dtype
+        device, dtype = p.device, p.dtype
         if "momentum_buffer" not in state:
             state["momentum_buffer"] = torch.zeros(num_params, *shape, dtype=dtype, device=device)
         if "second_momentum_buffer" not in state:
