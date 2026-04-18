@@ -445,13 +445,13 @@ WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context
 TOTAL_BATCH_SIZE = 2**17 # ~524K tokens per optimizer step
 EMBEDDING_LR = 0.6      # learning rate for token embeddings (Adam)
 UNEMBEDDING_LR = 0.004  # learning rate for lm_head (Adam)
-MATRIX_LR = 0.05        # learning rate for matrix parameters (Muon) — increased from 0.04 to escape loss plateau
+MATRIX_LR = 0.06        # learning rate for matrix parameters (Muon) — iter 7 baseline was 0.05; try 0.06 for stronger optimizer signal
 SCALAR_LR = 0.5         # learning rate for per-layer scalars (Adam)
 WEIGHT_DECAY = 0.2      # cautious weight decay for Muon
 ADAM_BETAS = (0.8, 0.95) # Adam beta1, beta2
-WARMUP_RATIO = 0.08     # linear warmup fraction (Muon benefits from warmup steps before full-signal matrix training)
+WARMUP_RATIO = 0.0      # linear warmup fraction — iter 7 best: no warmup
 WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown (deprecated, unused in linear schedule)
-FINAL_LR_FRAC = 0.001   # final LR as fraction of initial (lower floor for more late-training exploration)
+FINAL_LR_FRAC = 0.01    # final LR as fraction of initial — iter 7 best: 0.01
 
 # Model size
 DEPTH = 8               # number of transformer layers (baseline: 8)
