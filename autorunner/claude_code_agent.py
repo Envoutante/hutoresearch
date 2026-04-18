@@ -9,19 +9,17 @@ import signal
 import subprocess
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import yaml
 from rich.text import Text
 
 from autorunner.terminal_box import AgentOutputBox, StreamRenderConfig
 
 
-CHINESE_THINKING_SYSTEM_PROMPT = (
-    "请在整个会话中使用中文进行分析与思考。"
-    "如果任务要求某个输出字段有固定格式（例如 DESCRIPTION），请严格遵守该格式要求。"
-)
+DEFAULT_PROMPT_CONFIG_NAME = "subagent.yaml"
 
 
 @dataclass
@@ -39,6 +37,7 @@ class Emitter:
         *,
         index: int | None = None,
     ) -> StreamEvent:
+        """构造工具调用事件对象。"""
         payload: dict[str, Any] = {
             "type": "tool_call",
             "name": name,
@@ -57,6 +56,7 @@ class Emitter:
         *,
         tool_id: str = "",
     ) -> StreamEvent:
+        """构造工具结果事件对象。"""
         return StreamEvent(
             type="tool_result",
             data={
@@ -70,6 +70,7 @@ class Emitter:
 
 
 def normalize_raw_messages(raw: dict[str, Any]) -> list[StreamEvent]:
+    """将原始流式消息标准化为统一事件列表。"""
     events: list[StreamEvent] = []
     kind = raw.get("type")
 
@@ -146,13 +147,14 @@ def normalize_raw_messages(raw: dict[str, Any]) -> list[StreamEvent]:
 
 
 def _to_text(data: bytes | None) -> str:
+    """将字节数据安全解码为文本。"""
     if data is None:
         return ""
     return data.decode("utf-8", errors="replace")
 
 
 def _collect_py_files(workdir: Path) -> dict[str, str]:
-    """读取 workdir 下所有顶层 .py 文件（不递归子目录）。"""
+    """读取工作目录下所有顶层 Python 文件内容。"""
     files: dict[str, str] = {}
     for pyfile in sorted(workdir.glob("*.py")):
         if pyfile.name.startswith("_"):
@@ -162,7 +164,7 @@ def _collect_py_files(workdir: Path) -> dict[str, str]:
 
 
 def _extract_content_from_stream_json(stdout: str) -> str:
-    """Extract final assistant text from stream-json output lines."""
+    """从 stream-json 输出中提取最终回复文本。"""
     final_result = ""
     text_parts: list[str] = []
 
@@ -197,7 +199,7 @@ def _extract_content_from_stream_json(stdout: str) -> str:
 
 
 def _extract_error_from_stream_json(stdout: str) -> str:
-    """Extract human-readable error details from stream-json stdout lines."""
+    """从 stream-json 输出中提取可读的错误信息。"""
     error_text = ""
 
     for raw in stdout.splitlines():
@@ -245,51 +247,91 @@ class CodeAgentResult:
     files: dict[str, str]  # workdir 中的 .py 文件
 
 
-def _run_subprocess(
-    cmd: list[str],
-    workdir: Path,
-    timeout_sec: int,
-    render_title: str = "Claude Agent Output",
-    stream_output: bool = True,
-    transient_output: bool = False,
-) -> tuple[int, str, str, float, bool]:
-    """Run command as subprocess with process-group cleanup on timeout.
-
-    Returns (returncode, stdout, stderr, elapsed_sec, timed_out).
-    """
-    workdir.mkdir(parents=True, exist_ok=True)
-    start = time.monotonic()
-    timed_out = False
-    artifacts_dir = workdir / "autorunner" / "artifacts"
-    artifacts_dir.mkdir(parents=True, exist_ok=True)
-    safe_title = (
-        render_title.lower().replace(" ", "_").replace("(", "").replace(")", "")
-    )
-    live_stream_log = artifacts_dir / f"live_stream_{safe_title}_{int(start)}.jsonl"
-
-    # 调用 Agent
-    proc = subprocess.Popen(
-        cmd,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        cwd=workdir,
-        env={**os.environ},
-        start_new_session=True,
-        text=True,
-        bufsize=1,
-    )
-
-    stdout_lines: list[str] = []
-    stderr_lines: list[str] = []
-    events: queue.Queue[tuple[str, str | None]] = queue.Queue()
-    tool_index_to_id: dict[int, str] = {}
-    tool_call_state: dict[str, dict[str, bool]] = {}
-    tool_call_meta: dict[str, dict[str, Any]] = {}
-    thinking_buffer: list[str] = []
+@dataclass
+class _SubprocessStreamState:
+    stdout_lines: list[str] = field(default_factory=list)
+    stderr_lines: list[str] = field(default_factory=list)
+    events: queue.Queue[tuple[str, str | None]] = field(default_factory=queue.Queue)
+    tool_index_to_id: dict[int, str] = field(default_factory=dict)
+    tool_call_state: dict[str, dict[str, bool]] = field(default_factory=dict)
+    tool_call_meta: dict[str, dict[str, Any]] = field(default_factory=dict)
+    thinking_buffer: list[str] = field(default_factory=list)
     current_assistant_stream_id: str | None = None
+    stream_closed: dict[str, bool] = field(
+        default_factory=lambda: {"stdout": False, "stderr": False}
+    )
+    timed_out: bool = False
+    kill_deadline: float | None = None
 
+
+def _append_live_stream_line(log_path: Path, payload: str) -> None:
+    """将实时流内容追加写入日志文件。"""
+    try:
+        with log_path.open("a", encoding="utf-8") as fp:
+            fp.write(payload)
+    except OSError:
+        pass
+
+
+def _stream_reader_thread(
+    name: str,
+    stream: Any,
+    events: queue.Queue[tuple[str, str | None]],
+) -> None:
+    """持续读取子进程输出流并投递到事件队列。"""
+    try:
+        for line in iter(stream.readline, ""):
+            events.put((name, line))
+    finally:
+        events.put((name, None))
+
+
+def _start_stream_reader_threads(
+    proc: subprocess.Popen[str],
+    events: queue.Queue[tuple[str, str | None]],
+) -> None:
+    """启动标准输出与标准错误的后台读取线程。"""
+    stdout_thread = threading.Thread(
+        target=_stream_reader_thread,
+        args=("stdout", proc.stdout, events),
+        daemon=True,
+    )
+    stderr_thread = threading.Thread(
+        target=_stream_reader_thread,
+        args=("stderr", proc.stderr, events),
+        daemon=True,
+    )
+    stdout_thread.start()
+    stderr_thread.start()
+
+
+def _terminate_subprocess_group(proc: subprocess.Popen[str], timed_out: bool) -> None:
+    """按超时状态优雅终止并回收子进程相关资源。"""
+    if timed_out and proc.poll() is None:
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except OSError:
+                pass
+            proc.wait(timeout=5)
+
+    if proc.stdout is not None:
+        proc.stdout.close()
+    if proc.stderr is not None:
+        proc.stderr.close()
+
+
+class _StreamOutputProcessor:
+    def __init__(self, state: _SubprocessStreamState, renderer: Any):
+        """初始化流输出处理器。"""
+        self.state = state
+        self.renderer = renderer
+
+    @staticmethod
     def _format_tool_compact(name: str, args: dict[str, Any] | None) -> str:
+        """将工具名和参数格式化为紧凑展示文本。"""
         if not args:
             return name
         try:
@@ -300,21 +342,28 @@ def _run_subprocess(
             compact = compact[:117] + "..."
         return f"{name} {compact}"
 
+    @staticmethod
     def _is_success(content: str, success_flag: bool) -> bool:
+        """根据标记与内容判断工具调用是否成功。"""
         if not success_flag:
             return False
         lowered = content.lower()
         return (
-            "<tool_use_error>" not in lowered and "inputvalidationerror" not in lowered
+            "<tool_use_error>" not in lowered
+            and "inputvalidationerror" not in lowered
         )
 
     def _render_tool_call_line(
-        name: str, args: dict[str, Any], tr: dict[str, Any] | None
+        self,
+        name: str,
+        args: dict[str, Any],
+        tr: dict[str, Any] | None,
     ) -> Text:
+        """渲染单条工具调用状态行。"""
         is_task = name.lower() == "task"
         if tr is not None:
             content = str(tr.get("content") or "")
-            if _is_success(content, bool(tr.get("success", True))):
+            if self._is_success(content, bool(tr.get("success", True))):
                 style = "bold green"
                 indicator = "✓"
             else:
@@ -326,16 +375,17 @@ def _run_subprocess(
 
         tool_text = Text()
         tool_text.append(f"{indicator} ", style=style)
-        tool_text.append(_format_tool_compact(name, args), style=style)
+        tool_text.append(self._format_tool_compact(name, args), style=style)
         return tool_text
 
     def _format_tool_result_compact(
-        name: str,
+        self,
         content: str,
-        max_lines: int = 10,
+        max_lines: int,
         *,
         success: bool,
     ) -> list[Text]:
+        """将工具结果压缩为适合终端展示的文本行。"""
         elements: list[Text] = []
         if not content.strip():
             elements.append(Text(" └ (empty)", style="dim"))
@@ -360,33 +410,34 @@ def _run_subprocess(
 
         return elements
 
-    def _start_tool_call_block(call_id: str, tool_name: str):
-        state = tool_call_state.get(call_id)
-        if state is not None:
+    def _start_tool_call_block(self, call_id: str, tool_name: str) -> None:
+        """初始化并渲染一个工具调用块。"""
+        if call_id in self.state.tool_call_state:
             return
-        tool_call_state[call_id] = {
+        self.state.tool_call_state[call_id] = {
             "input_written": False,
             "result_header_written": False,
         }
-        tool_call_meta[call_id] = {
+        self.state.tool_call_meta[call_id] = {
             "name": tool_name,
             "args": {},
             "input_chunks": [],
             "result_written": False,
         }
-        renderer.add_ordered_tools_renderable(
-            _render_tool_call_line(tool_name, {}, None)
+        self.renderer.add_ordered_tools_renderable(
+            self._render_tool_call_line(tool_name, {}, None)
         )
 
-    def _append_tool_input_delta(call_id: str, partial: str):
+    def _append_tool_input_delta(self, call_id: str, partial: str) -> None:
+        """追加工具输入的增量 JSON 片段。"""
         if not partial:
             return
-        state = tool_call_state.setdefault(
+        state = self.state.tool_call_state.setdefault(
             call_id,
             {"input_written": False, "result_header_written": False},
         )
         state["input_written"] = True
-        meta = tool_call_meta.setdefault(
+        meta = self.state.tool_call_meta.setdefault(
             call_id,
             {
                 "name": "unknown",
@@ -399,14 +450,15 @@ def _run_subprocess(
         if isinstance(chunks, list):
             chunks.append(partial)
 
-    def _set_tool_input_object(call_id: str, tool_input: Any):
-        state = tool_call_state.setdefault(
+    def _set_tool_input_object(self, call_id: str, tool_input: Any) -> None:
+        """记录工具调用的完整输入对象。"""
+        state = self.state.tool_call_state.setdefault(
             call_id,
             {"input_written": False, "result_header_written": False},
         )
         if state["input_written"]:
             return
-        meta = tool_call_meta.setdefault(
+        meta = self.state.tool_call_meta.setdefault(
             call_id,
             {
                 "name": "unknown",
@@ -415,17 +467,23 @@ def _run_subprocess(
                 "result_written": False,
             },
         )
-        if isinstance(tool_input, dict):
-            meta["args"] = tool_input
-        else:
-            meta["args"] = {}
+        meta["args"] = tool_input if isinstance(tool_input, dict) else {}
         state["input_written"] = True
 
-    def _ensure_tool_result_header(call_id: str):
+    def _ensure_tool_result_header(self, call_id: str) -> None:
+        """预留工具结果头部处理钩子。"""
+        _ = call_id
         return
 
-    def _append_tool_result(call_id: str, result_content: Any, *, success: bool = True):
-        meta = tool_call_meta.setdefault(
+    def _append_tool_result(
+        self,
+        call_id: str,
+        result_content: Any,
+        *,
+        success: bool = True,
+    ) -> None:
+        """写入并渲染工具调用结果。"""
+        meta = self.state.tool_call_meta.setdefault(
             call_id,
             {
                 "name": "unknown",
@@ -466,30 +524,30 @@ def _run_subprocess(
         tool_name = str(meta.get("name") or "unknown")
         tool_args = meta.get("args")
         tr = {"name": tool_name, "content": result_text, "success": success}
-        renderer.add_ordered_tools_renderable(
-            _render_tool_call_line(tool_name, tool_args, tr)
+        self.renderer.add_ordered_tools_renderable(
+            self._render_tool_call_line(tool_name, tool_args, tr)
         )
-        is_ok = _is_success(result_text, success)
+        is_ok = self._is_success(result_text, success)
         if not is_ok:
-            for line in _format_tool_result_compact(
-                tool_name,
+            for line in self._format_tool_result_compact(
                 result_text,
                 max_lines=10,
                 success=is_ok,
             ):
-                renderer.add_ordered_tools_renderable(line)
+                self.renderer.add_ordered_tools_renderable(line)
         meta["result_written"] = True
 
-    def _flush_thinking_buffer():
-        if not thinking_buffer:
+    def flush_thinking_buffer(self) -> None:
+        """刷新并渲染暂存的思考文本。"""
+        if not self.state.thinking_buffer:
             return
-        text = "".join(thinking_buffer).strip()
-        thinking_buffer.clear()
-        if not text:
-            return
-        renderer.add_ordered_thinking(text)
+        text = "".join(self.state.thinking_buffer).strip()
+        self.state.thinking_buffer.clear()
+        if text:
+            self.renderer.add_ordered_thinking(text)
 
-    def _handle_normalized_event(event: StreamEvent):
+    def _handle_normalized_event(self, event: StreamEvent) -> None:
+        """处理标准化后的工具事件。"""
         if event.type == "tool_call":
             tool_name = str(event.data.get("name") or "unknown")
             tool_args = event.data.get("args") or {}
@@ -497,14 +555,14 @@ def _run_subprocess(
             raw_index = event.data.get("index")
 
             if not tool_call_id:
-                tool_call_id = f"anon_{len(tool_call_state) + 1}"
+                tool_call_id = f"anon_{len(self.state.tool_call_state) + 1}"
 
             if isinstance(raw_index, int):
-                tool_index_to_id[raw_index] = tool_call_id
+                self.state.tool_index_to_id[raw_index] = tool_call_id
 
-            _start_tool_call_block(tool_call_id, tool_name)
-            _set_tool_input_object(tool_call_id, tool_args)
-            meta = tool_call_meta.get(tool_call_id)
+            self._start_tool_call_block(tool_call_id, tool_name)
+            self._set_tool_input_object(tool_call_id, tool_args)
+            meta = self.state.tool_call_meta.get(tool_call_id)
             if meta is not None:
                 meta["name"] = tool_name
                 if isinstance(tool_args, dict):
@@ -517,42 +575,181 @@ def _run_subprocess(
             content = event.data.get("content") or ""
             success = bool(event.data.get("success", True))
             if not tool_call_id:
-                tool_call_id = f"result_{len(tool_call_state) + 1}"
-                _start_tool_call_block(tool_call_id, tool_name)
-                _set_tool_input_object(tool_call_id, {})
-            elif tool_call_id not in tool_call_state:
-                _start_tool_call_block(tool_call_id, tool_name)
-                _set_tool_input_object(tool_call_id, {})
+                tool_call_id = f"result_{len(self.state.tool_call_state) + 1}"
+                self._start_tool_call_block(tool_call_id, tool_name)
+                self._set_tool_input_object(tool_call_id, {})
+            elif tool_call_id not in self.state.tool_call_state:
+                self._start_tool_call_block(tool_call_id, tool_name)
+                self._set_tool_input_object(tool_call_id, {})
 
-            _ensure_tool_result_header(tool_call_id)
-            meta = tool_call_meta.get(tool_call_id)
+            self._ensure_tool_result_header(tool_call_id)
+            meta = self.state.tool_call_meta.get(tool_call_id)
             if meta is not None and not meta.get("name"):
                 meta["name"] = tool_name
-            _append_tool_result(tool_call_id, content, success=success)
+            self._append_tool_result(tool_call_id, content, success=success)
 
-    def _reader_thread(name: str, stream):
+    def handle_stdout_payload(self, payload: str, live_stream_log: Path) -> None:
+        """处理并渲染标准输出中的单条负载。"""
+        self.state.stdout_lines.append(payload)
+        _append_live_stream_line(live_stream_log, payload)
+
+        text = payload.strip()
+        if not text:
+            return
+
         try:
-            for line in iter(stream.readline, ""):
-                events.put((name, line))
-        finally:
-            events.put((name, None))
+            item = json.loads(text)
+        except json.JSONDecodeError:
+            self.renderer.add_stdout(payload)
+            return
 
-    stdout_thread = threading.Thread(
-        target=_reader_thread,
-        args=("stdout", proc.stdout),
-        daemon=True,
-    )
-    stderr_thread = threading.Thread(
-        target=_reader_thread,
-        args=("stderr", proc.stderr),
-        daemon=True,
-    )
-    stdout_thread.start()
-    stderr_thread.start()
+        kind = item.get("type")
+        event = item.get("event") or {}
+        event_type = event.get("type")
+        delta = event.get("delta") or {}
+        delta_type = delta.get("type")
 
-    stream_closed = {"stdout": False, "stderr": False}
+        if (
+            kind == "stream_event"
+            and event_type == "content_block_delta"
+            and delta_type == "thinking_delta"
+        ):
+            self.state.thinking_buffer.append(delta.get("thinking") or "")
+            return
+
+        self.flush_thinking_buffer()
+
+        for normalized_event in normalize_raw_messages(item):
+            self._handle_normalized_event(normalized_event)
+
+        if kind == "system":
+            status = item.get("status")
+            subtype = item.get("subtype")
+            if status:
+                self.renderer.set_status(status)
+            elif subtype:
+                self.renderer.set_status(subtype)
+            return
+
+        if kind == "stream_event":
+            if event_type == "content_block_start":
+                return
+
+            if event_type == "message_start":
+                message = event.get("message") or {}
+                msg_id = message.get("id")
+                self.state.current_assistant_stream_id = (
+                    str(msg_id) if msg_id is not None else None
+                )
+                return
+
+            if event_type == "message_stop":
+                self.state.current_assistant_stream_id = None
+                return
+
+            if event_type == "content_block_delta":
+                if delta_type == "text_delta":
+                    chunk = delta.get("text") or ""
+                    if chunk:
+                        self.renderer.add_ordered_assistant(
+                            chunk,
+                            stream_id=self.state.current_assistant_stream_id,
+                        )
+                elif delta_type == "input_json_delta":
+                    partial = delta.get("partial_json") or ""
+                    if partial:
+                        self.renderer.set_status("tool input streaming")
+                    block_index = event.get("index")
+                    if isinstance(block_index, int):
+                        tool_call_id = self.state.tool_index_to_id.get(block_index)
+                        if tool_call_id:
+                            self._append_tool_input_delta(tool_call_id, partial)
+                return
+
+            if event_type == "content_block_stop":
+                block_index = event.get("index")
+                if isinstance(block_index, int):
+                    tool_call_id = self.state.tool_index_to_id.get(block_index)
+                    if tool_call_id:
+                        self._ensure_tool_result_header(tool_call_id)
+                return
+
+            if event_type == "message_delta":
+                stop_reason = (event.get("delta") or {}).get("stop_reason")
+                self.renderer.set_usage(event.get("usage"))
+                if stop_reason:
+                    self.renderer.set_status(f"stop_reason={stop_reason}")
+                return
+
+            return
+
+        if kind == "assistant":
+            message = item.get("message") or {}
+            for block in message.get("content") or []:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") == "tool_use":
+                    tool_name = block.get("name") or "tool"
+                    self.renderer.set_status(f"tool_use={tool_name}")
+            return
+
+        if kind == "user":
+            return
+
+        if kind == "result":
+            subtype = item.get("subtype")
+            if subtype:
+                self.renderer.set_status(f"result={subtype}")
+            self.renderer.set_usage(
+                item.get("usage"),
+                total_cost_usd=item.get("total_cost_usd"),
+            )
+            return
+
+        self.renderer.add_stdout(payload)
+
+    def handle_stderr_payload(self, payload: str, live_stream_log: Path) -> None:
+        """处理并渲染标准错误中的单条负载。"""
+        self.state.stderr_lines.append(payload)
+        _append_live_stream_line(live_stream_log, payload)
+        self.renderer.add_stderr(payload)
+
+
+def _run_subprocess(
+    cmd: list[str],
+    workdir: Path,
+    timeout_sec: int,
+    render_title: str = "Claude Agent Output",
+    stream_output: bool = True,
+    transient_output: bool = False,
+) -> tuple[int, str, str, float, bool]:
+    """运行子进程并返回退出码、输出与超时信息。"""
+    workdir.mkdir(parents=True, exist_ok=True)
+    start = time.monotonic()
+    artifacts_dir = workdir / "autorunner" / "artifacts"
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    safe_title = (
+        render_title.lower().replace(" ", "_").replace("(", "").replace(")", "")
+    )
+    live_stream_log = artifacts_dir / f"live_stream_{safe_title}_{int(start)}.jsonl"
+
+    # 调用 Agent
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        cwd=workdir,
+        env={**os.environ},
+        start_new_session=True,
+        text=True,
+        bufsize=1,
+    )
+
+    state = _SubprocessStreamState()
+    _start_stream_reader_threads(proc, state.events)
+
     deadline = start + timeout_sec
-    kill_deadline: float | None = None
 
     with AgentOutputBox(
         StreamRenderConfig(
@@ -562,196 +759,57 @@ def _run_subprocess(
             transient=transient_output,
         )
     ) as renderer:
+        processor = _StreamOutputProcessor(state, renderer)
         while True:
             if (
                 proc.poll() is not None
-                and stream_closed["stdout"]
-                and stream_closed["stderr"]
+                and state.stream_closed["stdout"]
+                and state.stream_closed["stderr"]
             ):
-                _flush_thinking_buffer()
+                processor.flush_thinking_buffer()
                 break
 
             now = time.monotonic()
-            if now >= deadline and not timed_out:
-                timed_out = True
-                kill_deadline = now + 5.0
+            if now >= deadline and not state.timed_out:
+                state.timed_out = True
+                state.kill_deadline = now + 5.0
                 try:
                     os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
                 except OSError:
                     pass
 
             if (
-                timed_out
-                and kill_deadline is not None
-                and now >= kill_deadline
+                state.timed_out
+                and state.kill_deadline is not None
+                and now >= state.kill_deadline
                 and proc.poll() is None
             ):
                 try:
                     os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
                 except OSError:
                     pass
-                kill_deadline = None
+                state.kill_deadline = None
 
             renderer.update_elapsed(int(now - start))
 
             try:
-                name, payload = events.get(timeout=0.2)
+                name, payload = state.events.get(timeout=0.2)
             except queue.Empty:
                 continue
 
             if payload is None:
-                stream_closed[name] = True
+                state.stream_closed[name] = True
                 continue
 
             if name == "stdout":
-                stdout_lines.append(payload)
-                try:
-                    with live_stream_log.open("a", encoding="utf-8") as fp:
-                        fp.write(payload)
-                except OSError:
-                    pass
-                text = payload.strip()
-                if not text:
-                    continue
-
-                try:
-                    item = json.loads(text)
-                except json.JSONDecodeError:
-                    renderer.add_stdout(payload)
-                    continue
-
-                kind = item.get("type")
-                event = item.get("event") or {}
-                event_type = event.get("type")
-                delta = event.get("delta") or {}
-                delta_type = delta.get("type")
-
-                # Keep thinking buffered and flush when event type changes.
-                if (
-                    kind == "stream_event"
-                    and event_type == "content_block_delta"
-                    and delta_type == "thinking_delta"
-                ):
-                    thinking_buffer.append(delta.get("thinking") or "")
-                    continue
-
-                _flush_thinking_buffer()
-
-                for normalized_event in normalize_raw_messages(item):
-                    _handle_normalized_event(normalized_event)
-
-                """解析 stream-json 输出"""
-                if kind == "system":
-                    status = item.get("status")
-                    subtype = item.get("subtype")
-                    if status:
-                        renderer.set_status(status)
-                    elif subtype:
-                        renderer.set_status(subtype)
-                    continue
-
-                if kind == "stream_event":
-                    if event_type == "content_block_start":
-                        continue
-
-                    if event_type == "message_start":
-                        message = event.get("message") or {}
-                        msg_id = message.get("id")
-                        current_assistant_stream_id = (
-                            str(msg_id) if msg_id is not None else None
-                        )
-                        continue
-
-                    if event_type == "message_stop":
-                        current_assistant_stream_id = None
-                        continue
-
-                    if event_type == "content_block_delta":
-                        if delta_type == "text_delta":
-                            chunk = delta.get("text") or ""
-                            if chunk:
-                                renderer.add_ordered_assistant(
-                                    chunk,
-                                    stream_id=current_assistant_stream_id,
-                                )
-                        elif delta_type == "input_json_delta":
-                            partial = delta.get("partial_json") or ""
-                            if partial:
-                                renderer.set_status("tool input streaming")
-                            block_index = event.get("index")
-                            if isinstance(block_index, int):
-                                tool_call_id = tool_index_to_id.get(block_index)
-                                if tool_call_id:
-                                    _append_tool_input_delta(tool_call_id, partial)
-                        continue
-
-                    if event_type == "content_block_stop":
-                        block_index = event.get("index")
-                        if isinstance(block_index, int):
-                            tool_call_id = tool_index_to_id.get(block_index)
-                            if tool_call_id:
-                                _ensure_tool_result_header(tool_call_id)
-                        continue
-
-                    if event_type == "message_delta":
-                        stop_reason = (event.get("delta") or {}).get("stop_reason")
-                        renderer.set_usage(event.get("usage"))
-                        if stop_reason:
-                            renderer.set_status(f"stop_reason={stop_reason}")
-                        continue
-
-                    continue
-
-                if kind == "assistant":
-                    message = item.get("message") or {}
-                    for block in message.get("content") or []:
-                        if not isinstance(block, dict):
-                            continue
-                        if block.get("type") == "tool_use":
-                            tool_name = block.get("name") or "tool"
-                            renderer.set_status(f"tool_use={tool_name}")
-                    continue
-
-                if kind == "user":
-                    continue
-
-                if kind == "result":
-                    subtype = item.get("subtype")
-                    if subtype:
-                        renderer.set_status(f"result={subtype}")
-                    renderer.set_usage(
-                        item.get("usage"),
-                        total_cost_usd=item.get("total_cost_usd"),
-                    )
-                    continue
-
-                renderer.add_stdout(payload)
+                processor.handle_stdout_payload(payload, live_stream_log)
             else:
-                stderr_lines.append(payload)
-                try:
-                    with live_stream_log.open("a", encoding="utf-8") as fp:
-                        fp.write(payload)
-                except OSError:
-                    pass
-                renderer.add_stderr(payload)
+                processor.handle_stderr_payload(payload, live_stream_log)
 
-    if timed_out and proc.poll() is None:
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except OSError:
-                pass
-            proc.wait(timeout=5)
+    _terminate_subprocess_group(proc, state.timed_out)
 
-    if proc.stdout is not None:
-        proc.stdout.close()
-    if proc.stderr is not None:
-        proc.stderr.close()
-
-    stdout_bytes = "".join(stdout_lines).encode("utf-8", errors="replace")
-    stderr_bytes = "".join(stderr_lines).encode("utf-8", errors="replace")
+    stdout_bytes = "".join(state.stdout_lines).encode("utf-8", errors="replace")
+    stderr_bytes = "".join(state.stderr_lines).encode("utf-8", errors="replace")
 
     elapsed = time.monotonic() - start
     return (
@@ -759,7 +817,7 @@ def _run_subprocess(
         _to_text(stdout_bytes),
         _to_text(stderr_bytes),
         elapsed,
-        timed_out,
+        state.timed_out,
     )
 
 
@@ -772,12 +830,45 @@ class ClaudeCodeAgent:
         timeout_sec: int = 600,
         extra_args: list[str] | None = None,
         stream_output: bool = True,
+        prompt_config_path: Path | None = None,
     ):
+        """初始化 Claude Code Agent 的运行参数与提示词配置。"""
         self._model = model
         self._timeout_sec = timeout_sec
         self._extra_args = extra_args or []
         self._binary = "claude"
         self._stream_output = stream_output
+        self._prompt_config_path = prompt_config_path or Path(__file__).with_name(
+            DEFAULT_PROMPT_CONFIG_NAME
+        )
+        self._prompt_templates = self._load_prompt_templates(self._prompt_config_path)
+
+    def _load_prompt_templates(self, config_path: Path) -> dict[str, Any]:
+        """加载并校验提示词模板配置。"""
+        if not config_path.exists():
+            raise FileNotFoundError(f"Prompt config file not found: {config_path}")
+        data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError(f"Prompt config must be a mapping: {config_path}")
+        return data
+
+    def _render_prompt(self, section: str, template_name: str, **kwargs: Any) -> str:
+        """按模板与变量渲染最终提示词。"""
+        section_map = self._prompt_templates.get(section)
+        if not isinstance(section_map, dict):
+            raise ValueError(f"Missing prompt section: {section}")
+
+        template = section_map.get(template_name)
+        if not isinstance(template, str):
+            raise ValueError(f"Missing prompt template: {section}.{template_name}")
+
+        try:
+            return template.format(**kwargs)
+        except KeyError as exc:
+            missing_key = exc.args[0]
+            raise ValueError(
+                f"Missing prompt variable '{missing_key}' for {section}.{template_name}"
+            ) from exc
 
     def _build_result(
         self,
@@ -788,7 +879,7 @@ class ClaudeCodeAgent:
         elapsed: float,
         timed_out: bool,
     ) -> CodeAgentResult:
-        """Collect .py files from workdir and build result."""
+        """汇总执行产物并构造统一结果对象。"""
         files = _collect_py_files(workdir)
         effective_stderr = stderr.strip()
         if returncode != 0 and not effective_stderr:
@@ -816,12 +907,11 @@ class ClaudeCodeAgent:
         )
 
     def _build_cmd(self, prompt: str, workdir: Path) -> list[str]:
+        """组装 Claude CLI 命令行参数。"""
         cmd = [
             self._binary,
             "-p",
             prompt,
-            "--append-system-prompt",
-            CHINESE_THINKING_SYSTEM_PROMPT,
             "--dangerously-skip-permissions",
             "--output-format",
             "stream-json",
@@ -845,6 +935,7 @@ class ClaudeCodeAgent:
         render_title: str,
         transient_output: bool = False,
     ) -> tuple[int, str, str, float, bool]:
+        """调用底层子进程执行器并透传结果。"""
         return _run_subprocess(
             cmd,
             workdir,
@@ -859,72 +950,17 @@ class ClaudeCodeAgent:
         topic: str,
         exp_plan: str,
         metric_key: str,
-        pkg_hint: str,
-        compute_budget: str,
         extra_guidance: str,
     ) -> str:
-        """生成首次 generate 的 prompt"""
-        prompt = f"""你是 AI 研究员，正在对 GPT 训练代码 train.py 进行实验优化。
-
-## 任务
-{topic}
-
-## 实验目标
-{exp_plan}
-
-## 评估指标
-指标名: {metric_key}
-方向: minimize（越低越好）
-
-## 计算预算
-{compute_budget}
-
-## 约束与取舍原则
-1. VRAM 是软约束：为了获得有意义的 {metric_key} 改善，允许小幅增加显存，但严禁显存占用急剧膨胀。
-2. 简洁性优先：在其他条件相同的情况下，优先更简单的改动。
-3. 复杂性与收益权衡：如果改动明显增加复杂性但收益很小（例如约 0.001 的改善却引入大量 hack 代码），通常不应采用。
-4. 简化奖励：若删除代码后取得相同或更好结果，应优先保留该方案；即便指标几乎不变，但代码明显更简单，也应倾向保留。
-
-## 想法耗尽时的探索策略
-如果你感觉可尝试的想法变少，不要停下，请继续主动探索：
-1. 回看代码中引用的论文与实现线索，提取可落地到当前 train.py 的改动点。
-2. 重新审阅已给出的上下文与历史结果，寻找未被充分尝试的角度。
-3. 组合此前“接近成功”的思路做小步重组。
-4. 在可控风险下尝试更激进的架构改动，并保持代码可运行与可评估。
-5. 你在推进分支以便迭代；如果你感觉在某个方向陷入困境，可以回滚，但必须非常谨慎，并仅在有明确理由时进行。
-
-## 当前 train.py 内容摘要
-{pkg_hint}
-
-## 优化方向指引
-除了超参数（学习率、batch size、权重衰减等）外，还可以从以下维度寻找突破：
-1. **模型结构**：层数、embedding 维度、attention head 数、KV head 数、window pattern
-2. **激活函数**：SwiGLU、GeGLU、ReLU、GeLU 等
-3. **归一化策略**：RMSNorm、LayerNorm、Pre-Norm、Post-Norm
-4. **训练范式**：初始化策略、梯度裁剪、warmup 策略、learning rate schedule
-5. **混合精度与算子**：BF16 vs FP16、FlashAttention 版本、kernel 实现
-
-请充分分析当前代码和上述维度，选择一个最有潜力的方向进行改进。
-
-## 额外指导
-{extra_guidance}
-
-## 执行要求（必须遵守）
-1. 使用 Read 工具读取 train.py 和 results.tsv。
-2. 在提出改动前，先读取 autorunner/artifacts/current_state.md（若文件存在）。
-3. 使用 Bash 工具定位最新的 autorunner/artifacts/eval-*.json（若存在），并用 Read 工具重点查看 recommendation 与 diagnosis。
-4. 若最新评估中的 recommendation.next_action 是 revert_and_retry 或 discard_and_pivot，必须在方案里显式响应该建议。
-5. 使用 Edit/Write 工具直接修改 train.py（原地修改，不新建同义副本）。
-6. 可用 Bash 工具做轻量自检（例如 python -m py_compile train.py）。
-7. 不要只在对话里返回代码块；最终结果应体现在文件系统中的 train.py 里。
-8. 无论是否回退到历史版本、重写文件或做最小修补，train.py 顶部都必须保留这一行：os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"。若缺失，必须在提交前补回。
-
-## 输出要求
-请按以下格式输出，且不要粘贴整份代码：
-DESCRIPTION: <一句话描述本轮实验改动，中文，5-18词，不含制表符>
-仅使用纯文本，不要使用任何 Markdown 语法符号（例如 #、-、*、```）。
-"""
-        return prompt
+        """生成首次实验迭代的提示词。"""
+        return self._render_prompt(
+            "generator",
+            "generate",
+            topic=topic,
+            exp_plan=exp_plan,
+            metric_key=metric_key,
+            extra_guidance=extra_guidance,
+        )
 
     def _refine_prompt(
         self,
@@ -935,110 +971,39 @@ DESCRIPTION: <一句话描述本轮实验改动，中文，5-18词，不含制�
         topic: str,
         extra_hints: str,
     ) -> str:
-        """生成 refine 的 prompt"""
+        """基于历史结果生成 refine 提示词。"""
         summaries_text = (
             "\n".join(run_summaries[-10:]) if run_summaries else "无历史记录"
         )
         files_text = ""
         for name, content in current_files.items():
             files_text += f"\n=== {name} ===\n{content[:3000]}"
-
-        prompt = f"""你是 AI 研究员，正在对 train.py 进行迭代优化。
-
-## 任务
-{topic}
-
-## 指标
-指标名: {metric_key}
-方向: {metric_direction}
-
-## 历史运行摘要（按时间顺序，近似到远）
-{summaries_text}
-
-请**充分分析**以上历史实验结果：
-- 哪些改动带来了提升？提升了多少？
-- 哪些改动没有效果，甚至变差了？
-- 被 discard 的实验中，有哪些思路值得重新尝试（比如参数设置更合理）？
-- 哪些优化方向还没有被探索过？
-
-在分析的基础上，选择一个最有潜力的方向进行改进。
-
-## 约束与取舍原则
-1. VRAM 是软约束：为了获得有意义的 {metric_key} 改善，允许小幅增加显存，但严禁显存占用急剧膨胀。
-2. 简洁性优先：在其他条件相同的情况下，优先更简单的改动。
-3. 复杂性与收益权衡：如果改动明显增加复杂性但收益很小（例如约 0.001 的改善却引入大量 hack 代码），通常不应采用。
-4. 简化奖励：若删除代码后取得相同或更好结果，应优先保留该方案；即便指标几乎不变，但代码明显更简单，也应倾向保留。
-
-## 想法耗尽时的探索策略
-如果你感觉可尝试的想法变少，不要停下，请继续主动探索：
-1. 回看代码中引用的论文与实现线索，提取可落地到当前 train.py 的改动点。
-2. 重新审阅已给出的上下文与历史结果，寻找未被充分尝试的角度。
-3. 组合此前“接近成功”的思路做小步重组。
-4. 在可控风险下尝试更激进的架构改动，并保持代码可运行与可评估。
-5. 你在推进分支以便迭代；如果你感觉在某个方向陷入困境，可以回滚，但必须非常谨慎，并仅在有明确理由时进行。
-
-## 当前文件
-{files_text}
-
-## 优化方向指引
-除了超参数外，还可以从以下维度寻找突破：
-1. **模型结构**：层数、embedding 维度、attention head 数、KV head 数、window pattern
-2. **激活函数**：SwiGLU、GeGLU、ReLU、GeLU 等
-3. **归一化策略**：RMSNorm、LayerNorm、Pre-Norm、Post-Norm
-4. **训练范式**：初始化策略、梯度裁剪、warmup 策略、learning rate schedule
-5. **混合精度与算子**：BF16 vs FP16、FlashAttention 版本、kernel 实现
-
-## 额外提示
-{extra_hints}
-
-## 执行要求（必须遵守）
-1. 使用 Read 工具读取 train.py。
-2. 使用 Read 工具读取 autorunner/artifacts/current_state.md（若文件存在）。
-3. 使用 Bash 工具定位最新的 autorunner/artifacts/eval-*.json（若存在），并用 Read 工具重点查看 recommendation 与 diagnosis。
-4. 在改动方案中显式说明如何响应最新评估建议（continue/revert_and_retry/discard_and_pivot/investigate）。
-5. 使用 Edit/Write 工具直接修改 train.py（原地修改，不新建同义副本）。
-6. 可用 Bash 工具做轻量自检（例如 python -m py_compile train.py）。
-7. 不要只在对话里返回代码块；最终结果应体现在文件系统中的 train.py 里。
-8. 无论是否回退到历史版本、重写文件或做最小修补，train.py 顶部都必须保留这一行：os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"。若缺失，必须在提交前补回。
-
-## 输出要求
-请按以下格式输出，且不要粘贴整份代码：
-DESCRIPTION: <一句话描述本轮实验改动，中文，5-18词，不含制表符>
-仅使用纯文本，不要使用任何 Markdown 语法符号（例如 #、-、*、```）。
-"""
-        return prompt
+        return self._render_prompt(
+            "generator",
+            "refine",
+            topic=topic,
+            metric_key=metric_key,
+            metric_direction=metric_direction,
+            summaries_text=summaries_text,
+            files_text=files_text,
+            extra_hints=extra_hints,
+        )
 
     def _repair_prompt(
         self,
         files: dict[str, str],
         issues: str,
     ) -> str:
-        """生成 repair 的 prompt"""
+        """生成修复问题的提示词。"""
         files_text = ""
         for name, content in files.items():
             files_text += f"\n=== {name} ===\n{content[:3000]}"
-
-        prompt = f"""你是 AI 研究员，正在修复 train.py 的问题。
-
-## 当前文件
-{files_text}
-
-## 问题描述
-{issues}
-
-## 执行要求（必须遵守）
-1. 使用 Read 工具读取 train.py。
-2. 根据问题描述定位 bug，并使用 Edit/Write 工具直接修复 train.py。
-3. 可用 Bash 工具做轻量自检（例如 python -m py_compile train.py）。
-4. 不要只在对话里返回代码块；最终结果应体现在文件系统中的 train.py 里。
-5. 无论是否回退到历史版本、重写文件或做最小修补，train.py 顶部都必须保留这一行：os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"。若缺失，必须在提交前补回。
-
-## 输出要求
-请按以下格式输出，且不要粘贴整份代码：
-DESCRIPTION: <一句话描述修复动作，中文，5-18词，不含制表符>
-仅使用纯文本，不要使用任何 Markdown 语法符号（例如 #、-、*、```）。
-"""
-        return prompt
+        return self._render_prompt(
+            "generator",
+            "repair",
+            files_text=files_text,
+            issues=issues,
+        )
 
     def _evaluate_prompt(
         self,
@@ -1051,62 +1016,18 @@ DESCRIPTION: <一句话描述修复动作，中文，5-18词，不含制表符>
         best_candidate_path: Path,
         eval_output_path: Path,
     ) -> str:
-        """生成独立 Evaluator 的 prompt。"""
-        return f"""你是 AutoResearch 项目的独立 Evaluator Agent。
-
-你的任务：对刚刚结束的实验进行批判性分析，不要宽容，不要假设作者是正确的。
-
-当前轮次: {iteration}
-
-请按以下顺序执行：
-1. 使用 Read 工具读取 {iter_artifact_path}
-2. 使用 Read 工具读取 {run_log_path}（完整日志，不要只看尾部）
-3. 使用 Bash 工具运行 git diff HEAD~1 train.py，查看本轮代码改动
-4. 使用 Read 工具读取 {current_state_path}（如果存在）
-5. 使用 Read 工具读取 {results_tsv_path}
-6. 使用 Read 工具读取 {best_candidate_path}（如果存在）
-
-分析维度：
-A. 实验结果归类：completed_success / completed_anomaly / crashed / timeout / oom
-B. 指标对比：本轮 val_bpb 与历史 best 的差异及百分比
-C. 训练健康度：从 run.log 诊断是否有 loss spike、梯度异常、I/O 瓶颈
-D. 代码审查：本轮 diff 是否合理、是否有 bug、是否过度复杂
-E. 下一轮建议：从 continue / revert_and_retry / discard_and_pivot / investigate 中选择，并给出理由
-
-输出要求（必须遵守）：
-1. 必须写 JSON 文件到 {eval_output_path}，并严格包含以下字段：
-{{
-    "iteration": {iteration},
-    "evaluated_at": "ISO8601 时间",
-    "outcome": "completed_success|completed_anomaly|crashed|timeout|oom",
-    "metrics": {{
-        "val_bpb": "number|null",
-        "best_val_bpb": "number|null",
-        "relative_change_percent": "number|null",
-        "peak_vram_mb": "number|null",
-        "mfu_percent": "number|null"
-    }},
-    "metrics_healthy": "bool",
-    "diagnosis": {{
-        "summary": "string",
-        "issues": ["string", "..."],
-        "root_cause": "string"
-    }},
-    "code_review": {{
-        "diff_summary": "string",
-        "risks": ["string", "..."],
-        "consistency": "bool"
-    }},
-    "recommendation": {{
-        "next_action": "continue|revert_and_retry|discard_and_pivot|investigate",
-        "reasoning": "string",
-        "suggested_directions": ["string", "..."]
-    }}
-}}
-2. 必须更新 {current_state_path}，追加本轮结论、主要问题和下一轮推荐方向。
-3. 不要修改 train.py。
-4. 终端输出只需一句话总结本轮结论。
-"""
+        """生成独立评估代理使用的提示词。"""
+        return self._render_prompt(
+            "evaluator",
+            "evaluate",
+            iteration=iteration,
+            iter_artifact_path=iter_artifact_path,
+            run_log_path=run_log_path,
+            current_state_path=current_state_path,
+            results_tsv_path=results_tsv_path,
+            best_candidate_path=best_candidate_path,
+            eval_output_path=eval_output_path,
+        )
 
     def generate(
         self,
@@ -1114,18 +1035,15 @@ E. 下一轮建议：从 continue / revert_and_retry / discard_and_pivot / inves
         exp_plan: str,
         topic: str,
         metric_key: str,
-        pkg_hint: str,
-        compute_budget: str,
         extra_guidance: str,
         workdir: Path,
         timeout_sec: int | None = None,
     ) -> CodeAgentResult:
+        """执行首次生成流程并返回结果。"""
         prompt = self._generate_prompt(
             topic,
             exp_plan,
             metric_key,
-            pkg_hint,
-            compute_budget,
             extra_guidance,
         )
         cmd = self._build_cmd(prompt, workdir)
@@ -1150,6 +1068,7 @@ E. 下一轮建议：从 continue / revert_and_retry / discard_and_pivot / inves
         workdir: Path,
         timeout_sec: int | None = None,
     ) -> CodeAgentResult:
+        """执行迭代优化流程并返回结果。"""
         prompt = self._refine_prompt(
             current_files,
             run_summaries,
@@ -1176,6 +1095,7 @@ E. 下一轮建议：从 continue / revert_and_retry / discard_and_pivot / inves
         workdir: Path,
         timeout_sec: int | None = None,
     ) -> CodeAgentResult:
+        """执行修复流程并返回结果。"""
         prompt = self._repair_prompt(files, issues)
         cmd = self._build_cmd(prompt, workdir)
         rc, stdout, stderr, elapsed, to = self._run_subprocess(
@@ -1200,6 +1120,7 @@ E. 下一轮建议：从 continue / revert_and_retry / discard_and_pivot / inves
         workdir: Path,
         timeout_sec: int | None = None,
     ) -> CodeAgentResult:
+        """执行评估流程并返回结果。"""
         prompt = self._evaluate_prompt(
             iteration=iteration,
             iter_artifact_path=iter_artifact_path,

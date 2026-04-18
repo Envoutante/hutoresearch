@@ -833,8 +833,6 @@ def run_loop(
                 exp_plan=exp_plan,
                 topic=topic,
                 metric_key="val_bpb",
-                pkg_hint=train_py_content[:3000],
-                compute_budget=f"单轮训练时间预算：{time_budget} 秒",
                 extra_guidance=extra_guidance,
                 workdir=WORKDIR,
             )
