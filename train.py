@@ -106,12 +106,16 @@ class CausalSelfAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+        hidden_dim = int(config.n_embd * 2 / 3)  # SwiGLU up-projects to ~8/3 * d_model total, split into two
+        # SwiGLU: compute gate and value paths; hidden = (W_up, W_gate), output = Swish(x @ W_up) * (x @ W_gate) @ W_down
+        self.c_fc = nn.Linear(config.n_embd, hidden_dim, bias=False)
+        self.c_gate = nn.Linear(config.n_embd, hidden_dim, bias=False)
+        self.c_proj = nn.Linear(hidden_dim, config.n_embd, bias=False)
 
     def forward(self, x):
-        x = self.c_fc(x)
-        x = F.relu(x).square()
+        x_fc = self.c_fc(x)
+        x_gate = self.c_gate(x)
+        x = F.silu(x_fc) * torch.sigmoid(x_gate)
         x = self.c_proj(x)
         return x
 
@@ -167,6 +171,7 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
             torch.nn.init.zeros_(block.attn.c_proj.weight)
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
+            torch.nn.init.uniform_(block.mlp.c_gate.weight, -s, s)
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
         # Per-layer scalars
         self.resid_lambdas.fill_(1.0)
