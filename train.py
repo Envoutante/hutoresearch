@@ -454,8 +454,8 @@ WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown
 FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 
 # Model size
-DEPTH = 8               # number of transformer layers
-DEVICE_BATCH_SIZE = 16  # per-device batch size (reduce if OOM)
+DEPTH = 12              # number of transformer layers (increased from 8 for better capacity)
+DEVICE_BATCH_SIZE = 8   # per-device batch size (reduced from 16 — batch=16 caused 82% VRAM increase with no val_bpb benefit)
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
