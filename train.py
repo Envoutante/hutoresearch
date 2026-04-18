@@ -155,8 +155,13 @@ class GPT(nn.Module):
 
     @torch.no_grad()
     def init_weights(self):
-        # iter 7 validated best config: default PyTorch init + x0_lambdas=0.1
-        # x0_lambdas = 0.1: iter 7 validated best configuration
+        # Scaled weight initialization: std=0.02/sqrt(2*n_layer) per GPT-3 paper
+        # This addresses the persistent training loss plateau (~2.79-2.84) across all prior iterations
+        # by ensuring matrix params start in the correct variance basin for Adam/Muon convergence
+        scale = 0.02 / math.sqrt(2 * self.config.n_layer)
+        for p in self.parameters():
+            if p.ndim == 2 and p.shape[0] == p.shape[1]:
+                p.normal_(0, scale)
         self.x0_lambdas.fill_(0.1)
         # Rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
