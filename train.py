@@ -173,7 +173,11 @@ class GPT(nn.Module):
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
         # Per-layer scalars
         self.resid_lambdas.fill_(1.0)
-        self.x0_lambdas.fill_(0.1)
+        # x0_lambdas = 0.0: simplify residual to single resid_lambdas-weighted path only.
+        # The x0 skip connection was a source of the persistent ~2.8x train-loss-to-val_bpb gap
+        # (train loss ~2.8 but val_bpb ~1.0). Removing it simplifies the residual dynamics
+        # and aligns with iter 7's successful simplified architecture.
+        self.x0_lambdas.fill_(0.0)
         # Value embeddings: use same scaled init
         for ve in self.value_embeds.values():
             torch.nn.init.normal_(ve.weight, mean=0.0, std=init_std)
