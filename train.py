@@ -247,8 +247,7 @@ class GPT(nn.Module):
     def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02,
                         weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
         model_dim = self.config.n_embd
-        # Matrix params for Muon: single flat list (iter 7 proven best)
-        matrix_params = [p for p in self.transformer.h.parameters()]
+        matrix_params = list(self.transformer.h.parameters())
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
@@ -266,7 +265,13 @@ class GPT(nn.Module):
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
         ]
-        param_groups.append(dict(kind='muon', params=matrix_params, lr=matrix_lr, momentum=0.85, ns_steps=5, weight_decay=weight_decay, beta2=0.95))
+        # Separate Muon groups per shape (iter 7 proven best)
+        for shape in sorted({p.shape for p in matrix_params}):
+            group_params = [p for p in matrix_params if p.shape == shape]
+            param_groups.append(dict(
+                kind='muon', params=group_params, lr=matrix_lr,
+                momentum=0.95, ns_steps=5, beta2=0.95, weight_decay=weight_decay,
+            ))
         optimizer = MuonAdamW(param_groups)
         for group in optimizer.param_groups:
             group["initial_lr"] = group["lr"]
@@ -398,11 +403,14 @@ class MuonAdamW(torch.optim.Optimizer):
                             self._adamw_step_t, self._adamw_lr_t, self._adamw_beta1_t,
                             self._adamw_beta2_t, self._adamw_eps_t, self._adamw_wd_t)
 
-    def _step_muon_shape(self, group, params, shape):
+    def _step_muon(self, group):
+        params = group['params']
+        if not params:
+            return
         p = params[0]
         state = self.state[p]
         num_params = len(params)
-        device, dtype = p.device, p.dtype
+        shape, device, dtype = p.shape, p.device, p.dtype
         if "momentum_buffer" not in state:
             state["momentum_buffer"] = torch.zeros(num_params, *shape, dtype=dtype, device=device)
         if "second_momentum_buffer" not in state:
@@ -420,18 +428,6 @@ class MuonAdamW(torch.optim.Optimizer):
                         self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t,
                         self._muon_beta2_t, group["ns_steps"], red_dim)
         torch._foreach_copy_(params, list(stacked_params.unbind(0)))
-
-    def _step_muon(self, group):
-        params = group['params']
-        if not params:
-            return
-        # Group params by shape since muon requires same-shape stacking
-        from collections import defaultdict
-        shape_to_params = defaultdict(list)
-        for p in params:
-            shape_to_params[p.shape].append(p)
-        for shape, shape_params in shape_to_params.items():
-            self._step_muon_shape(group, shape_params, shape)
 
     @torch.no_grad()
     def step(self):
