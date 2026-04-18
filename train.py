@@ -246,15 +246,14 @@ class GPT(nn.Module):
     def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02,
                         weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
         model_dim = self.config.n_embd
-        # Split transformer.h params into muon (square 2D) and AdamW (non-square 2D) groups
+        # All 2D transformer.h params (square AND non-square) go to Muon for Newton-Schmidt coordination
         all_h_params = list(self.transformer.h.parameters())
-        matrix_params = [p for p in all_h_params if p.ndim == 2 and p.shape[0] == p.shape[1]]
-        mlp_params = [p for p in all_h_params if p.ndim == 2 and p.shape[0] != p.shape[1]]
+        matrix_params = [p for p in all_h_params if p.ndim == 2]
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
-        x0_params = [self.x0_lambdas] + mlp_params
+        x0_params = [self.x0_lambdas]
         assert len(list(self.parameters())) == (len(matrix_params) + len(embedding_params) +
             len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params))
         # Scale LR ∝ 1/√dmodel (tuned at 768 dim)
