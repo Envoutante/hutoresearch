@@ -405,18 +405,11 @@ class MuonAdamW(torch.optim.Optimizer):
         params = group['params']
         if not params:
             return
-        # Group params by shape for per-shape muon steps
-        from collections import defaultdict
-        shape_to_params = defaultdict(list)
-        for p in params:
-            shape_to_params[p.shape].append(p)
-        for shape, shape_params in shape_to_params.items():
-            self._step_muon_single_shape(group, shape_params, shape)
-
-    def _step_muon_single_shape(self, group, params, shape):
+        # Single flat param group — iter 7 validated best (Newton-Schmidt cross-matrix coordination)
         num_params = len(params)
         device = params[0].device
         dtype = params[0].dtype
+        shape = params[0].shape
         p0 = params[0]
         state0 = self.state[p0]
         if "momentum_buffer" not in state0:
