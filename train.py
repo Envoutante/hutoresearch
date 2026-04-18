@@ -173,11 +173,9 @@ class GPT(nn.Module):
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
         # Per-layer scalars
         self.resid_lambdas.fill_(1.0)
-        # x0_lambdas = 0.0: simplify residual to single resid_lambdas-weighted path only.
-        # The x0 skip connection was a source of the persistent ~2.8x train-loss-to-val_bpb gap
-        # (train loss ~2.8 but val_bpb ~1.0). Removing it simplifies the residual dynamics
-        # and aligns with iter 7's successful simplified architecture.
-        self.x0_lambdas.fill_(0.0)
+        # x0_lambdas = 0.1: iter 7 validated best configuration
+        # Reverted from 0.0 (introduced in iter 15 candidate, caused regression)
+        self.x0_lambdas.fill_(0.1)
         # Value embeddings: use same scaled init
         for ve in self.value_embeds.values():
             torch.nn.init.normal_(ve.weight, mean=0.0, std=init_std)
@@ -250,13 +248,10 @@ class GPT(nn.Module):
     def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02,
                         weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
         model_dim = self.config.n_embd
-        # All 2D transformer.h params go to Muon — single flat group (iter 7 validated best)
-        # Per-shape grouping was confirmed harmful across 8 consecutive failures (iters 14-20+):
-        # Newton-Schmidt second-order cross-matrix gradient coordination requires a single unified group
+        # All 2D transformer.h params (square AND non-square) go to Muon for Newton-Schmidt
+        # coordination — iter 7's exact validated config restored here
         all_h_params = list(self.transformer.h.parameters())
-        # Muon requires square matrices for stacking; filter out MLP's rectangular c_fc/c_proj
-        all_2d_params = [p for p in all_h_params if p.ndim == 2 and p.shape[0] == p.shape[1]]
-        mlp_2d_params = [p for p in all_h_params if p.ndim == 2 and p.shape[0] != p.shape[1]]
+        matrix_params = [p for p in all_h_params if p.ndim == 2]
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
@@ -269,13 +264,12 @@ class GPT(nn.Module):
             dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=mlp_2d_params, lr=matrix_lr, betas=adam_betas, eps=1e-10, weight_decay=weight_decay),
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
         ]
-        # Single flat Muon group — iter 7's exact validated configuration
+        # Single flat Muon group with ALL 2D params — iter 7's exact validated configuration
         param_groups.append(dict(
-            kind='muon', params=all_2d_params, lr=matrix_lr,
+            kind='muon', params=matrix_params, lr=matrix_lr,
             momentum=0.85, ns_steps=5, beta2=0.95, weight_decay=weight_decay,
         ))
         optimizer = MuonAdamW(param_groups)
