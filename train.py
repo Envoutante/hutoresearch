@@ -155,14 +155,31 @@ class GPT(nn.Module):
 
     @torch.no_grad()
     def init_weights(self):
-        # Scaled weight initialization: std=0.02/sqrt(2*n_layer) per GPT-3 paper
-        # This addresses the persistent training loss plateau (~2.79-2.84) across all prior iterations
-        # by ensuring matrix params start in the correct variance basin for Adam/Muon convergence
-        scale = 0.02 / math.sqrt(2 * self.config.n_layer)
-        for p in self.parameters():
-            if p.ndim == 2 and p.shape[0] == p.shape[1]:
-                p.normal_(0, scale)
+        # Scaled initialization: std = 0.02 / sqrt(2 * n_layer) per GPT-3 paper
+        # iter 7 exact validated config: zeros for c_proj, scaled init for all other 2D params
+        n_layer = self.config.n_layer
+        init_std = 0.02 / math.sqrt(2 * n_layer)
+        # Embedding and unembedding
+        torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=init_std)
+        torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=init_std)
+        # Transformer blocks: scaled init for all matrix parameters
+        for block in self.transformer.h:
+            torch.nn.init.normal_(block.attn.c_q.weight, mean=0.0, std=init_std)
+            torch.nn.init.normal_(block.attn.c_k.weight, mean=0.0, std=init_std)
+            torch.nn.init.normal_(block.attn.c_v.weight, mean=0.0, std=init_std)
+            torch.nn.init.zeros_(block.attn.c_proj.weight)
+            torch.nn.init.normal_(block.mlp.c_fc.weight, mean=0.0, std=init_std)
+            torch.nn.init.zeros_(block.mlp.c_proj.weight)
+        # Per-layer scalars
+        self.resid_lambdas.fill_(1.0)
         self.x0_lambdas.fill_(0.1)
+        # Value embeddings: use same scaled init
+        for ve in self.value_embeds.values():
+            torch.nn.init.normal_(ve.weight, mean=0.0, std=init_std)
+        # Gate weights init to zero (sigmoid(0)=0.5, scaled by 2 -> 1.0 = neutral)
+        for block in self.transformer.h:
+            if block.attn.ve_gate is not None:
+                torch.nn.init.zeros_(block.attn.ve_gate.weight)
         # Rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
