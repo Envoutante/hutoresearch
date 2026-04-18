@@ -248,12 +248,15 @@ class GPT(nn.Module):
         model_dim = self.config.n_embd
         # All 2D transformer.h params (square AND non-square) go to Muon for Newton-Schmidt coordination
         all_h_params = list(self.transformer.h.parameters())
-        matrix_params = [p for p in all_h_params if p.ndim == 2 and p.shape[0] == p.shape[1]]
+        matrix_params = [p for p in all_h_params if p.ndim == 2]
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
+        assert len(list(self.parameters())) == (len(matrix_params) + len(embedding_params) +
+            len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params)), \
+            f"Param count mismatch: {len(list(self.parameters()))} vs sum={len(matrix_params)+len(embedding_params)+len(lm_head_params)+len(value_embeds_params)+len(resid_params)+len(x0_params)}"
         # Scale LR ∝ 1/√dmodel (tuned at 768 dim)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         print(f"Scaling AdamW LRs by 1/sqrt({model_dim}/768) = {dmodel_lr_scale:.6f}")
@@ -449,7 +452,7 @@ WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context
 TOTAL_BATCH_SIZE = 2**17 # ~524K tokens per optimizer step
 EMBEDDING_LR = 0.6      # learning rate for token embeddings (Adam)
 UNEMBEDDING_LR = 0.004  # learning rate for lm_head (Adam)
-MATRIX_LR = 0.04        # learning rate for matrix parameters (Muon) — iter 7 validated best
+MATRIX_LR = 0.05        # learning rate for matrix parameters (Muon) — iter 7 validated best
 SCALAR_LR = 0.5         # learning rate for per-layer scalars (Adam)
 WEIGHT_DECAY = 0.0      # iter 7 validated: no weight decay for Muon
 ADAM_BETAS = (0.8, 0.95) # Adam beta1, beta2
