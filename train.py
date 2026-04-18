@@ -246,13 +246,19 @@ class GPT(nn.Module):
     def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02,
                         weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
         model_dim = self.config.n_embd
-        matrix_params = list(self.transformer.h.parameters())
+        # Group matrix params by shape for muon optimizer (which stacks them)
+        all_matrix_params = list(self.transformer.h.parameters())
+        by_shape = {}
+        for p in all_matrix_params:
+            by_shape.setdefault(p.shape, []).append(p)
+        matrix_params_groups = [params for params in by_shape.values()]
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
-        assert len(list(self.parameters())) == (len(matrix_params) + len(embedding_params) +
+        all_matrix_count = sum(len(g) for g in matrix_params_groups)
+        assert len(list(self.parameters())) == (all_matrix_count + len(embedding_params) +
             len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params))
         # Scale LR ∝ 1/√dmodel (tuned at 768 dim)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -263,8 +269,9 @@ class GPT(nn.Module):
             dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
-            dict(kind='muon', params=matrix_params, lr=matrix_lr, momentum=0.85, ns_steps=5, weight_decay=weight_decay, beta2=0.95),
         ]
+        for matrix_group in matrix_params_groups:
+            param_groups.append(dict(kind='muon', params=matrix_group, lr=matrix_lr, momentum=0.85, ns_steps=5, weight_decay=weight_decay, beta2=0.95))
         optimizer = MuonAdamW(param_groups)
         for group in optimizer.param_groups:
             group["initial_lr"] = group["lr"]
