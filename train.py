@@ -246,14 +246,11 @@ class GPT(nn.Module):
     def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02,
                         weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
         model_dim = self.config.n_embd
-        # All 2D transformer.h params go to Muon, grouped by shape to avoid stack size mismatch
+        # All 2D transformer.h params go to Muon — single flat group (iter 7 validated best)
+        # Per-shape grouping was confirmed harmful across 8 consecutive failures (iters 14-20+):
+        # Newton-Schmidt second-order cross-matrix gradient coordination requires a single unified group
         all_h_params = list(self.transformer.h.parameters())
         all_2d_params = [p for p in all_h_params if p.ndim == 2]
-        # Group by shape since Muon requires uniform shape per group
-        from collections import defaultdict
-        shape_to_params = defaultdict(list)
-        for p in all_2d_params:
-            shape_to_params[p.shape].append(p)
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
@@ -269,12 +266,11 @@ class GPT(nn.Module):
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
         ]
-        # Create one Muon group per shape to avoid stack mismatch
-        for shape, params in shape_to_params.items():
-            param_groups.append(dict(
-                kind='muon', params=params, lr=matrix_lr,
-                momentum=0.85, ns_steps=5, beta2=0.95, weight_decay=weight_decay,
-            ))
+        # Single flat Muon group — iter 7's exact validated configuration
+        param_groups.append(dict(
+            kind='muon', params=all_2d_params, lr=matrix_lr,
+            momentum=0.85, ns_steps=5, beta2=0.95, weight_decay=weight_decay,
+        ))
         optimizer = MuonAdamW(param_groups)
         for group in optimizer.param_groups:
             group["initial_lr"] = group["lr"]
