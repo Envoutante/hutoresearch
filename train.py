@@ -398,14 +398,11 @@ class MuonAdamW(torch.optim.Optimizer):
                             self._adamw_step_t, self._adamw_lr_t, self._adamw_beta1_t,
                             self._adamw_beta2_t, self._adamw_eps_t, self._adamw_wd_t)
 
-    def _step_muon(self, group):
-        params = group['params']
-        if not params:
-            return
+    def _step_muon_shape(self, group, params, shape):
         p = params[0]
         state = self.state[p]
         num_params = len(params)
-        shape, device, dtype = p.shape, p.device, p.dtype
+        device, dtype = p.device, p.dtype
         if "momentum_buffer" not in state:
             state["momentum_buffer"] = torch.zeros(num_params, *shape, dtype=dtype, device=device)
         if "second_momentum_buffer" not in state:
@@ -423,6 +420,18 @@ class MuonAdamW(torch.optim.Optimizer):
                         self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t,
                         self._muon_beta2_t, group["ns_steps"], red_dim)
         torch._foreach_copy_(params, list(stacked_params.unbind(0)))
+
+    def _step_muon(self, group):
+        params = group['params']
+        if not params:
+            return
+        # Group params by shape since muon requires same-shape stacking
+        from collections import defaultdict
+        shape_to_params = defaultdict(list)
+        for p in params:
+            shape_to_params[p.shape].append(p)
+        for shape, shape_params in shape_to_params.items():
+            self._step_muon_shape(group, shape_params, shape)
 
     @torch.no_grad()
     def step(self):
