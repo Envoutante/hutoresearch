@@ -246,13 +246,9 @@ class GPT(nn.Module):
     def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02,
                         weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
         model_dim = self.config.n_embd
-        # All 2D transformer.h params go to Muon, but grouped by shape since Newton-Schmidt requires same-size stacking
+        # All 2D transformer.h params go to Muon as a single flat group
         all_h_params = list(self.transformer.h.parameters())
-        shape_to_params = {}
-        for p in all_h_params:
-            if p.ndim == 2:
-                shape_key = tuple(p.shape)
-                shape_to_params.setdefault(shape_key, []).append(p)
+        all_2d_params = [p for p in all_h_params if p.ndim == 2]
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
@@ -268,11 +264,10 @@ class GPT(nn.Module):
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
         ]
-        for shape_key, params in shape_to_params.items():
-            param_groups.append(dict(
-                kind='muon', params=params, lr=matrix_lr,
-                momentum=0.85, ns_steps=5, beta2=0.95, weight_decay=weight_decay,
-            ))
+        param_groups.append(dict(
+            kind='muon', params=all_2d_params, lr=matrix_lr,
+            momentum=0.85, ns_steps=5, beta2=0.95, weight_decay=weight_decay,
+        ))
         optimizer = MuonAdamW(param_groups)
         for group in optimizer.param_groups:
             group["initial_lr"] = group["lr"]
