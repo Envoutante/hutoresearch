@@ -403,34 +403,31 @@ class MuonAdamW(torch.optim.Optimizer):
         params = group['params']
         if not params:
             return
-        # Group params by shape since muon requires uniform dimensions for torch.stack
-        from collections import defaultdict
-        shape_to_params = defaultdict(list)
-        for p in params:
-            shape_to_params[p.shape].append(p)
-        for shape, ps in shape_to_params.items():
-            num_params = len(ps)
-            device = ps[0].device
-            dtype = ps[0].dtype
-            p0 = ps[0]
-            state0 = self.state[p0]
-            if "momentum_buffer" not in state0:
-                state0["momentum_buffer"] = torch.zeros(num_params, *shape, dtype=dtype, device=device)
-            if "second_momentum_buffer" not in state0:
-                state_shape = (num_params, shape[-2], 1) if shape[-2] >= shape[-1] else (num_params, 1, shape[-1])
-                state0["second_momentum_buffer"] = torch.zeros(state_shape, dtype=dtype, device=device)
-            red_dim = -1 if shape[-2] >= shape[-1] else -2
-            stacked_grads = torch.stack([p.grad for p in ps])
-            stacked_params = torch.stack(ps)
-            self._muon_momentum_t.fill_(group["momentum"])
-            self._muon_beta2_t.fill_(group["beta2"] if group["beta2"] is not None else 0.0)
-            self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1])**0.5)
-            self._muon_wd_t.fill_(group["weight_decay"])
-            muon_step_fused(stacked_grads, stacked_params,
-                            state0["momentum_buffer"], state0["second_momentum_buffer"],
-                            self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t,
-                            self._muon_beta2_t, group["ns_steps"], red_dim)
-            torch._foreach_copy_(ps, list(stacked_params.unbind(0)))
+        # Single flat group: stack all matrix params together for Newton-Schmidt cross-matrix coordination
+        # (iter 7 validated best — per-shape grouping has failed 8 consecutive times)
+        num_params = len(params)
+        device = params[0].device
+        dtype = params[0].dtype
+        p0 = params[0]
+        state0 = self.state[p0]
+        shape = p0.shape
+        if "momentum_buffer" not in state0:
+            state0["momentum_buffer"] = torch.zeros(num_params, *shape, dtype=dtype, device=device)
+        if "second_momentum_buffer" not in state0:
+            state_shape = (num_params, shape[-2], 1) if shape[-2] >= shape[-1] else (num_params, 1, shape[-1])
+            state0["second_momentum_buffer"] = torch.zeros(state_shape, dtype=dtype, device=device)
+        red_dim = -1 if shape[-2] >= shape[-1] else -2
+        stacked_grads = torch.stack([p.grad for p in params])
+        stacked_params = torch.stack(params)
+        self._muon_momentum_t.fill_(group["momentum"])
+        self._muon_beta2_t.fill_(group["beta2"] if group["beta2"] is not None else 0.0)
+        self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1])**0.5)
+        self._muon_wd_t.fill_(group["weight_decay"])
+        muon_step_fused(stacked_grads, stacked_params,
+                        state0["momentum_buffer"], state0["second_momentum_buffer"],
+                        self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t,
+                        self._muon_beta2_t, group["ns_steps"], red_dim)
+        torch._foreach_copy_(params, list(stacked_params.unbind(0)))
 
     @torch.no_grad()
     def step(self):
