@@ -265,11 +265,15 @@ class GPT(nn.Module):
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
         ]
-        # Single unified Muon group (iter 7 proven best: momentum=0.85)
-        param_groups.append(dict(
-            kind='muon', params=matrix_params, lr=matrix_lr,
-            momentum=0.85, ns_steps=5, beta2=0.95, weight_decay=weight_decay,
-        ))
+        # Group matrix params by shape for Muon (stack requires same-size tensors)
+        by_shape = {}
+        for p in matrix_params:
+            by_shape.setdefault(p.shape, []).append(p)
+        for shape, params in by_shape.items():
+            param_groups.append(dict(
+                kind='muon', params=params, lr=matrix_lr,
+                momentum=0.85, ns_steps=5, beta2=0.95, weight_decay=weight_decay,
+            ))
         optimizer = MuonAdamW(param_groups)
         for group in optimizer.param_groups:
             group["initial_lr"] = group["lr"]
