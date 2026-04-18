@@ -267,16 +267,12 @@ class GPT(nn.Module):
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
         ]
-        # Group 2D params by shape for Muon — each shape requires its own group
-        from collections import defaultdict
-        shape_to_params = defaultdict(list)
-        for p in matrix_params:
-            shape_to_params[p.shape].append(p)
-        for params_by_shape in shape_to_params.values():
-            param_groups.append(dict(
-                kind='muon', params=params_by_shape, lr=matrix_lr,
-                momentum=0.85, ns_steps=5, beta2=0.95, weight_decay=weight_decay,
-            ))
+        # All 2D transformer.h params in ONE Muon group for Newton-Schmidt
+        # second-order cross-matrix gradient coordination — iter 7's exact validated config
+        param_groups.append(dict(
+            kind='muon', params=matrix_params, lr=matrix_lr,
+            momentum=0.85, ns_steps=5, beta2=0.95, weight_decay=weight_decay,
+        ))
         optimizer = MuonAdamW(param_groups)
         for group in optimizer.param_groups:
             group["initial_lr"] = group["lr"]
