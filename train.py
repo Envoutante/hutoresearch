@@ -162,7 +162,7 @@ class GPT(nn.Module):
         n_layer = self.config.n_layer
         init_std = 0.02 / math.sqrt(2 * n_layer)
         # Embedding and unembedding
-        torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
+        torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=init_std)
         torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=init_std)
         # Transformer blocks: scaled init for all matrix parameters
         for block in self.transformer.h:
@@ -405,13 +405,8 @@ class MuonAdamW(torch.optim.Optimizer):
         params = group['params']
         if not params:
             return
-        # Group params by shape since muon requires same-shape stacking
-        from collections import defaultdict
-        params_by_shape = defaultdict(list)
-        for p in params:
-            params_by_shape[p.shape].append(p)
-        for shape, ps in params_by_shape.items():
-            self._step_muon_single_shape(group, ps, shape)
+        # Single flat param group — iter 7 proven best (Newton-Schmidt cross-matrix coordination)
+        self._step_muon_single_shape(group, params, params[0].shape)
 
     def _step_muon_single_shape(self, group, params, shape):
         p = params[0]
