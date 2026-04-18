@@ -155,28 +155,28 @@ class GPT(nn.Module):
 
     @torch.no_grad()
     def init_weights(self):
-        # Scaled initialization: std = 0.02/sqrt(2*n_layer) to escape the ~2.8 loss plateau
+        # Scaled initialization: std = 0.02 / sqrt(2 * n_layer)
+        # This was recommended as the ONLY remaining untested direction orthogonal to all
+        # exhausted hyperparameter/architecture experiments. Addresses the universal ~2.8 loss plateau.
         n_layer = self.config.n_layer
-        n_embd = self.config.n_embd
-        embed_std = 0.02 / math.sqrt(2 * n_layer)
-        head_std = 0.02 / math.sqrt(2 * n_layer)
+        init_std = 0.02 / math.sqrt(2 * n_layer)
         # Embedding and unembedding
-        torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=embed_std)
-        torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=head_std)
-        # Transformer blocks
+        torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=init_std)
+        torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=init_std)
+        # Transformer blocks: scaled init for all matrix parameters
         for block in self.transformer.h:
-            torch.nn.init.normal_(block.attn.c_q.weight, std=head_std)
-            torch.nn.init.normal_(block.attn.c_k.weight, std=head_std)
-            torch.nn.init.normal_(block.attn.c_v.weight, std=head_std)
+            torch.nn.init.normal_(block.attn.c_q.weight, mean=0.0, std=init_std)
+            torch.nn.init.normal_(block.attn.c_k.weight, mean=0.0, std=init_std)
+            torch.nn.init.normal_(block.attn.c_v.weight, mean=0.0, std=init_std)
             torch.nn.init.zeros_(block.attn.c_proj.weight)
-            torch.nn.init.normal_(block.mlp.c_fc.weight, std=head_std)
+            torch.nn.init.normal_(block.mlp.c_fc.weight, mean=0.0, std=init_std)
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
         # Per-layer scalars
         self.resid_lambdas.fill_(1.0)
         self.x0_lambdas.fill_(0.1)
-        # Value embeddings — also use scaled init
+        # Value embeddings: use same scaled init
         for ve in self.value_embeds.values():
-            torch.nn.init.normal_(ve.weight, std=embed_std)
+            torch.nn.init.normal_(ve.weight, mean=0.0, std=init_std)
         # Gate weights init to zero (sigmoid(0)=0.5, scaled by 2 -> 1.0 = neutral)
         for block in self.transformer.h:
             if block.attn.ve_gate is not None:
@@ -403,34 +403,27 @@ class MuonAdamW(torch.optim.Optimizer):
         params = group['params']
         if not params:
             return
-        # Group params by shape since muon requires uniform dimensions for torch.stack
-        from collections import defaultdict
-        shape_to_params = defaultdict(list)
-        for p in params:
-            shape_to_params[p.shape].append(p)
-        for shape, ps in shape_to_params.items():
-            num_params = len(ps)
-            device = ps[0].device
-            dtype = ps[0].dtype
-            p0 = ps[0]
-            state0 = self.state[p0]
-            if "momentum_buffer" not in state0:
-                state0["momentum_buffer"] = torch.zeros(num_params, *shape, dtype=dtype, device=device)
-            if "second_momentum_buffer" not in state0:
-                state_shape = (num_params, shape[-2], 1) if shape[-2] >= shape[-1] else (num_params, 1, shape[-1])
-                state0["second_momentum_buffer"] = torch.zeros(state_shape, dtype=dtype, device=device)
-            red_dim = -1 if shape[-2] >= shape[-1] else -2
-            stacked_grads = torch.stack([p.grad for p in ps])
-            stacked_params = torch.stack(ps)
-            self._muon_momentum_t.fill_(group["momentum"])
-            self._muon_beta2_t.fill_(group["beta2"] if group["beta2"] is not None else 0.0)
-            self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1])**0.5)
-            self._muon_wd_t.fill_(group["weight_decay"])
-            muon_step_fused(stacked_grads, stacked_params,
-                            state0["momentum_buffer"], state0["second_momentum_buffer"],
-                            self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t,
-                            self._muon_beta2_t, group["ns_steps"], red_dim)
-            torch._foreach_copy_(ps, list(stacked_params.unbind(0)))
+        p = params[0]
+        state = self.state[p]
+        num_params = len(params)
+        shape, device, dtype = p.shape, p.device, p.dtype
+        if "momentum_buffer" not in state:
+            state["momentum_buffer"] = torch.zeros(num_params, *shape, dtype=dtype, device=device)
+        if "second_momentum_buffer" not in state:
+            state_shape = (num_params, shape[-2], 1) if shape[-2] >= shape[-1] else (num_params, 1, shape[-1])
+            state["second_momentum_buffer"] = torch.zeros(state_shape, dtype=dtype, device=device)
+        red_dim = -1 if shape[-2] >= shape[-1] else -2
+        stacked_grads = torch.stack([p.grad for p in params])
+        stacked_params = torch.stack(params)
+        self._muon_momentum_t.fill_(group["momentum"])
+        self._muon_beta2_t.fill_(group["beta2"] if group["beta2"] is not None else 0.0)
+        self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1])**0.5)
+        self._muon_wd_t.fill_(group["weight_decay"])
+        muon_step_fused(stacked_grads, stacked_params,
+                        state["momentum_buffer"], state["second_momentum_buffer"],
+                        self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t,
+                        self._muon_beta2_t, group["ns_steps"], red_dim)
+        torch._foreach_copy_(params, list(stacked_params.unbind(0)))
 
     @torch.no_grad()
     def step(self):
