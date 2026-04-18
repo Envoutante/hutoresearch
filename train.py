@@ -250,7 +250,9 @@ class GPT(nn.Module):
         # Per-shape grouping was confirmed harmful across 8 consecutive failures (iters 14-20+):
         # Newton-Schmidt second-order cross-matrix gradient coordination requires a single unified group
         all_h_params = list(self.transformer.h.parameters())
-        all_2d_params = [p for p in all_h_params if p.ndim == 2]
+        # Muon requires square matrices for stacking; filter out MLP's rectangular c_fc/c_proj
+        all_2d_params = [p for p in all_h_params if p.ndim == 2 and p.shape[0] == p.shape[1]]
+        mlp_2d_params = [p for p in all_h_params if p.ndim == 2 and p.shape[0] != p.shape[1]]
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
@@ -263,6 +265,7 @@ class GPT(nn.Module):
             dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=mlp_2d_params, lr=matrix_lr, betas=adam_betas, eps=1e-10, weight_decay=weight_decay),
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
         ]
