@@ -30,7 +30,7 @@ fa3 = get_kernel(repo).flash_attn_interface
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
 
-TIME_BUDGET = 1200  # 20min — iter 7 proven config with linear decay
+TIME_BUDGET = 1200  # 20min override
 
 # ---------------------------------------------------------------------------
 # GPT Model
@@ -106,9 +106,8 @@ class CausalSelfAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        hidden_dim = 4 * config.n_embd  # 4x width (iter 7 proven best)
-        self.c_fc = nn.Linear(config.n_embd, hidden_dim, bias=False)
-        self.c_proj = nn.Linear(hidden_dim, config.n_embd, bias=False)
+        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
+        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -156,28 +155,28 @@ class GPT(nn.Module):
 
     @torch.no_grad()
     def init_weights(self):
-        # Scaled initialization: std = 0.02 / sqrt(2 * n_layer)
-        # This addresses the universal ~2.8 loss plateau seen across all 13 iterations,
-        # suggesting the original init may have been pushing the model into a bad basin.
+        # Scaled initialization: std = 0.02/sqrt(2*n_layer) to escape the ~2.8 loss plateau
         n_layer = self.config.n_layer
-        init_std = 0.02 / math.sqrt(2 * n_layer)
+        n_embd = self.config.n_embd
+        embed_std = 0.02 / math.sqrt(2 * n_layer)
+        head_std = 0.02 / math.sqrt(2 * n_layer)
         # Embedding and unembedding
-        torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=init_std)
-        torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=init_std)
-        # Transformer blocks: scaled init for all matrix parameters
+        torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=embed_std)
+        torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=head_std)
+        # Transformer blocks
         for block in self.transformer.h:
-            torch.nn.init.normal_(block.attn.c_q.weight, mean=0.0, std=init_std)
-            torch.nn.init.normal_(block.attn.c_k.weight, mean=0.0, std=init_std)
-            torch.nn.init.normal_(block.attn.c_v.weight, mean=0.0, std=init_std)
+            torch.nn.init.normal_(block.attn.c_q.weight, std=head_std)
+            torch.nn.init.normal_(block.attn.c_k.weight, std=head_std)
+            torch.nn.init.normal_(block.attn.c_v.weight, std=head_std)
             torch.nn.init.zeros_(block.attn.c_proj.weight)
-            torch.nn.init.normal_(block.mlp.c_fc.weight, mean=0.0, std=init_std)
+            torch.nn.init.normal_(block.mlp.c_fc.weight, std=head_std)
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
         # Per-layer scalars
         self.resid_lambdas.fill_(1.0)
         self.x0_lambdas.fill_(0.1)
-        # Value embeddings: use same scaled init
+        # Value embeddings — also use scaled init
         for ve in self.value_embeds.values():
-            torch.nn.init.normal_(ve.weight, mean=0.0, std=init_std)
+            torch.nn.init.normal_(ve.weight, std=embed_std)
         # Gate weights init to zero (sigmoid(0)=0.5, scaled by 2 -> 1.0 = neutral)
         for block in self.transformer.h:
             if block.attn.ve_gate is not None:
@@ -265,7 +264,6 @@ class GPT(nn.Module):
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
         ]
-        # Single flat Muon param group — iter 7 proven best (Newton-Schmidt cross-matrix coordination)
         param_groups.append(dict(
             kind='muon', params=matrix_params, lr=matrix_lr,
             momentum=0.85, ns_steps=5, beta2=0.95, weight_decay=weight_decay,
@@ -405,21 +403,10 @@ class MuonAdamW(torch.optim.Optimizer):
         params = group['params']
         if not params:
             return
-        # Group params by shape — each shape needs its own stack/stacked-ops
-        shape_to_params = {}
-        for p in params:
-            shape_key = p.shape
-            if shape_key not in shape_to_params:
-                shape_to_params[shape_key] = []
-            shape_to_params[shape_key].append(p)
-        for shape, ps in shape_to_params.items():
-            self._step_muon_single_shape(group, ps, shape)
-
-    def _step_muon_single_shape(self, group, params, shape):
         p = params[0]
         state = self.state[p]
         num_params = len(params)
-        device, dtype = p.device, p.dtype
+        shape, device, dtype = p.shape, p.device, p.dtype
         if "momentum_buffer" not in state:
             state["momentum_buffer"] = torch.zeros(num_params, *shape, dtype=dtype, device=device)
         if "second_momentum_buffer" not in state:
@@ -459,13 +446,13 @@ WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context
 TOTAL_BATCH_SIZE = 2**17 # ~524K tokens per optimizer step
 EMBEDDING_LR = 0.6      # learning rate for token embeddings (Adam)
 UNEMBEDDING_LR = 0.004  # learning rate for lm_head (Adam)
-MATRIX_LR = 0.05        # learning rate for matrix parameters — iter 7 best: 0.05
+MATRIX_LR = 0.05        # learning rate for matrix parameters (Muon) — increased from 0.04 to escape loss plateau
 SCALAR_LR = 0.5         # learning rate for per-layer scalars (Adam)
-WEIGHT_DECAY = 0.2      # weight decay for AdamW matrix params
+WEIGHT_DECAY = 0.2      # cautious weight decay for Muon
 ADAM_BETAS = (0.8, 0.95) # Adam beta1, beta2
-WARMUP_RATIO = 0.0      # linear warmup fraction — iter 7 best: no warmup
-WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown (deprecated, unused in linear schedule)
-FINAL_LR_FRAC = 0.01    # final LR as fraction of initial — iter 7 best: 0.01
+WARMUP_RATIO = 0.0      # no warmup (loss plateau persists — give model max signal from start)
+WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown
+FINAL_LR_FRAC = 0.01    # final LR as fraction of initial (lower floor for longer learning)
 
 # Model size
 DEPTH = 8               # number of transformer layers (baseline: 8)
@@ -543,10 +530,11 @@ def get_lr_multiplier(progress):
         # Linear decay from 1.0 to FINAL_LR_FRAC
         return max(1.0 - progress, FINAL_LR_FRAC)
 
-# Muon momentum schedule: ramp 0.85→0.95 over first 300 steps (iter 7 proven)
 def get_muon_momentum(step):
-    momentum = min(0.85 + (step / 300.0) * 0.10, 0.95)
-    return momentum
+    return 0.85  # constant — iter 7 validated best used no momentum schedule
+
+def get_weight_decay(progress):
+    return WEIGHT_DECAY  # constant — iter 7 had no weight decay schedule
 
 # ---------------------------------------------------------------------------
 # Training loop
@@ -572,10 +560,12 @@ while True:
     progress = min(total_training_time / TIME_BUDGET, 1.0)
     lrm = get_lr_multiplier(progress)
     muon_momentum = get_muon_momentum(step)
+    muon_weight_decay = get_weight_decay(progress)
     for group in optimizer.param_groups:
         group["lr"] = group["initial_lr"] * lrm
         if group['kind'] == 'muon':
             group["momentum"] = muon_momentum
+            group["weight_decay"] = muon_weight_decay
     optimizer.step()
     model.zero_grad(set_to_none=True)
 
