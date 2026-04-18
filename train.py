@@ -455,7 +455,7 @@ EMBEDDING_LR = 0.6      # learning rate for token embeddings (Adam)
 UNEMBEDDING_LR = 0.004  # learning rate for lm_head (Adam)
 MATRIX_LR = 0.05        # learning rate for matrix parameters (Muon) — increased from 0.04 to escape loss plateau
 SCALAR_LR = 0.5         # learning rate for per-layer scalars (Adam)
-WEIGHT_DECAY = 0.2      # cautious weight decay for Muon
+WEIGHT_DECAY = 0.0      # iter 7 validated: no weight decay for Muon
 ADAM_BETAS = (0.8, 0.95) # Adam beta1, beta2
 WARMUP_RATIO = 0.0      # no warmup (loss plateau persists — give model max signal from start)
 WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown
@@ -540,9 +540,6 @@ def get_lr_multiplier(progress):
 def get_muon_momentum(step):
     return 0.85  # constant — iter 7 validated best used no momentum schedule
 
-def get_weight_decay(progress):
-    return WEIGHT_DECAY  # constant — iter 7 had no weight decay schedule
-
 # ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
@@ -567,12 +564,10 @@ while True:
     progress = min(total_training_time / TIME_BUDGET, 1.0)
     lrm = get_lr_multiplier(progress)
     muon_momentum = get_muon_momentum(step)
-    muon_weight_decay = get_weight_decay(progress)
     for group in optimizer.param_groups:
         group["lr"] = group["initial_lr"] * lrm
         if group['kind'] == 'muon':
             group["momentum"] = muon_momentum
-            group["weight_decay"] = muon_weight_decay
     optimizer.step()
     model.zero_grad(set_to_none=True)
 
