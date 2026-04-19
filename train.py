@@ -30,7 +30,7 @@ fa3 = get_kernel(repo).flash_attn_interface
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
 
-TIME_BUDGET = 2400  # 40min — extended from iter 7's 1200s to allow LR warmdown to fully converge
+TIME_BUDGET = 600  # 10min — must match runner's time_budget=600 enforcement
 
 # ---------------------------------------------------------------------------
 # GPT Model
@@ -464,7 +464,7 @@ WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown
 FINAL_LR_FRAC = 0.01    # final LR as fraction of initial — iter 7 validated best, restored from regression
 
 # Model size
-DEPTH = 8               # number of transformer layers (baseline: 8)
+DEPTH = 12              # number of transformer layers — increased from 8 for higher model capacity
 DEVICE_BATCH_SIZE = 8   # per-device batch size
 
 # ---------------------------------------------------------------------------
