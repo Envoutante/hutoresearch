@@ -30,7 +30,7 @@ fa3 = get_kernel(repo).flash_attn_interface
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
 
-TIME_BUDGET = 2400  # iter 7's validated best: 2400s achieved val_bpb=1.001131; 1200s proved insufficient (model still converging)
+TIME_BUDGET = 1200  # iter 7's validated best: 1200s achieved val_bpb=1.001131 with linear decay
 
 # ---------------------------------------------------------------------------
 # GPT Model
@@ -266,11 +266,11 @@ class GPT(nn.Module):
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
         ]
-        # Muon replaced with AdamW for diagnostic: test if loss plateau is optimizer-bound
-        # All matrix params go to AdamW (same LR as Muon's MATRIX_LR)
+        # Muon for 2D matrix params — iter 7 validated best: Newton-Schmidt second-order coordination
         param_groups.append(dict(
-            kind='adamw', params=matrix_params, lr=matrix_lr,
+            kind='muon', params=matrix_params, lr=matrix_lr,
             betas=adam_betas, eps=1e-10, weight_decay=weight_decay,
+            momentum=0.85, beta2=0.95, ns_steps=3,
         ))
         optimizer = MuonAdamW(param_groups)
         for group in optimizer.param_groups:
@@ -466,7 +466,7 @@ FINAL_LR_FRAC = 0.01    # final LR as fraction of initial — iter 7 validated b
 
 # Model size
 DEPTH = 8               # number of transformer layers — reverted from 12 to fix structural timeout; iter 7 achieved best val_bpb=1.001131 with depth=8
-DEVICE_BATCH_SIZE = 4   # per-device batch size — keep to test if OOM was depth-bound
+DEVICE_BATCH_SIZE = 8   # per-device batch size — iter 7 achieved best val_bpb=1.001131 with batch=8
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
