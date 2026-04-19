@@ -245,11 +245,10 @@ class GPT(nn.Module):
     def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02,
                         weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
         model_dim = self.config.n_embd
-        # 2D square transformer.h params go to Muon for Newton-Schmidt coordination.
-        # Non-square params (MLP c_fc [4d,d], c_proj [d,4d]) must stay with AdamW
-        # because muon.stack_grads requires equal-sized tensors.
+        # All 2D transformer.h params go to Muon for Newton-Schmidt coordination.
+        # Single flat group — iter 7's exact validated config.
         all_h_params = list(self.transformer.h.parameters())
-        matrix_params = [p for p in all_h_params if p.ndim == 2 and p.shape[0] == p.shape[1]]
+        matrix_params = [p for p in all_h_params if p.ndim == 2]
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
@@ -464,8 +463,8 @@ WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown
 FINAL_LR_FRAC = 0.01    # final LR as fraction of initial — iter 7 validated best, restored from regression
 
 # Model size
-DEPTH = 12              # number of transformer layers — increased from 8 for higher model capacity
-DEVICE_BATCH_SIZE = 4   # per-device batch size — reduced for GPU memory constraint
+DEPTH = 8               # number of transformer layers — iter 7 validated best
+DEVICE_BATCH_SIZE = 4   # per-device batch size — keep to test if OOM was depth-bound
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
