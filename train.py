@@ -30,7 +30,7 @@ fa3 = get_kernel(repo).flash_attn_interface
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
 
-TIME_BUDGET = 1200  # 20min — matches outer loop_runner kill threshold (~1500s), iter 7's validated best used this value
+TIME_BUDGET = 2400  # iter 7's validated best: 2400s achieved val_bpb=1.001131; 1200s proved insufficient (model still converging)
 
 # ---------------------------------------------------------------------------
 # GPT Model
