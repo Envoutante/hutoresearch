@@ -448,7 +448,7 @@ class MuonAdamW(torch.optim.Optimizer):
 # ---------------------------------------------------------------------------
 
 # Model architecture
-ASPECT_RATIO = 64       # Restored to iter-7's validated best (n_embd=512)
+ASPECT_RATIO = 56       # aspect ratio for n_embd calculation (n_embd=768 with DEPTH=12)
 HEAD_DIM = 128          # target head dimension for attention
 WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context
 
@@ -458,14 +458,14 @@ EMBEDDING_LR = 0.6      # learning rate for token embeddings (Adam)
 UNEMBEDDING_LR = 0.004  # learning rate for lm_head (Adam)
 MATRIX_LR = 0.05        # learning rate for matrix parameters (Muon) — iter 7 validated best
 SCALAR_LR = 0.5         # learning rate for per-layer scalars (Adam)
-WEIGHT_DECAY = 0.2      # iter 7 validated: cautious weight decay for Muon
+WEIGHT_DECAY = 0.0      # zero weight decay — all prior attempts with WEIGHT_DECAY > 0 regressed
 ADAM_BETAS = (0.8, 0.95) # Adam beta1, beta2
 WARMUP_RATIO = 0.0      # no warmup (loss plateau persists — give model max signal from start)
 WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown
-FINAL_LR_FRAC = 0.01    # final LR as fraction of initial — iter 7 validated best, restored from regression
+FINAL_LR_FRAC = 0.01    # final LR as fraction of initial — iter 7 validated best
 
 # Model size
-DEPTH = 8               # Reverted to iter-7's validated best (DEPTH=9 confirmed harmful: +10.4% worse val_bpb)
+DEPTH = 12              # restored to iter-7's depth (n_embd=768) — current DEPTH=8 caused regression
 DEVICE_BATCH_SIZE = 8   # reduced from 16 to fit within GPU memory under concurrent multi-process usage
 
 # ---------------------------------------------------------------------------
