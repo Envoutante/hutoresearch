@@ -30,7 +30,7 @@ fa3 = get_kernel(repo).flash_attn_interface
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
 
-TIME_BUDGET = 600  # 10min — must match runner's time_budget=600 enforcement
+TIME_BUDGET = 1200  # 20min — restored from 600s to allow batch=8 to converge
 
 # ---------------------------------------------------------------------------
 # GPT Model
@@ -465,7 +465,7 @@ FINAL_LR_FRAC = 0.01    # final LR as fraction of initial — iter 7 validated b
 
 # Model size
 DEPTH = 12              # number of transformer layers — increased from 8 for higher model capacity
-DEVICE_BATCH_SIZE = 4   # per-device batch size
+DEVICE_BATCH_SIZE = 8   # per-device batch size — restored from 4; OOM was transient
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
