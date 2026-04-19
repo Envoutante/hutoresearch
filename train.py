@@ -248,7 +248,7 @@ class GPT(nn.Module):
         # All 2D transformer.h params go to Muon for Newton-Schmidt coordination.
         # Single flat group — iter 7's exact validated config.
         all_h_params = list(self.transformer.h.parameters())
-        matrix_params = [p for p in all_h_params if p.ndim == 2]
+        matrix_params = [p for p in all_h_params if p.ndim == 2 and p.shape[0] != MAX_SEQ_LEN]
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
