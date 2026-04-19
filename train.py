@@ -465,7 +465,7 @@ FINAL_LR_FRAC = 0.01    # final LR as fraction of initial — iter 7 validated b
 
 # Model size
 DEPTH = 12              # number of transformer layers — increased from 8 for higher model capacity
-DEVICE_BATCH_SIZE = 8   # per-device batch size — restored from 4; OOM was transient
+DEVICE_BATCH_SIZE = 4   # per-device batch size — reduced for GPU memory constraint
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
