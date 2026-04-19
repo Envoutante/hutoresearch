@@ -466,7 +466,7 @@ FINAL_LR_FRAC = 0.01    # final LR as fraction of initial — iter 7 validated b
 
 # Model size
 DEPTH = 8               # number of transformer layers — reverted from 12 to fix structural timeout; iter 7 achieved best val_bpb=1.001131 with depth=8
-DEVICE_BATCH_SIZE = 16  # doubled from 8 to reduce grad_accum_steps (16->4), enabling ~2x more optimizer steps in same wall time for better convergence within TIME_BUDGET
+DEVICE_BATCH_SIZE = 8   # reduced from 16 to fit within GPU memory under concurrent multi-process usage
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
