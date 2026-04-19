@@ -466,7 +466,7 @@ FINAL_LR_FRAC = 0.01    # final LR as fraction of initial — iter 7 validated b
 
 # Model size
 DEPTH = 12              # restored to iter-7's depth (n_embd=768) — current DEPTH=8 caused regression
-DEVICE_BATCH_SIZE = 8   # reduced from 16 to fit within GPU memory under concurrent multi-process usage
+DEVICE_BATCH_SIZE = 2   # reduced to fit within GPU memory under concurrent multi-process usage
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
