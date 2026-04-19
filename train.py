@@ -448,7 +448,7 @@ class MuonAdamW(torch.optim.Optimizer):
 # ---------------------------------------------------------------------------
 
 # Model architecture
-ASPECT_RATIO = 56       # Restored to iter-7's validated best (n_embd=512)
+ASPECT_RATIO = 64       # Restored to iter-7's validated best (n_embd=512)
 HEAD_DIM = 128          # target head dimension for attention
 WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context
 
@@ -458,7 +458,7 @@ EMBEDDING_LR = 0.6      # learning rate for token embeddings (Adam)
 UNEMBEDDING_LR = 0.004  # learning rate for lm_head (Adam)
 MATRIX_LR = 0.05        # learning rate for matrix parameters (Muon) — iter 7 validated best
 SCALAR_LR = 0.5         # learning rate for per-layer scalars (Adam)
-WEIGHT_DECAY = 0.0      # iter 7 validated: no weight decay for Muon
+WEIGHT_DECAY = 0.2      # iter 7 validated: cautious weight decay for Muon
 ADAM_BETAS = (0.8, 0.95) # Adam beta1, beta2
 WARMUP_RATIO = 0.0      # no warmup (loss plateau persists — give model max signal from start)
 WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown
