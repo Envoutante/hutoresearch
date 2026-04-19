@@ -30,7 +30,7 @@ fa3 = get_kernel(repo).flash_attn_interface
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
 
-TIME_BUDGET = 600  # Restore to 600s: enough for training to converge while allowing eval within outer loop budget
+TIME_BUDGET = 1000  # Increased from 600s to allow more optimizer steps (1775→~3000) within outer loop 1500s budget
 
 # ---------------------------------------------------------------------------
 # GPT Model
