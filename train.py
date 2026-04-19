@@ -30,7 +30,7 @@ fa3 = get_kernel(repo).flash_attn_interface
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
 
-TIME_BUDGET = 1200  # iter 7's validated best: 1200s achieved val_bpb=1.001131 with linear decay
+TIME_BUDGET = 2400  # iter 7 achieved val_bpb=1.001131 with 2400s; 1200s (iter 35) was insufficient — loss still descending at termination
 
 # ---------------------------------------------------------------------------
 # GPT Model
