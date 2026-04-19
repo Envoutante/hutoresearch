@@ -30,7 +30,7 @@ fa3 = get_kernel(repo).flash_attn_interface
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
 
-TIME_BUDGET = 1200  # Reverted to iter-7's validated best (3464 steps, val_bpb=1.001131)
+TIME_BUDGET = 1800  # Increased from 1200 to allow full convergence (loss still descending at 1200s)
 
 # ---------------------------------------------------------------------------
 # GPT Model
@@ -448,7 +448,7 @@ class MuonAdamW(torch.optim.Optimizer):
 # ---------------------------------------------------------------------------
 
 # Model architecture
-ASPECT_RATIO = 72       # Increased from 56 to widen n_embd=640 (vs 512) for more representational capacity
+ASPECT_RATIO = 56       # Restored to iter-7's validated best (n_embd=512)
 HEAD_DIM = 128          # target head dimension for attention
 WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context
 
