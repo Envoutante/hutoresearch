@@ -30,7 +30,7 @@ fa3 = get_kernel(repo).flash_attn_interface
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
 
-TIME_BUDGET = 1200  # 20min override
+TIME_BUDGET = 2400  # 40min — extended from iter 7's 1200s to allow LR warmdown to fully converge
 
 # ---------------------------------------------------------------------------
 # GPT Model
@@ -155,11 +155,32 @@ class GPT(nn.Module):
 
     @torch.no_grad()
     def init_weights(self):
-        # PyTorch default initialization — GPT-3 scaled init produced 1.107 plateau
-        # resid_lambdas and x0_lambdas still need explicit init
+        # Scaled initialization: std = 0.02 / sqrt(2 * n_layer)
+        # GPT-3 paper: addresses ~2.8 loss plateau. Critical for Muon Newton-Schmidt coordination.
+        n_layer = self.config.n_layer
+        init_std = 0.02 / math.sqrt(2 * n_layer)
+        # Embedding and unembedding
+        torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=init_std)
+        torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=init_std)
+        # Transformer blocks: scaled init for all matrix parameters
+        for block in self.transformer.h:
+            torch.nn.init.normal_(block.attn.c_q.weight, mean=0.0, std=init_std)
+            torch.nn.init.normal_(block.attn.c_k.weight, mean=0.0, std=init_std)
+            torch.nn.init.normal_(block.attn.c_v.weight, mean=0.0, std=init_std)
+            torch.nn.init.zeros_(block.attn.c_proj.weight)
+            torch.nn.init.normal_(block.mlp.c_fc.weight, mean=0.0, std=init_std)
+            torch.nn.init.zeros_(block.mlp.c_proj.weight)
+        # Per-layer scalars
         self.resid_lambdas.fill_(1.0)
         self.x0_lambdas.fill_(0.1)
-        # Rotary embeddings (must be recomputed after device placement)
+        # Value embeddings: use same scaled init
+        for ve in self.value_embeds.values():
+            torch.nn.init.normal_(ve.weight, mean=0.0, std=init_std)
+        # Gate weights init to zero (sigmoid(0)=0.5, scaled by 2 -> 1.0 = neutral)
+        for block in self.transformer.h:
+            if block.attn.ve_gate is not None:
+                torch.nn.init.zeros_(block.attn.ve_gate.weight)
+        # Rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.cos, self.sin = cos, sin
@@ -440,7 +461,7 @@ WEIGHT_DECAY = 0.0      # iter 7 validated: no weight decay for Muon
 ADAM_BETAS = (0.8, 0.95) # Adam beta1, beta2
 WARMUP_RATIO = 0.0      # no warmup (loss plateau persists — give model max signal from start)
 WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown
-FINAL_LR_FRAC = 0.005   # final LR as fraction of initial — middle ground between 0.01 (iter 7 best) and 0.001 (iter 9 regression)
+FINAL_LR_FRAC = 0.01    # final LR as fraction of initial — iter 7 validated best, restored from regression
 
 # Model size
 DEPTH = 8               # number of transformer layers (baseline: 8)
