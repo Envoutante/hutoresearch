@@ -465,7 +465,7 @@ FINAL_LR_FRAC = 0.01    # final LR as fraction of initial — iter 7 validated b
 
 # Model size
 DEPTH = 12              # number of transformer layers — increased from 8 for higher model capacity
-DEVICE_BATCH_SIZE = 8   # per-device batch size
+DEVICE_BATCH_SIZE = 4   # per-device batch size
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
@@ -523,6 +523,8 @@ optimizer = model.setup_optimizer(
 )
 
 model = torch.compile(model, dynamic=False)
+
+torch.cuda.empty_cache()  # free any cached memory before training loop
 
 train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
 x, y, epoch = next(train_loader)  # prefetch first batch
