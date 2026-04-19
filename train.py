@@ -137,7 +137,8 @@ class GPT(nn.Module):
             "wte": nn.Embedding(config.vocab_size, config.n_embd),
             "h": nn.ModuleList([Block(config, i) for i in range(config.n_layer)]),
         })
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        # Tied embedding: lm_head_weight is a separate tunable parameter initialized from wte
+        self.lm_head_weight = nn.Parameter(self.transformer.wte.weight.clone())
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
         self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))
         # Value embeddings
@@ -159,9 +160,9 @@ class GPT(nn.Module):
         # GPT-3 paper: addresses ~2.8 loss plateau. Critical for Muon Newton-Schmidt coordination.
         n_layer = self.config.n_layer
         init_std = 0.02 / math.sqrt(2 * n_layer)
-        # Embedding and unembedding
+        # Embedding and unembedding (tied embedding: lm_head_weight is cloned from wte)
         torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=init_std)
-        torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=init_std)
+        torch.nn.init.normal_(self.lm_head_weight, mean=0.0, std=init_std)
         # Transformer blocks: scaled init for all matrix parameters
         for block in self.transformer.h:
             torch.nn.init.normal_(block.attn.c_q.weight, mean=0.0, std=init_std)
@@ -233,7 +234,7 @@ class GPT(nn.Module):
     def num_scaling_params(self):
         wte = sum(p.numel() for p in self.transformer.wte.parameters())
         value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
-        lm_head = sum(p.numel() for p in self.lm_head.parameters())
+        lm_head = self.lm_head_weight.numel()
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel()
         total = wte + value_embeds + lm_head + transformer_matrices + scalars
@@ -252,7 +253,7 @@ class GPT(nn.Module):
         matrix_params = [p for p in all_h_params if p.ndim == 2 and p.shape[0] == p.shape[1]]
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
-        lm_head_params = list(self.lm_head.parameters())
+        lm_head_params = [self.lm_head_weight]
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         # Scale LR ∝ 1/√dmodel (tuned at 768 dim)
@@ -291,7 +292,7 @@ class GPT(nn.Module):
         x = norm(x)
 
         softcap = 15
-        logits = self.lm_head(x)
+        logits = F.linear(x, self.lm_head_weight)
         logits = logits.float()
         logits = softcap * torch.tanh(logits / softcap)
 
