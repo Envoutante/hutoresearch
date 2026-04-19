@@ -266,11 +266,11 @@ class GPT(nn.Module):
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
         ]
-        # All 2D transformer.h params in ONE Muon group for Newton-Schmidt
-        # second-order cross-matrix gradient coordination — iter 7's exact validated config
+        # Muon replaced with AdamW for diagnostic: test if loss plateau is optimizer-bound
+        # All matrix params go to AdamW (same LR as Muon's MATRIX_LR)
         param_groups.append(dict(
-            kind='muon', params=matrix_params, lr=matrix_lr,
-            momentum=0.85, ns_steps=5, beta2=0.95, weight_decay=weight_decay,
+            kind='adamw', params=matrix_params, lr=matrix_lr,
+            betas=adam_betas, eps=1e-10, weight_decay=weight_decay,
         ))
         optimizer = MuonAdamW(param_groups)
         for group in optimizer.param_groups:
