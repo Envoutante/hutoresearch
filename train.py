@@ -465,7 +465,7 @@ WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown
 FINAL_LR_FRAC = 0.01    # final LR as fraction of initial — iter 7 validated best, restored from regression
 
 # Model size
-DEPTH = 12              # number of transformer layers — iter 7 validated best
+DEPTH = 8               # number of transformer layers — reverted from 12 to fix structural timeout; iter 7 achieved best val_bpb=1.001131 with depth=8
 DEVICE_BATCH_SIZE = 4   # per-device batch size — keep to test if OOM was depth-bound
 
 # ---------------------------------------------------------------------------
