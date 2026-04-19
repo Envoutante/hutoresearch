@@ -30,7 +30,7 @@ fa3 = get_kernel(repo).flash_attn_interface
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
 
-TIME_BUDGET = 1200  # 20min — restored from 600s to allow batch=8 to converge
+TIME_BUDGET = 2400  # 40min — restored to iter 7's validated time budget
 
 # ---------------------------------------------------------------------------
 # GPT Model
@@ -245,14 +245,11 @@ class GPT(nn.Module):
     def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02,
                         weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
         model_dim = self.config.n_embd
-        # All 2D transformer.h params go to Muon for Newton-Schmidt coordination.
-        # Group by shape for per-shape Muon groups (different shapes can't be stacked).
+        # 2D square transformer.h params go to Muon for Newton-Schmidt coordination.
+        # Non-square params (MLP c_fc [4d,d], c_proj [d,4d]) must stay with AdamW
+        # because muon.stack_grads requires equal-sized tensors.
         all_h_params = list(self.transformer.h.parameters())
-        matrix_candidates = [p for p in all_h_params if p.ndim == 2 and p.shape[0] != MAX_SEQ_LEN]
-        from collections import defaultdict
-        shape_to_params = defaultdict(list)
-        for p in matrix_candidates:
-            shape_to_params[p.shape].append(p)
+        matrix_params = [p for p in all_h_params if p.ndim == 2 and p.shape[0] == p.shape[1]]
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
@@ -268,12 +265,12 @@ class GPT(nn.Module):
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
         ]
-        # Per-shape Muon groups for Newton-Schmidt second-order cross-matrix gradient coordination
-        for shape, params in shape_to_params.items():
-            param_groups.append(dict(
-                kind='muon', params=params, lr=matrix_lr,
-                momentum=0.85, ns_steps=5, beta2=0.95, weight_decay=weight_decay,
-            ))
+        # All 2D transformer.h params in ONE Muon group for Newton-Schmidt
+        # second-order cross-matrix gradient coordination — iter 7's exact validated config
+        param_groups.append(dict(
+            kind='muon', params=matrix_params, lr=matrix_lr,
+            momentum=0.85, ns_steps=5, beta2=0.95, weight_decay=weight_decay,
+        ))
         optimizer = MuonAdamW(param_groups)
         for group in optimizer.param_groups:
             group["initial_lr"] = group["lr"]
@@ -467,7 +464,7 @@ WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown
 FINAL_LR_FRAC = 0.01    # final LR as fraction of initial — iter 7 validated best, restored from regression
 
 # Model size
-DEPTH = 8               # number of transformer layers — iter 7 validated best
+DEPTH = 12              # number of transformer layers — iter 7 validated best
 DEVICE_BATCH_SIZE = 4   # per-device batch size — keep to test if OOM was depth-bound
 
 # ---------------------------------------------------------------------------
