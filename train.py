@@ -30,7 +30,7 @@ fa3 = get_kernel(repo).flash_attn_interface
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
 
-TIME_BUDGET = 1000  # Increased from 600s to allow more optimizer steps (1775→~3000) within outer loop 1500s budget
+TIME_BUDGET = 1200  # Reverted to iter-7's validated best (3464 steps, val_bpb=1.001131)
 
 # ---------------------------------------------------------------------------
 # GPT Model
@@ -465,7 +465,7 @@ WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown
 FINAL_LR_FRAC = 0.01    # final LR as fraction of initial — iter 7 validated best, restored from regression
 
 # Model size
-DEPTH = 8               # number of transformer layers — reverted from 12 to fix structural timeout; iter 7 achieved best val_bpb=1.001131 with depth=8
+DEPTH = 9               # Increased from 8 to 9 for better generalization; iter-7 best used depth=8
 DEVICE_BATCH_SIZE = 8   # reduced from 16 to fit within GPU memory under concurrent multi-process usage
 
 # ---------------------------------------------------------------------------
