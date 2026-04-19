@@ -18,6 +18,7 @@ from dataclasses import dataclass, asdict
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from kernels import get_kernel
 
@@ -123,9 +124,14 @@ class Block(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x, ve, cos_sin, window_size):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size)
-        x = x + self.mlp(norm(x))
-        return x
+        # Activation checkpointing: trade compute for memory
+        # Allows larger batch sizes without OOM
+        def block_forward(x, ve, cos_sin, window_size):
+            x = x + self.attn(norm(x), ve, cos_sin, window_size)
+            x = x + self.mlp(norm(x))
+            return x
+        return checkpoint(block_forward, x, ve, cos_sin, window_size,
+                         use_reentrant=False, determinism_check="none")
 
 
 class GPT(nn.Module):
@@ -466,7 +472,7 @@ FINAL_LR_FRAC = 0.01    # final LR as fraction of initial — iter 7 validated b
 
 # Model size
 DEPTH = 12              # restored to iter-7's depth (n_embd=768) — current DEPTH=8 caused regression
-DEVICE_BATCH_SIZE = 4   # reduced from 8 due to GPU memory pressure from multiple processes
+DEVICE_BATCH_SIZE = 8   # restored to 8; activation checkpointing should free enough memory
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
