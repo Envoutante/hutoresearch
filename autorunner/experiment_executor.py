@@ -178,6 +178,7 @@ def run(
     time_budget: int = 600,
     run_log_path: Path | None = None,
     on_process_started: Callable[[int], None] | None = None,
+    env_overrides: dict[str, str] | None = None,
 ) -> ExperimentResult:
     """
     运行 train.py，实时写入 run.log。
@@ -216,6 +217,8 @@ def run(
         # 强制 Python 子进程无缓冲输出，避免 run.log 长时间为空
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
+        if env_overrides:
+            env.update(env_overrides)
 
         process = subprocess.Popen(
             ["uv", "run", "python", "-u", "train.py"],

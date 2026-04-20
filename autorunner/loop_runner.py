@@ -166,6 +166,38 @@ def _git_commit(decision: str, description: str = "") -> str:
         return ""
 
 
+def _git_head_short() -> str:
+    """读取当前 HEAD 短哈希。"""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=WORKDIR,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return result.stdout.strip()
+    except subprocess.CalledProcessError:
+        return ""
+
+
+def _restore_train_py_from_commit(commit_hash: str) -> bool:
+    """仅将 train.py 恢复到指定 commit，不影响其他文件。"""
+    if not commit_hash:
+        return False
+    try:
+        subprocess.run(
+            ["git", "restore", "--source", commit_hash, "--worktree", "train.py"],
+            cwd=WORKDIR,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return True
+    except subprocess.CalledProcessError:
+        return False
+
+
 def _write_llm_log(iteration: int, phase: str, content: str):
     """LLM 回复写入日志文件"""
     ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -524,6 +556,35 @@ def _extract_description_from_llm_reply(
     return picked[:160]
 
 
+def _extract_global_upper_assignments(code: str) -> dict[str, str]:
+    """提取 train.py 中全大写常量赋值（用于 repair 约束校验）。"""
+    out: dict[str, str] = {}
+    for raw in code.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        left, right = line.split("=", 1)
+        name = left.strip()
+        if not name or not name.isidentifier() or not name.isupper():
+            continue
+        out[name] = right.strip()
+    return out
+
+
+def _detect_forbidden_repair_changes(before_code: str, after_code: str) -> list[str]:
+    """检测 repair 是否改动了优化相关超参/结构参数（全大写常量）。"""
+    before = _extract_global_upper_assignments(before_code)
+    after = _extract_global_upper_assignments(after_code)
+
+    changed: list[str] = []
+    for key in sorted(set(before) | set(after)):
+        if before.get(key) != after.get(key):
+            changed.append(key)
+    return changed
+
+
 def _repair_once_on_failure(
     *,
     agent: ClaudeCodeAgent,
@@ -533,6 +594,7 @@ def _repair_once_on_failure(
     time_budget: int,
     run_log_path: Path,
     pre_iteration_code: str,
+    refine_description: str,
 ) -> tuple[ExperimentResult, bool, str | None, str | None]:
     """失败时最多修复 3 次并重跑；均失败则回退到本轮开始前代码。"""
     max_repair_attempts = 3
@@ -564,6 +626,7 @@ def _repair_once_on_failure(
         repair_result = agent.repair(
             files={"train.py": current_code},
             issues=issues,
+            refine_description=refine_description,
             workdir=WORKDIR,
         )
 
@@ -605,6 +668,23 @@ def _repair_once_on_failure(
             )
             continue
 
+        forbidden_changes = _detect_forbidden_repair_changes(
+            current_code, repaired_code
+        )
+        if forbidden_changes:
+            changed_keys = ", ".join(forbidden_changes[:8])
+            if len(forbidden_changes) > 8:
+                changed_keys += ", ..."
+            _print_progress(
+                iteration,
+                max_iterations,
+                stage,
+                "fail",
+                "(forbidden optimization/architecture changes)",
+            )
+            console.print(Text(f"       blocked keys: {changed_keys}", style="red"))
+            continue
+
         (WORKDIR / "train.py").write_text(repaired_code)
         last_repair_git_hash = _git_commit("repair", f"iteration {iteration}")
         _print_progress(iteration, max_iterations, stage, "done", f"({elapsed:.1f}s)")
@@ -630,11 +710,25 @@ def _repair_once_on_failure(
             f"({runtime_min:.1f}m)",
         )
 
-        last_repair_desc = _extract_description_from_llm_reply(
+        # repair 成功后，允许其基于 refine 描述重写“最终实验方向描述”，
+        # 但若输出明显偏向报错排障语义，则回退到 refine 描述。
+        candidate_desc = _extract_description_from_llm_reply(
             repair_result.content,
             iteration=iteration,
-            prefix="repair: ",
         )
+        low = candidate_desc.lower()
+        if (
+            candidate_desc == f"iter {iteration}"
+            or "repair" in low
+            or "bug" in low
+            or "报错" in candidate_desc
+            or "错误" in candidate_desc
+            or "修复" in candidate_desc
+            or "异常" in candidate_desc
+        ):
+            last_repair_desc = refine_description
+        else:
+            last_repair_desc = candidate_desc
 
         if rerun_result.status == "completed":
             return rerun_result, True, last_repair_git_hash, last_repair_desc
@@ -794,49 +888,100 @@ def run_loop(
     console.print(Text("─" * 50, style="dim"))
 
     for iteration in range(1, max_iterations + 1):
-        phase = "generate" if iteration == 1 else "refine"
-
-        # === 阶段1: LLM 生成/ refine ===
-        _print_progress(iteration, max_iterations, f"LLM ({phase})", "start")
-        t0 = time.monotonic()
-
+        phase = "bootstrap" if iteration == 1 else "refine"
         train_py_content = (WORKDIR / "train.py").read_text()
-        run_summaries = _build_run_summaries()
-        eval_guidance = _build_eval_guidance()
-        if iteration == 1:
-            if best_bpb_record is not None and best_commit:
-                exp_plan = (
-                    "提出一个候选实验，使 val_bpb 优于当前最佳 "
-                    f"{best_bpb_record:.6f}。"
-                )
-                extra_guidance = (
-                    "请先使用 Read 工具阅读 results.tsv，梳理此前每次尝试的改动与效果，"
-                    "避免重复无效方向。"
-                    "历史最佳参考："
-                    f"commit={best_commit}, val_bpb={best_bpb_record:.6f}。"
-                    "可以使用 Bash 读取该版本 train.py（例如："
-                    f"git show {best_commit}:train.py），"
-                    "并基于该最佳版本与当前代码进行候选实验设计。"
-                    f"{eval_guidance}"
-                )
-            else:
-                exp_plan = "暂无历史最佳记录，先基于当前代码提出首个候选实验。"
-                extra_guidance = (
-                    "请先使用 Read 工具阅读 results.tsv，梳理此前每次尝试的改动与效果，"
-                    "优先规避已经证明无效的方向。"
-                    "当前没有可对照的历史最佳 commit，"
-                    "请先从模型结构、训练范式或归一化策略中选择一个最有潜力的方向。"
-                    f"{eval_guidance}"
-                )
+        git_hash = ""
+        tsv_description = f"iter {iteration}"
+        llm_log_written = False
 
-            result = agent.generate(
-                exp_plan=exp_plan,
-                topic=topic,
-                metric_key="val_bpb",
-                extra_guidance=extra_guidance,
-                workdir=WORKDIR,
-            )
+        if iteration == 1:
+            # === bootstrap: iter=1 ===
+            if best_bpb_record is None or not best_commit:
+                _print_progress(
+                    iteration,
+                    max_iterations,
+                    "LLM (bootstrap)",
+                    "skip",
+                    "(no history; baseline directly)",
+                )
+                git_hash = _git_head_short()
+                tsv_description = "baseline(no_history)"
+            else:
+                restored = _restore_train_py_from_commit(best_commit)
+                if restored:
+                    _print_progress(
+                        iteration,
+                        max_iterations,
+                        "Bootstrap restore",
+                        "done",
+                        f"(train.py <- {best_commit})",
+                    )
+                else:
+                    _print_progress(
+                        iteration,
+                        max_iterations,
+                        "Bootstrap restore",
+                        "fail",
+                        f"(restore {best_commit} failed)",
+                    )
+
+                # 可选分析：仅总结历史，不改代码
+                _print_progress(iteration, max_iterations, "LLM (bootstrap)", "start")
+                t0 = time.monotonic()
+                eval_guidance = _build_eval_guidance()
+                exp_plan = (
+                    "分析并总结历史实验结果，为后续 refine 提供可执行方向；"
+                    "本轮不产出代码改动。"
+                )
+                extra_guidance = (
+                    "请仅做只读分析：总结历史有效方向、失败模式与下一轮优先级。"
+                    "禁止修改 train.py。"
+                    f"历史最佳参考：commit={best_commit}, val_bpb={best_bpb_record:.6f}。"
+                    f"{eval_guidance}"
+                )
+                result = agent.generate(
+                    exp_plan=exp_plan,
+                    topic=topic,
+                    metric_key="val_bpb",
+                    extra_guidance=extra_guidance,
+                    workdir=WORKDIR,
+                )
+                elapsed = time.monotonic() - t0
+                _write_llm_log(iteration, "generate", result.content)
+                llm_log_written = True
+
+                if result.success:
+                    _print_progress(
+                        iteration,
+                        max_iterations,
+                        "LLM (bootstrap)",
+                        "done",
+                        f"({elapsed:.1f}s)",
+                    )
+                    tsv_description = _extract_description_from_llm_reply(
+                        result.content,
+                        iteration=iteration,
+                        prefix="bootstrap_analysis: ",
+                    )
+                else:
+                    _print_progress(
+                        iteration,
+                        max_iterations,
+                        "LLM (bootstrap)",
+                        "fail",
+                        f"({elapsed:.1f}s) rc={result.rc}",
+                    )
+                    tsv_description = f"baseline(from_best:{best_commit})"
+
+                # 无论分析是否成功，都使用 best commit 作为本轮基线来源标识
+                git_hash = best_commit
         else:
+            # === 阶段1: LLM refine ===
+            _print_progress(iteration, max_iterations, f"LLM ({phase})", "start")
+            t0 = time.monotonic()
+
+            run_summaries = _build_run_summaries()
+            eval_guidance = _build_eval_guidance()
             result = agent.refine(
                 current_files={"train.py": train_py_content},
                 run_summaries=run_summaries,
@@ -850,50 +995,55 @@ def run_loop(
                 workdir=WORKDIR,
             )
 
-        elapsed = time.monotonic() - t0
+            elapsed = time.monotonic() - t0
 
-        # 写 LLM 回复日志
-        _write_llm_log(iteration, phase, result.content)
-        tsv_description = _extract_description_from_llm_reply(
-            result.content,
-            iteration=iteration,
-        )
+            # 写 LLM 回复日志
+            _write_llm_log(iteration, phase, result.content)
+            llm_log_written = True
+            tsv_description = _extract_description_from_llm_reply(
+                result.content,
+                iteration=iteration,
+            )
 
-        if not result.success:
+            if not result.success:
+                _print_progress(
+                    iteration,
+                    max_iterations,
+                    f"LLM ({phase})",
+                    "fail",
+                    f"({elapsed:.1f}s) rc={result.rc}",
+                )
+                err = (result.stderr or result.content or "").strip()
+                if err:
+                    console.print(Text(f"       error: {err[:300]}", style="red"))
+                else:
+                    console.print(
+                        Text(
+                            "       error: (empty) see autorunner/artifacts/live_stream_*.jsonl",
+                            style="red",
+                        )
+                    )
+                continue
+
             _print_progress(
                 iteration,
                 max_iterations,
                 f"LLM ({phase})",
-                "fail",
-                f"({elapsed:.1f}s) rc={result.rc}",
+                "done",
+                f"({elapsed:.1f}s)",
             )
-            err = (result.stderr or result.content or "").strip()
-            if err:
-                console.print(Text(f"       error: {err[:300]}", style="red"))
-            else:
-                console.print(
-                    Text(
-                        "       error: (empty) see autorunner/artifacts/live_stream_*.jsonl",
-                        style="red",
-                    )
-                )
-            continue
 
-        _print_progress(
-            iteration, max_iterations, f"LLM ({phase})", "done", f"({elapsed:.1f}s)"
-        )
+            # === 仅接受工作区文件结果，不再解析对话文本代码 ===
+            new_code = result.files.get("train.py", "").strip()
+            if not new_code:
+                print(f"       WARNING: train.py was not updated by file tools")
+                continue
 
-        # === 仅接受工作区文件结果，不再解析对话文本代码 ===
-        new_code = result.files.get("train.py", "").strip()
-        if not new_code:
-            print(f"       WARNING: train.py was not updated by file tools")
-            continue
+            (WORKDIR / "train.py").write_text(new_code)
 
-        (WORKDIR / "train.py").write_text(new_code)
-
-        # === Git commit ===
-        desc = f"iteration {iteration}"
-        git_hash = _git_commit("candidate", desc)
+            # === Git commit ===
+            desc = f"iteration {iteration}"
+            git_hash = _git_commit("candidate", desc)
 
         # === 阶段2: 运行实验 ===
         _print_progress(iteration, max_iterations, "Run experiment", "start")
@@ -921,6 +1071,7 @@ def run_loop(
                     time_budget=time_budget,
                     run_log_path=RUN_LOG_FILE,
                     pre_iteration_code=train_py_content,
+                    refine_description=tsv_description,
                 )
             )
             if repaired:
@@ -982,7 +1133,8 @@ def run_loop(
         print(f"       artifacts/iter-{iteration:03d}.json written")
         if eval_artifact is not None:
             print(f"       {eval_artifact.relative_to(WORKDIR)} written")
-        print(f"       llm_iter-{iteration:03d}_{phase}.log written")
+        if llm_log_written:
+            print(f"       llm_iter-{iteration:03d}_{phase}.log written")
         print(f"       {RUN_LOG_FILE.relative_to(WORKDIR)} written")
         print()
 

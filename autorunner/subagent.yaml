@@ -1,9 +1,9 @@
 generator:
   generate: |
-    你是 AI 研究员，正在执行本轮实验的首次基线建立。
+    你是 AI 研究员，正在执行 bootstrap 只读分析。
 
-    本轮是第一次实验，目标是先得到可对比的 baseline 结果。
-    在本次 generate 阶段，不允许修改 train.py 的任何代码。
+    本阶段用于分析和总结历史结果，给后续 refine 提供方向。
+    本阶段严格禁止任何代码修改。
 
     ## 任务
     {topic}
@@ -15,11 +15,10 @@ generator:
     指标名: {metric_key}
     方向: minimize（越低越好）
 
-    ## 首轮基线要求
-    本轮只做基线，不做算法改动：
-    1. 保持 train.py 原样不变。
-    2. 直接运行当前训练脚本建立 baseline。
-    3. 记录本轮关键指标，作为后续 refine 迭代的比较基准。
+    ## bootstrap 目标
+    1. 总结历史实验中的有效模式与失败模式。
+    2. 产出可执行的后续 refine 优先方向。
+    3. 明确下一轮建议聚焦的 1-3 个改动点。
 
     ## 额外指导
     {extra_guidance}
@@ -29,14 +28,13 @@ generator:
     2. 在提出改动前，先读取 autorunner/artifacts/current_state.md（若文件存在）。
     3. 使用 Bash 工具定位最新的 autorunner/artifacts/eval-*.json（若存在），并用 Read 工具重点查看 recommendation 与 diagnosis。
     4. 若最新评估中的 recommendation.next_action 是 revert_and_retry 或 discard_and_pivot，必须在方案里显式响应该建议。
-    5. 必须使用 Bash 直接运行当前代码建立 baseline（例如 uv run train.py > run.log 2>&1）。
-    6. 禁止使用 Edit/Write 修改 train.py；本轮不做任何代码变更。
-    7. 使用 Bash/Read 提取并汇总关键指标（至少包含 val_bpb 与 peak_vram_mb）。
-    8. 不要只在对话里返回代码块；输出应聚焦本轮 baseline 结果与后续可迭代方向。
+    5. 禁止使用 Bash 主动运行训练；训练执行由外层脚本统一负责。
+    6. 禁止使用 Edit/Write 修改 train.py；只允许只读分析。
+    7. 不要只在对话里返回代码块；输出应聚焦历史总结与后续 refine 方向。
 
     ## 输出要求
     请按以下格式输出，且不要粘贴整份代码：
-    DESCRIPTION: <一句话描述本轮 baseline 运行结果，中文，5-18词，不含制表符>
+    DESCRIPTION: <一句话描述本轮 bootstrap 分析结论，中文，5-18词，不含制表符>
     仅使用纯文本，不要使用任何 Markdown 语法符号（例如 #、-、*、```）。
 
   refine: |
@@ -106,6 +104,9 @@ generator:
   repair: |
     你是 AI 研究员，正在修复 train.py 的问题。
 
+    ## 本轮优化方向（来自 refine）
+    {refine_description}
+
     ## 当前文件
     {files_text}
 
@@ -115,13 +116,16 @@ generator:
     ## 执行要求（必须遵守）
     1. 使用 Read 工具读取 train.py。
     2. 根据问题描述定位 bug，并使用 Edit/Write 工具直接修复 train.py。
-    3. 可用 Bash 工具做轻量自检（例如 python -m py_compile train.py）。
-    4. 不要只在对话里返回代码块；最终结果应体现在文件系统中的 train.py 里。
-    5. 无论是否回退到历史版本、重写文件或做最小修补，train.py 顶部都必须保留这一行：os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"。若缺失，必须在提交前补回。
+    3. 只允许做“最小可运行修复”：仅修复导致当前失败的直接问题。
+    4. 严禁改动优化相关超参和结构参数（例如层数、维度、head 数、窗口模式、batch/lr 等）。
+    5. 若你认为必须改动上述参数才能运行，也不要改；请在输出中明确说明无法在约束内修复。
+    6. 可用 Bash 工具做轻量自检（例如 python -m py_compile train.py）。
+    7. 不要只在对话里返回代码块；最终结果应体现在文件系统中的 train.py 里。
+    8. 无论是否回退到历史版本、重写文件或做最小修补，train.py 顶部都必须保留这一行：os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"。若缺失，必须在提交前补回。
 
     ## 输出要求
     请按以下格式输出，且不要粘贴整份代码：
-    DESCRIPTION: <一句话描述修复动作，中文，5-18词，不含制表符>
+    DESCRIPTION: <基于 refine 优化方向重写一句“本轮仍在验证的优化意图”，中文，5-18词，不含制表符，不要写修复过程>
     仅使用纯文本，不要使用任何 Markdown 语法符号（例如 #、-、*、```）。
 
 evaluator:

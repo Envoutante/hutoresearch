@@ -349,8 +349,7 @@ class _StreamOutputProcessor:
             return False
         lowered = content.lower()
         return (
-            "<tool_use_error>" not in lowered
-            and "inputvalidationerror" not in lowered
+            "<tool_use_error>" not in lowered and "inputvalidationerror" not in lowered
         )
 
     def _render_tool_call_line(
@@ -993,6 +992,7 @@ class ClaudeCodeAgent:
         self,
         files: dict[str, str],
         issues: str,
+        refine_description: str,
     ) -> str:
         """生成修复问题的提示词。"""
         files_text = ""
@@ -1003,6 +1003,7 @@ class ClaudeCodeAgent:
             "repair",
             files_text=files_text,
             issues=issues,
+            refine_description=refine_description,
         )
 
     def _evaluate_prompt(
@@ -1092,11 +1093,12 @@ class ClaudeCodeAgent:
         *,
         files: dict[str, str],
         issues: str,
+        refine_description: str,
         workdir: Path,
         timeout_sec: int | None = None,
     ) -> CodeAgentResult:
         """执行修复流程并返回结果。"""
-        prompt = self._repair_prompt(files, issues)
+        prompt = self._repair_prompt(files, issues, refine_description)
         cmd = self._build_cmd(prompt, workdir)
         rc, stdout, stderr, elapsed, to = self._run_subprocess(
             cmd,
