@@ -5,13 +5,21 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
+from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
+
+from rich.console import Console, Group
+from rich.live import Live
+from rich.panel import Panel
+from rich.table import Table
 
 # 支持直接运行: python autorunner/parallel_runner.py
 if __name__ == "__main__":
@@ -34,6 +42,7 @@ FAILURE_DIRECTIONS_FILE = ARTIFACTS_DIR / "failure_directions.json"
 QUEUE_EVENTS_FILE = ARTIFACTS_DIR / "parallel_queue.jsonl"
 BEST_TRAIN_FILE = ARTIFACTS_DIR / "best_train.py"
 MODEL = "MiniMax-M2.7"
+console = Console()
 
 
 @dataclass
@@ -45,6 +54,7 @@ class CandidateTask:
     direction_fingerprint: str
     parent_ref: str
     created_at: float
+    queued_at: float
     status: str = "queued"
     gpu_id: int | None = None
     launch_ts: float | None = None
@@ -70,6 +80,200 @@ def _append_queue_event(event_type: str, payload: dict):
     }
     with QUEUE_EVENTS_FILE.open("a") as f:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def _short_text(text: str, max_len: int = 42) -> str:
+    s = " ".join(str(text or "").split())
+    if len(s) <= max_len:
+        return s
+    return s[: max_len - 3] + "..."
+
+
+def _load_recent_queue_events(limit: int = 8) -> list[str]:
+    if not QUEUE_EVENTS_FILE.exists():
+        return []
+
+    rows: deque[str] = deque(maxlen=limit)
+    try:
+        with QUEUE_EVENTS_FILE.open("r", encoding="utf-8") as f:
+            for line in f:
+                text = line.strip()
+                if not text:
+                    continue
+                try:
+                    obj = json.loads(text)
+                except json.JSONDecodeError:
+                    continue
+                ts = str(obj.get("ts") or "")
+                ev = str(obj.get("event") or "unknown")
+                payload = (
+                    obj.get("payload") if isinstance(obj.get("payload"), dict) else {}
+                )
+                cid = str(payload.get("candidate_id") or "")
+                gpu = payload.get("gpu_id")
+                attempt = payload.get("attempt")
+                extra = []
+                if cid:
+                    extra.append(cid)
+                if gpu is not None:
+                    extra.append(f"gpu={gpu}")
+                if attempt is not None:
+                    extra.append(f"try={attempt}")
+                tail = f" ({', '.join(extra)})" if extra else ""
+                rows.append(f"{ts} | {ev}{tail}")
+    except OSError:
+        return []
+    return list(rows)
+
+
+def _render_dashboard(
+    *,
+    start_ts: float,
+    completed_runs: int,
+    max_total_runs: int,
+    baseline_bpb: float,
+    queued: list[CandidateTask],
+    running: dict[str, RunningTask],
+    finished_recent: list[dict[str, str]],
+    repair_stats: dict[str, int],
+    failure_reason_counts: dict[str, int],
+    dashboard_status_filter: str,
+    mem_idle_threshold_mb: int,
+    util_idle_threshold_pct: int,
+) -> Panel:
+    elapsed = int(time.time() - start_ts)
+    gpu_snapshots = _gpu_snapshots()
+
+    summary = Table.grid(expand=True)
+    summary.add_column(ratio=1)
+    summary.add_column(ratio=1)
+    baseline_text = "inf" if baseline_bpb == float("inf") else f"{baseline_bpb:.6f}"
+    summary.add_row(
+        f"elapsed: {elapsed}s | progress: {completed_runs}/{max_total_runs}",
+        f"queued: {len(queued)} | running: {len(running)} | baseline: {baseline_text}",
+    )
+    summary.add_row(
+        (
+            "repair: "
+            f"start={repair_stats.get('start', 0)} "
+            f"success={repair_stats.get('success', 0)} "
+            f"failed={repair_stats.get('failed', 0)} "
+            f"out_of_scope={repair_stats.get('out_of_scope', 0)}"
+        ),
+        f"filter: {dashboard_status_filter}",
+    )
+
+    gpu_table = Table(title="GPU", expand=True)
+    gpu_table.add_column("gpu", style="cyan", justify="right")
+    gpu_table.add_column("mem(MiB)", justify="right")
+    gpu_table.add_column("util(%)", justify="right")
+    gpu_table.add_column("state")
+    gpu_table.add_column("candidate")
+
+    running_by_gpu: dict[int, str] = {}
+    for rt in running.values():
+        if rt.task.gpu_id is not None:
+            running_by_gpu[rt.task.gpu_id] = rt.task.candidate_id
+
+    for gpu_id, mem_used, util in gpu_snapshots:
+        cid = running_by_gpu.get(gpu_id, "")
+        busy = bool(cid)
+        state = "running" if busy else "idle"
+        state_style = "green" if busy else "dim"
+        mem_style = "green" if mem_used <= mem_idle_threshold_mb else "red"
+        util_style = "green" if util <= util_idle_threshold_pct else "red"
+        gpu_table.add_row(
+            str(gpu_id),
+            f"[{mem_style}]{mem_used}[/{mem_style}]/{mem_idle_threshold_mb}",
+            f"[{util_style}]{util}[/{util_style}]/{util_idle_threshold_pct}",
+            f"[{state_style}]{state}[/{state_style}]",
+            cid,
+        )
+
+    cand_table = Table(title="Candidates", expand=True)
+    cand_table.add_column("id", style="cyan")
+    cand_table.add_column("status")
+    cand_table.add_column("gpu", justify="right")
+    cand_table.add_column("wait(s)", justify="right")
+    cand_table.add_column("runtime(s)", justify="right")
+    cand_table.add_column("desc")
+
+    def _allow_status(status: str) -> bool:
+        if dashboard_status_filter == "all":
+            return True
+        if dashboard_status_filter == "active":
+            return status in {"queued", "running", "repairing"}
+        if dashboard_status_filter == "failed":
+            return status in {"discard", "failed"}
+        if dashboard_status_filter == "finished":
+            return status in {"keep", "discard"}
+        return True
+
+    now = time.time()
+    for task in queued[-20:]:
+        if not _allow_status("queued"):
+            continue
+        wait_s = int(max(0, now - task.queued_at))
+        cand_table.add_row(
+            task.candidate_id,
+            "[yellow]queued[/yellow]",
+            "-",
+            str(wait_s),
+            "-",
+            _short_text(task.refine_description),
+        )
+
+    for rt in running.values():
+        t = rt.task
+        current_status = t.status if t.status else "running"
+        if not _allow_status(current_status):
+            continue
+        run_s = int(max(0, now - (t.launch_ts or now)))
+        status_text = (
+            "[magenta]repairing[/magenta]"
+            if current_status == "repairing"
+            else "[blue]running[/blue]"
+        )
+        cand_table.add_row(
+            t.candidate_id,
+            status_text,
+            str(t.gpu_id) if t.gpu_id is not None else "-",
+            str(int(max(0, now - t.queued_at))),
+            str(run_s),
+            _short_text(t.refine_description),
+        )
+
+    for row in finished_recent[-20:]:
+        status = row.get("status", "")
+        if not _allow_status(status):
+            continue
+        status_style = "green" if status == "keep" else "red"
+        cand_table.add_row(
+            row.get("candidate_id", ""),
+            f"[{status_style}]{status}[/{status_style}]",
+            row.get("gpu", "-"),
+            row.get("wait", "-"),
+            row.get("runtime", "-"),
+            _short_text(row.get("desc", "")),
+        )
+
+    reason_table = Table(title="Failure Reasons", expand=True)
+    reason_table.add_column("reason")
+    reason_table.add_column("count", justify="right")
+    for reason, count in sorted(
+        failure_reason_counts.items(),
+        key=lambda x: x[1],
+        reverse=True,
+    )[:8]:
+        reason_table.add_row(reason, str(count))
+
+    event_table = Table(title="Recent Events", expand=True)
+    event_table.add_column("event", style="dim")
+    for line in _load_recent_queue_events(limit=8):
+        event_table.add_row(line)
+
+    group = Group(summary, gpu_table, cand_table, reason_table, event_table)
+    return Panel(group, title="AutoResearch Parallel Dashboard", border_style="cyan")
 
 
 def _load_baseline() -> float:
@@ -326,6 +530,19 @@ def _find_free_gpu_ids(
     return free
 
 
+def _pick_least_loaded_gpu_id() -> int:
+    """在没有满足空闲阈值时，选择负载最低的 GPU 兜底派发。"""
+    snapshots = _gpu_snapshots()
+    best_gpu = snapshots[0][0]
+    best_score = (snapshots[0][1], snapshots[0][2])
+    for gpu_id, mem_used, util in snapshots[1:]:
+        score = (mem_used, util)
+        if score < best_score:
+            best_score = score
+            best_gpu = gpu_id
+    return best_gpu
+
+
 def _copy_base_train_to_candidate(base_train: Path, candidate_dir: Path) -> Path:
     candidate_dir.mkdir(parents=True, exist_ok=True)
     target = candidate_dir / "train.py"
@@ -349,6 +566,16 @@ def _create_candidate(
     failed_text = _recent_failure_direction_text()
     failed_block = "\n".join(failed_text) if failed_text else "无"
 
+    forbidden_training_text = (
+        "禁止运行任何训练命令或长任务命令，"
+        "包括但不限于：uv run python train.py、python train.py、torchrun、nohup。"
+        "训练只能由外层调度器执行。"
+    )
+    forbidden_git_history_text = (
+        "禁止使用 git 命令查看、切换或回滚历史版本（如 git show/log/checkout/restore）。"
+        "历史实验信息只能来自 autorunner/candidates 目录、results.tsv 与 artifacts 文件。"
+    )
+
     result = agent.refine(
         current_files={"train.py": base_code},
         run_summaries=run_summaries,
@@ -358,12 +585,33 @@ def _create_candidate(
         extra_hints=(
             "你需要产出一个新候选方向。"
             "必须显式避开以下已失败方向，不要重复同类尝试：\n"
-            f"{failed_block}"
+            f"{failed_block}\n"
+            f"{forbidden_training_text}\n"
+            f"{forbidden_git_history_text}"
         ),
         workdir=candidate_dir,
     )
 
     (candidate_dir / "llm_refine.log").write_text(result.content or "")
+
+    # 防止 agent 越权自行启动训练；若发现候选目录已有训练日志，直接废弃该候选。
+    suspicious_logs = [
+        candidate_dir / "run.log",
+        candidate_dir / "run_repair_1.log",
+        candidate_dir / "run_repair_2.log",
+        candidate_dir / "run_repair_3.log",
+    ]
+    for p in suspicious_logs:
+        if p.exists() and p.stat().st_size > 0:
+            _append_queue_event(
+                "candidate_generation_failed",
+                {
+                    "candidate_id": candidate_id,
+                    "reason": "agent_attempted_training",
+                    "path": str(p.relative_to(WORKDIR)),
+                },
+            )
+            return None
 
     if not result.success:
         _append_queue_event(
@@ -419,6 +667,7 @@ def _create_candidate(
         direction_fingerprint=fingerprint,
         parent_ref=base_train_path.name,
         created_at=time.time(),
+        queued_at=time.time(),
         status="queued",
     )
 
@@ -462,12 +711,21 @@ def _run_one_candidate(
     gpu_id: int,
     time_budget: int,
 ) -> ExperimentResult:
-    print(f"[runner] launch {task.candidate_id} on gpu={gpu_id}")
+    def _runtime_env_for_gpu(gid: int) -> dict[str, str]:
+        existing_pythonpath = os.environ.get("PYTHONPATH", "").strip()
+        pythonpath = str(WORKDIR)
+        if existing_pythonpath:
+            pythonpath = f"{pythonpath}:{existing_pythonpath}"
+        return {
+            "CUDA_VISIBLE_DEVICES": str(gid),
+            "PYTHONPATH": pythonpath,
+        }
+
     result = run(
         train_py_path=task.train_py_path,
         time_budget=time_budget,
         run_log_path=task.workdir / "run.log",
-        env_overrides={"CUDA_VISIBLE_DEVICES": str(gpu_id)},
+        env_overrides=_runtime_env_for_gpu(gpu_id),
     )
     return result
 
@@ -479,14 +737,20 @@ def _repair_candidate_if_needed(
     initial_result: ExperimentResult,
     gpu_id: int,
     time_budget: int,
-) -> tuple[ExperimentResult, bool, str]:
+) -> tuple[ExperimentResult, bool, str, str, int]:
     """失败候选触发受约束 repair；返回 (最终结果, 是否修复成功, 最终描述)。"""
     final_desc = task.refine_description
     if initial_result.status == "completed":
-        return initial_result, False, final_desc
+        return initial_result, False, final_desc, "not_needed", 0
 
     max_repair_attempts = 3
     current_result = initial_result
+    attempts_started = 0
+
+    existing_pythonpath = os.environ.get("PYTHONPATH", "").strip()
+    pythonpath = str(WORKDIR)
+    if existing_pythonpath:
+        pythonpath = f"{pythonpath}:{existing_pythonpath}"
 
     for attempt in range(1, max_repair_attempts + 1):
         analysis = analyze_failure(
@@ -495,6 +759,7 @@ def _repair_candidate_if_needed(
         )
         if not analysis.should_retry:
             break
+        attempts_started += 1
 
         _append_queue_event(
             "candidate_repair_start",
@@ -561,7 +826,7 @@ def _repair_candidate_if_needed(
                 description=task.refine_description,
                 reason="repair_out_of_scope",
             )
-            return current_result, False, final_desc
+            return current_result, False, final_desc, "out_of_scope", attempts_started
 
         task.train_py_path.write_text(repaired_code)
 
@@ -569,7 +834,10 @@ def _repair_candidate_if_needed(
             train_py_path=task.train_py_path,
             time_budget=time_budget,
             run_log_path=task.workdir / f"run_repair_{attempt}.log",
-            env_overrides={"CUDA_VISIBLE_DEVICES": str(gpu_id)},
+            env_overrides={
+                "CUDA_VISIBLE_DEVICES": str(gpu_id),
+                "PYTHONPATH": pythonpath,
+            },
         )
 
         candidate_desc = _extract_description_from_llm_reply(
@@ -600,11 +868,13 @@ def _repair_candidate_if_needed(
         )
 
         if rerun_result.status == "completed":
-            return rerun_result, True, final_desc
+            return rerun_result, True, final_desc, "success", attempts_started
 
         current_result = rerun_result
 
-    return current_result, False, final_desc
+    if attempts_started > 0:
+        return current_result, False, final_desc, "failed", attempts_started
+    return current_result, False, final_desc, "not_needed", 0
 
 
 def run_parallel_loop(
@@ -617,6 +887,8 @@ def run_parallel_loop(
     topic: str,
     mem_idle_threshold_mb: int,
     util_idle_threshold_pct: int,
+    dashboard_status_filter: str,
+    dispatch_stall_sec: float,
     poll_interval_sec: float,
 ):
     ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -625,7 +897,7 @@ def run_parallel_loop(
     if not BEST_TRAIN_FILE.exists():
         shutil.copy2(WORKDIR / "train.py", BEST_TRAIN_FILE)
 
-    agent = ClaudeCodeAgent(model=MODEL, timeout_sec=600)
+    agent = ClaudeCodeAgent(model=MODEL, timeout_sec=600, stream_output=False)
     baseline_bpb = _load_baseline()
 
     queued: list[CandidateTask] = []
@@ -633,144 +905,311 @@ def run_parallel_loop(
     completed_runs = 0
     executor = ThreadPoolExecutor(max_workers=max_running)
     failure_fingerprints = _load_failure_direction_set()
-
-    print("[parallel_runner] started")
-    print(
-        f"[parallel_runner] baseline={baseline_bpb if baseline_bpb != float('inf') else 'inf'} "
-        f"queue_capacity={queue_capacity} max_running={max_running}"
-    )
+    failure_reason_counts: dict[str, int] = {}
+    repair_stats = {"start": 0, "success": 0, "failed": 0, "out_of_scope": 0}
+    last_no_gpu_event_ts = 0.0
+    finished_recent: list[dict[str, str]] = []
+    start_ts = time.time()
 
     try:
-        while True:
-            # 1) 补充候选队列
-            if len(queued) < low_watermark and completed_runs < max_total_runs:
-                need = min(queue_capacity - len(queued), low_watermark - len(queued))
-                if need > 0:
-                    run_summaries = _build_run_summaries()
-                    for _ in range(need):
-                        task = _create_candidate(
-                            agent=agent,
-                            base_train_path=BEST_TRAIN_FILE,
-                            run_summaries=run_summaries,
-                            failure_fingerprints=failure_fingerprints,
-                            topic=topic,
-                        )
-                        if task is not None:
-                            queued.append(task)
-
-            # 2) 空闲 GPU 启动实验
-            occupied = {
-                rt.task.gpu_id for rt in running.values() if rt.task.gpu_id is not None
-            }
-            free_gpu_ids = _find_free_gpu_ids(
-                occupied_gpu_ids={int(x) for x in occupied},
+        with Live(
+            _render_dashboard(
+                start_ts=start_ts,
+                completed_runs=completed_runs,
+                max_total_runs=max_total_runs,
+                baseline_bpb=baseline_bpb,
+                queued=queued,
+                running=running,
+                finished_recent=finished_recent,
+                repair_stats=repair_stats,
+                failure_reason_counts=failure_reason_counts,
+                dashboard_status_filter=dashboard_status_filter,
                 mem_idle_threshold_mb=mem_idle_threshold_mb,
                 util_idle_threshold_pct=util_idle_threshold_pct,
-            )
-            while free_gpu_ids and queued and len(running) < max_running:
-                gpu_id = free_gpu_ids.pop(0)
-                task = queued.pop(0)
-                task.status = "running"
-                task.gpu_id = gpu_id
-                task.launch_ts = time.time()
-                fut = executor.submit(
-                    _run_one_candidate,
-                    task=task,
-                    gpu_id=gpu_id,
-                    time_budget=time_budget,
-                )
-                running[task.candidate_id] = RunningTask(task=task, future=fut)
-                _append_queue_event(
-                    "candidate_running",
-                    {
-                        "candidate_id": task.candidate_id,
-                        "gpu_id": gpu_id,
-                    },
-                )
+            ),
+            console=console,
+            refresh_per_second=2,
+            transient=False,
+        ) as live:
+            stop_refresh = threading.Event()
 
-            # 3) 回收完成任务
-            finished_ids: list[str] = []
-            for cid, rt in running.items():
-                if not rt.future.done():
-                    continue
-
-                exp_result = rt.future.result()
-                task = rt.task
-                finished_ids.append(cid)
-                completed_runs += 1
-
-                exp_result, repaired, final_desc = _repair_candidate_if_needed(
-                    agent=agent,
-                    task=task,
-                    initial_result=exp_result,
-                    gpu_id=task.gpu_id if task.gpu_id is not None else 0,
-                    time_budget=time_budget,
-                )
-                task.final_description = final_desc
-
-                if exp_result.status == "completed" and exp_result.val_bpb is not None:
-                    improved, decision = metric_judge(baseline_bpb, exp_result.val_bpb)
-                else:
-                    improved, decision = False, "discard"
-
-                _append_results_tsv(
-                    candidate_id=task.candidate_id,
-                    exp_result=exp_result,
-                    decision=decision,
-                    description=task.final_description or task.refine_description,
+            def _snapshot_for_dashboard() -> tuple[
+                int,
+                float,
+                list[CandidateTask],
+                dict[str, RunningTask],
+                list[dict[str, str]],
+                dict[str, int],
+                dict[str, int],
+            ]:
+                # 在无锁前提下做快照，遇到并发修改重试，避免看板线程崩溃。
+                for _ in range(3):
+                    try:
+                        return (
+                            completed_runs,
+                            baseline_bpb,
+                            list(queued),
+                            dict(running),
+                            list(finished_recent),
+                            dict(repair_stats),
+                            dict(failure_reason_counts),
+                        )
+                    except RuntimeError:
+                        continue
+                return (
+                    completed_runs,
+                    baseline_bpb,
+                    [],
+                    {},
+                    [],
+                    dict(repair_stats),
+                    dict(failure_reason_counts),
                 )
 
-                if improved and exp_result.val_bpb is not None:
-                    baseline_bpb = exp_result.val_bpb
-                    shutil.copy2(task.train_py_path, BEST_TRAIN_FILE)
+            def _refresh_loop() -> None:
+                interval = max(0.5, min(1.0, poll_interval_sec))
+                while not stop_refresh.is_set():
+                    (
+                        completed_snapshot,
+                        baseline_snapshot,
+                        queued_snapshot,
+                        running_snapshot,
+                        finished_snapshot,
+                        repair_snapshot,
+                        failure_snapshot,
+                    ) = _snapshot_for_dashboard()
+                    live.update(
+                        _render_dashboard(
+                            start_ts=start_ts,
+                            completed_runs=completed_snapshot,
+                            max_total_runs=max_total_runs,
+                            baseline_bpb=baseline_snapshot,
+                            queued=queued_snapshot,
+                            running=running_snapshot,
+                            finished_recent=finished_snapshot,
+                            repair_stats=repair_snapshot,
+                            failure_reason_counts=failure_snapshot,
+                            dashboard_status_filter=dashboard_status_filter,
+                            mem_idle_threshold_mb=mem_idle_threshold_mb,
+                            util_idle_threshold_pct=util_idle_threshold_pct,
+                        )
+                    )
+                    stop_refresh.wait(interval)
+
+            refresh_thread = threading.Thread(target=_refresh_loop, daemon=True)
+            refresh_thread.start()
+
+            while True:
+                # 1) 补充候选队列
+                if len(queued) < low_watermark and completed_runs < max_total_runs:
+                    need = min(
+                        queue_capacity - len(queued), low_watermark - len(queued)
+                    )
+                    if need > 0:
+                        run_summaries = _build_run_summaries()
+                        for _ in range(need):
+                            task = _create_candidate(
+                                agent=agent,
+                                base_train_path=BEST_TRAIN_FILE,
+                                run_summaries=run_summaries,
+                                failure_fingerprints=failure_fingerprints,
+                                topic=topic,
+                            )
+                            if task is not None:
+                                queued.append(task)
+
+                # 2) 空闲 GPU 启动实验
+                occupied = {
+                    rt.task.gpu_id
+                    for rt in running.values()
+                    if rt.task.gpu_id is not None
+                }
+                free_gpu_ids = _find_free_gpu_ids(
+                    occupied_gpu_ids={int(x) for x in occupied},
+                    mem_idle_threshold_mb=mem_idle_threshold_mb,
+                    util_idle_threshold_pct=util_idle_threshold_pct,
+                )
+
+                # 队列存在但没有空闲 GPU 时，记录可观测事件，便于调参排障。
+                if queued and not free_gpu_ids and len(running) < max_running:
+                    now_ts = time.time()
+                    if now_ts - last_no_gpu_event_ts >= 10.0:
+                        oldest_wait = now_ts - min(x.queued_at for x in queued)
+                        _append_queue_event(
+                            "dispatch_waiting_gpu",
+                            {
+                                "queued": len(queued),
+                                "running": len(running),
+                                "oldest_wait_sec": round(oldest_wait, 1),
+                                "mem_idle_threshold_mb": mem_idle_threshold_mb,
+                                "util_idle_threshold_pct": util_idle_threshold_pct,
+                            },
+                        )
+                        last_no_gpu_event_ts = now_ts
+
+                # 若候选排队过久，使用最低负载 GPU 兜底派发，避免“已生成但不运行”。
+                if (
+                    queued
+                    and not free_gpu_ids
+                    and len(running) < max_running
+                    and dispatch_stall_sec > 0
+                ):
+                    oldest_wait = time.time() - min(x.queued_at for x in queued)
+                    if oldest_wait >= dispatch_stall_sec:
+                        fallback_gpu = _pick_least_loaded_gpu_id()
+                        free_gpu_ids = [fallback_gpu]
+                        _append_queue_event(
+                            "dispatch_fallback_gpu",
+                            {
+                                "gpu_id": fallback_gpu,
+                                "oldest_wait_sec": round(oldest_wait, 1),
+                            },
+                        )
+
+                while free_gpu_ids and queued and len(running) < max_running:
+                    gpu_id = free_gpu_ids.pop(0)
+                    task = queued.pop(0)
+                    task.status = "running"
+                    task.gpu_id = gpu_id
+                    task.launch_ts = time.time()
+                    fut = executor.submit(
+                        _run_one_candidate,
+                        task=task,
+                        gpu_id=gpu_id,
+                        time_budget=time_budget,
+                    )
+                    running[task.candidate_id] = RunningTask(task=task, future=fut)
                     _append_queue_event(
-                        "candidate_keep",
+                        "candidate_running",
                         {
                             "candidate_id": task.candidate_id,
-                            "val_bpb": exp_result.val_bpb,
-                            "baseline": baseline_bpb,
-                            "repaired": repaired,
+                            "gpu_id": gpu_id,
                         },
                     )
-                else:
-                    _append_failure_direction(
-                        fingerprint=task.direction_fingerprint,
-                        description=task.refine_description,
-                        reason=(
-                            exp_result.failure_type
-                            if exp_result.status != "completed"
-                            else "metric_not_improved"
-                        ),
+
+                # 3) 回收完成任务
+                finished_ids: list[str] = []
+                for cid, rt in running.items():
+                    if not rt.future.done():
+                        continue
+
+                    exp_result = rt.future.result()
+                    task = rt.task
+                    finished_ids.append(cid)
+                    completed_runs += 1
+
+                    task.status = "repairing"
+                    exp_result, repaired, final_desc, repair_status, repair_attempts = (
+                        _repair_candidate_if_needed(
+                            agent=agent,
+                            task=task,
+                            initial_result=exp_result,
+                            gpu_id=task.gpu_id if task.gpu_id is not None else 0,
+                            time_budget=time_budget,
+                        )
                     )
-                    failure_fingerprints.add(task.direction_fingerprint)
-                    _append_queue_event(
-                        "candidate_discard",
+                    task.status = "running"
+                    task.final_description = final_desc
+                    if repair_attempts > 0:
+                        repair_stats["start"] += repair_attempts
+                    if repair_status in {"success", "failed", "out_of_scope"}:
+                        repair_stats[repair_status] += 1
+
+                    if (
+                        exp_result.status == "completed"
+                        and exp_result.val_bpb is not None
+                    ):
+                        improved, decision = metric_judge(
+                            baseline_bpb, exp_result.val_bpb
+                        )
+                    else:
+                        improved, decision = False, "discard"
+
+                    _append_results_tsv(
+                        candidate_id=task.candidate_id,
+                        exp_result=exp_result,
+                        decision=decision,
+                        description=task.final_description or task.refine_description,
+                    )
+
+                    if improved and exp_result.val_bpb is not None:
+                        baseline_bpb = exp_result.val_bpb
+                        shutil.copy2(task.train_py_path, BEST_TRAIN_FILE)
+                        _append_queue_event(
+                            "candidate_keep",
+                            {
+                                "candidate_id": task.candidate_id,
+                                "val_bpb": exp_result.val_bpb,
+                                "baseline": baseline_bpb,
+                                "repaired": repaired,
+                            },
+                        )
+                        final_status = "keep"
+                    else:
+                        discard_reason = (
+                            "repair_out_of_scope"
+                            if repair_status == "out_of_scope"
+                            else (
+                                exp_result.failure_type
+                                if exp_result.status != "completed"
+                                else "metric_not_improved"
+                            )
+                        )
+                        _append_failure_direction(
+                            fingerprint=task.direction_fingerprint,
+                            description=task.refine_description,
+                            reason=discard_reason,
+                        )
+                        failure_reason_counts[discard_reason] = (
+                            failure_reason_counts.get(discard_reason, 0) + 1
+                        )
+                        failure_fingerprints.add(task.direction_fingerprint)
+                        _append_queue_event(
+                            "candidate_discard",
+                            {
+                                "candidate_id": task.candidate_id,
+                                "status": exp_result.status,
+                                "failure_type": exp_result.failure_type,
+                                "repaired": repaired,
+                                "discard_reason": discard_reason,
+                            },
+                        )
+                        final_status = "discard"
+
+                    runtime_s = int(
+                        max(0, time.time() - (task.launch_ts or time.time()))
+                    )
+                    wait_s = int(
+                        max(0, (task.launch_ts or time.time()) - task.queued_at)
+                    )
+                    finished_recent.append(
                         {
                             "candidate_id": task.candidate_id,
-                            "status": exp_result.status,
-                            "failure_type": exp_result.failure_type,
-                            "repaired": repaired,
-                        },
+                            "status": final_status,
+                            "gpu": str(task.gpu_id) if task.gpu_id is not None else "-",
+                            "wait": str(wait_s),
+                            "runtime": str(runtime_s),
+                            "desc": task.final_description or task.refine_description,
+                        }
                     )
+                    if len(finished_recent) > 30:
+                        finished_recent = finished_recent[-30:]
 
-                print(
-                    f"[runner] done {task.candidate_id} gpu={task.gpu_id} "
-                    f"status={exp_result.status} decision={decision} "
-                    f"val_bpb={exp_result.val_bpb}"
-                )
+                for cid in finished_ids:
+                    running.pop(cid, None)
 
-            for cid in finished_ids:
-                running.pop(cid, None)
+                # 4) 终止条件
+                if completed_runs >= max_total_runs and not running:
+                    break
 
-            # 4) 终止条件
-            if completed_runs >= max_total_runs and not running:
-                break
+                time.sleep(poll_interval_sec)
 
-            time.sleep(poll_interval_sec)
+            stop_refresh.set()
+            refresh_thread.join(timeout=1.0)
     finally:
         executor.shutdown(wait=True)
 
-    print(
+    console.print(
         f"[parallel_runner] finished completed_runs={completed_runs} "
         f"best_val_bpb={baseline_bpb if baseline_bpb != float('inf') else 'inf'}"
     )
@@ -783,8 +1222,15 @@ if __name__ == "__main__":
     parser.add_argument("--low-watermark", type=int, default=2)
     parser.add_argument("--max-running", type=int, default=1)
     parser.add_argument("--time-budget", type=int, default=600)
-    parser.add_argument("--mem-idle-threshold-mb", type=int, default=800)
-    parser.add_argument("--util-idle-threshold-pct", type=int, default=10)
+    parser.add_argument("--mem-idle-threshold-mb", type=int, default=20000)
+    parser.add_argument("--util-idle-threshold-pct", type=int, default=85)
+    parser.add_argument(
+        "--dashboard-status-filter",
+        type=str,
+        choices=["all", "active", "failed", "finished"],
+        default="all",
+    )
+    parser.add_argument("--dispatch-stall-sec", type=float, default=45.0)
     parser.add_argument("--poll-interval-sec", type=float, default=2.0)
     parser.add_argument(
         "--topic",
@@ -806,5 +1252,7 @@ if __name__ == "__main__":
         topic=args.topic,
         mem_idle_threshold_mb=args.mem_idle_threshold_mb,
         util_idle_threshold_pct=args.util_idle_threshold_pct,
+        dashboard_status_filter=args.dashboard_status_filter,
+        dispatch_stall_sec=args.dispatch_stall_sec,
         poll_interval_sec=args.poll_interval_sec,
     )

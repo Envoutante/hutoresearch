@@ -265,12 +265,88 @@ class _SubprocessStreamState:
 
 
 def _append_live_stream_line(log_path: Path, payload: str) -> None:
-    """将实时流内容追加写入日志文件。"""
+    """将已解析的实时流事件追加写入 Markdown 日志文件。"""
     try:
         with log_path.open("a", encoding="utf-8") as fp:
-            fp.write(payload)
+            fp.write(payload.rstrip("\n") + "\n")
     except OSError:
         pass
+
+
+def _short_text(text: Any, max_len: int = 200) -> str:
+    s = str(text or "").replace("\n", " ").strip()
+    if len(s) <= max_len:
+        return s
+    return s[: max_len - 3] + "..."
+
+
+def _append_live_stream_event(log_path: Path, kind: str, **fields: Any) -> None:
+    """按统一结构写入实时流 Markdown 事件。"""
+    if kind == "assistant_text":
+        _append_live_stream_line(
+            log_path, f"- assistant: {_short_text(fields.get('text'))}"
+        )
+        return
+    if kind == "thinking":
+        _append_live_stream_line(
+            log_path, f"- thinking: {_short_text(fields.get('text'))}"
+        )
+        return
+    if kind == "tool_call":
+        name = _short_text(fields.get("name"), 80)
+        call_id = _short_text(fields.get("id"), 80)
+        args = fields.get("args") or {}
+        try:
+            args_text = json.dumps(args, ensure_ascii=False, separators=(",", ":"))
+        except TypeError:
+            args_text = str(args)
+        _append_live_stream_line(
+            log_path,
+            f"- tool_call: name={name} id={call_id} args={_short_text(args_text, 800)}",
+        )
+        return
+    if kind == "tool_result":
+        name = _short_text(fields.get("name"), 80)
+        ok = bool(fields.get("success", True))
+        call_id = _short_text(fields.get("id"), 80)
+        content = fields.get("content") or ""
+        _append_live_stream_line(
+            log_path,
+            f"- tool_result: name={name} id={call_id} success={ok}",
+        )
+        _append_live_stream_line(log_path, "")
+        _append_live_stream_line(log_path, "```text")
+        _append_live_stream_line(log_path, str(content))
+        _append_live_stream_line(log_path, "```")
+        return
+    if kind == "stderr":
+        _append_live_stream_line(
+            log_path, f"- stderr: {_short_text(fields.get('text'), 1000)}"
+        )
+        return
+    if kind == "stdout":
+        _append_live_stream_line(
+            log_path, f"- stdout: {_short_text(fields.get('text'), 1000)}"
+        )
+        return
+    if kind == "system_status":
+        _append_live_stream_line(
+            log_path, f"- system_status: {_short_text(fields.get('status'))}"
+        )
+        return
+    if kind == "system_subtype":
+        _append_live_stream_line(
+            log_path, f"- system_subtype: {_short_text(fields.get('subtype'))}"
+        )
+        return
+    if kind == "result":
+        subtype = _short_text(fields.get("subtype"), 80)
+        is_error = bool(fields.get("is_error", False))
+        _append_live_stream_line(
+            log_path, f"- result: subtype={subtype} is_error={is_error}"
+        )
+        return
+    _append_live_stream_line(log_path, f"- {kind}: {_short_text(fields)}")
 
 
 def _stream_reader_thread(
@@ -587,10 +663,32 @@ class _StreamOutputProcessor:
                 meta["name"] = tool_name
             self._append_tool_result(tool_call_id, content, success=success)
 
+    def _log_normalized_event(self, event: StreamEvent, live_stream_log: Path) -> None:
+        """将标准化事件写入 live stream 日志。"""
+        if event.type == "tool_call":
+            _append_live_stream_event(
+                live_stream_log,
+                "tool_call",
+                name=str(event.data.get("name") or "unknown"),
+                id=str(event.data.get("id") or ""),
+                args=(event.data.get("args") or {}),
+            )
+            return
+
+        if event.type == "tool_result":
+            content = str(event.data.get("content") or "")
+            _append_live_stream_event(
+                live_stream_log,
+                "tool_result",
+                name=str(event.data.get("name") or "unknown"),
+                id=str(event.data.get("id") or ""),
+                success=bool(event.data.get("success", True)),
+                content=content,
+            )
+
     def handle_stdout_payload(self, payload: str, live_stream_log: Path) -> None:
         """处理并渲染标准输出中的单条负载。"""
         self.state.stdout_lines.append(payload)
-        _append_live_stream_line(live_stream_log, payload)
 
         text = payload.strip()
         if not text:
@@ -599,6 +697,7 @@ class _StreamOutputProcessor:
         try:
             item = json.loads(text)
         except json.JSONDecodeError:
+            _append_live_stream_event(live_stream_log, "stdout", text=text)
             self.renderer.add_stdout(payload)
             return
 
@@ -613,20 +712,34 @@ class _StreamOutputProcessor:
             and event_type == "content_block_delta"
             and delta_type == "thinking_delta"
         ):
-            self.state.thinking_buffer.append(delta.get("thinking") or "")
+            thinking = delta.get("thinking") or ""
+            self.state.thinking_buffer.append(thinking)
+            if thinking:
+                _append_live_stream_event(live_stream_log, "thinking", text=thinking)
             return
 
         self.flush_thinking_buffer()
 
         for normalized_event in normalize_raw_messages(item):
             self._handle_normalized_event(normalized_event)
+            self._log_normalized_event(normalized_event, live_stream_log)
 
         if kind == "system":
             status = item.get("status")
             subtype = item.get("subtype")
             if status:
+                _append_live_stream_event(
+                    live_stream_log,
+                    "system_status",
+                    status=str(status),
+                )
                 self.renderer.set_status(status)
             elif subtype:
+                _append_live_stream_event(
+                    live_stream_log,
+                    "system_subtype",
+                    subtype=str(subtype),
+                )
                 self.renderer.set_status(subtype)
             return
 
@@ -650,6 +763,11 @@ class _StreamOutputProcessor:
                 if delta_type == "text_delta":
                     chunk = delta.get("text") or ""
                     if chunk:
+                        _append_live_stream_event(
+                            live_stream_log,
+                            "assistant_text",
+                            text=chunk,
+                        )
                         self.renderer.add_ordered_assistant(
                             chunk,
                             stream_id=self.state.current_assistant_stream_id,
@@ -698,6 +816,12 @@ class _StreamOutputProcessor:
         if kind == "result":
             subtype = item.get("subtype")
             if subtype:
+                _append_live_stream_event(
+                    live_stream_log,
+                    "result",
+                    subtype=str(subtype),
+                    is_error=bool(item.get("is_error", False)),
+                )
                 self.renderer.set_status(f"result={subtype}")
             self.renderer.set_usage(
                 item.get("usage"),
@@ -705,12 +829,15 @@ class _StreamOutputProcessor:
             )
             return
 
+        _append_live_stream_event(live_stream_log, "stdout", text=text)
         self.renderer.add_stdout(payload)
 
     def handle_stderr_payload(self, payload: str, live_stream_log: Path) -> None:
         """处理并渲染标准错误中的单条负载。"""
         self.state.stderr_lines.append(payload)
-        _append_live_stream_line(live_stream_log, payload)
+        text = payload.strip()
+        if text:
+            _append_live_stream_event(live_stream_log, "stderr", text=text)
         self.renderer.add_stderr(payload)
 
 
@@ -730,7 +857,11 @@ def _run_subprocess(
     safe_title = (
         render_title.lower().replace(" ", "_").replace("(", "").replace(")", "")
     )
-    live_stream_log = artifacts_dir / f"live_stream_{safe_title}_{int(start)}.jsonl"
+    live_stream_log = artifacts_dir / f"live_stream_{safe_title}_{int(start)}.md"
+    _append_live_stream_line(live_stream_log, f"# {render_title}")
+    _append_live_stream_line(live_stream_log, f"- started_at: {int(start)}")
+    _append_live_stream_line(live_stream_log, f"- workdir: {workdir}")
+    _append_live_stream_line(live_stream_log, "")
 
     # 调用 Agent
     proc = subprocess.Popen(

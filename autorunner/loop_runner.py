@@ -1019,7 +1019,7 @@ def run_loop(
                 else:
                     console.print(
                         Text(
-                            "       error: (empty) see autorunner/artifacts/live_stream_*.jsonl",
+                            "       error: (empty) see autorunner/artifacts/live_stream_*.md",
                             style="red",
                         )
                     )

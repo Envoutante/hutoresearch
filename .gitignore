@@ -22,6 +22,7 @@ dev/
 # Results file
 results.tsv
 autorunner/artifacts/
+autorunner/candidates/
 large_tool_results/
 memory/
 skills/
