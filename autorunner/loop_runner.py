@@ -1019,7 +1019,7 @@ def run_loop(
                 else:
                     console.print(
                         Text(
-                            "       error: (empty) see autorunner/artifacts/live_stream_*.md",
+                            "       error: (empty) see candidates/*/logs/*.md",
                             style="red",
                         )
                     )

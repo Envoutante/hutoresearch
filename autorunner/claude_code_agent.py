@@ -9,6 +9,7 @@ import signal
 import subprocess
 import threading
 import time
+from datetime import datetime
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -256,6 +257,8 @@ class _SubprocessStreamState:
     tool_call_state: dict[str, dict[str, bool]] = field(default_factory=dict)
     tool_call_meta: dict[str, dict[str, Any]] = field(default_factory=dict)
     thinking_buffer: list[str] = field(default_factory=list)
+    thinking_log_buffer: str = ""
+    assistant_log_buffer: str = ""
     current_assistant_stream_id: str | None = None
     stream_closed: dict[str, bool] = field(
         default_factory=lambda: {"stdout": False, "stderr": False}
@@ -274,23 +277,21 @@ def _append_live_stream_line(log_path: Path, payload: str) -> None:
 
 
 def _short_text(text: Any, max_len: int = 200) -> str:
-    s = str(text or "").replace("\n", " ").strip()
-    if len(s) <= max_len:
-        return s
-    return s[: max_len - 3] + "..."
+    _ = max_len
+    return str(text or "").replace("\n", " ").strip()
 
 
 def _append_live_stream_event(log_path: Path, kind: str, **fields: Any) -> None:
     """按统一结构写入实时流 Markdown 事件。"""
     if kind == "assistant_text":
-        _append_live_stream_line(
-            log_path, f"- assistant: {_short_text(fields.get('text'))}"
-        )
+        text = str(fields.get("text") or "")
+        if text:
+            _append_live_stream_line(log_path, text.rstrip("\n"))
         return
     if kind == "thinking":
-        _append_live_stream_line(
-            log_path, f"- thinking: {_short_text(fields.get('text'))}"
-        )
+        text = str(fields.get("text") or "")
+        if text:
+            _append_live_stream_line(log_path, text.rstrip("\n"))
         return
     if kind == "tool_call":
         name = _short_text(fields.get("name"), 80)
@@ -612,6 +613,95 @@ class _StreamOutputProcessor:
                 self.renderer.add_ordered_tools_renderable(line)
         meta["result_written"] = True
 
+    @staticmethod
+    def _split_complete_units(buffer: str) -> tuple[list[str], str]:
+        """从缓冲区中拆出完整句子或行，保留未闭合尾部。"""
+        done: list[str] = []
+        start = 0
+        n = len(buffer)
+        i = 0
+
+        while i < n:
+            ch = buffer[i]
+            if ch == "\n":
+                segment = buffer[start:i]
+                if segment.strip():
+                    done.append(segment.rstrip())
+                start = i + 1
+                i += 1
+                continue
+
+            if ch in ".!?。！？":
+                next_ch = buffer[i + 1] if i + 1 < n else ""
+                if i + 1 == n or next_ch.isspace() or next_ch in "\"'”’)]}":
+                    segment = buffer[start : i + 1]
+                    stripped = segment.strip()
+                    if ch == "." and stripped[:-1].isdigit() and stripped.endswith("."):
+                        i += 1
+                        continue
+                    if stripped:
+                        done.append(segment.rstrip())
+                    start = i + 1
+            i += 1
+
+        rest = buffer[start:]
+        return done, rest
+
+    def _append_stream_text_for_log(
+        self,
+        kind: str,
+        chunk: str,
+        live_stream_log: Path,
+        *,
+        force: bool = False,
+    ) -> None:
+        """将流式文本聚合为完整句再写入 Markdown。"""
+        if kind == "thinking":
+            self.state.thinking_log_buffer += chunk
+            completed, rest = self._split_complete_units(self.state.thinking_log_buffer)
+            self.state.thinking_log_buffer = rest
+            for line in completed:
+                _append_live_stream_event(live_stream_log, "thinking", text=line)
+            if force and self.state.thinking_log_buffer.strip():
+                _append_live_stream_event(
+                    live_stream_log,
+                    "thinking",
+                    text=self.state.thinking_log_buffer.rstrip(),
+                )
+                self.state.thinking_log_buffer = ""
+            return
+
+        if kind == "assistant":
+            self.state.assistant_log_buffer += chunk
+            completed, rest = self._split_complete_units(
+                self.state.assistant_log_buffer
+            )
+            self.state.assistant_log_buffer = rest
+            for line in completed:
+                _append_live_stream_event(live_stream_log, "assistant_text", text=line)
+            if force and self.state.assistant_log_buffer.strip():
+                _append_live_stream_event(
+                    live_stream_log,
+                    "assistant_text",
+                    text=self.state.assistant_log_buffer.rstrip(),
+                )
+                self.state.assistant_log_buffer = ""
+
+    def flush_live_log_buffers(self, live_stream_log: Path) -> None:
+        """强制刷新日志缓冲，避免进程结束时残留半句。"""
+        self._append_stream_text_for_log(
+            "thinking",
+            "",
+            live_stream_log,
+            force=True,
+        )
+        self._append_stream_text_for_log(
+            "assistant",
+            "",
+            live_stream_log,
+            force=True,
+        )
+
     def flush_thinking_buffer(self) -> None:
         """刷新并渲染暂存的思考文本。"""
         if not self.state.thinking_buffer:
@@ -676,12 +766,37 @@ class _StreamOutputProcessor:
             return
 
         if event.type == "tool_result":
+            tool_call_id = str(event.data.get("id") or "")
+            tool_name = str(event.data.get("name") or "unknown")
+            tool_args: dict[str, Any] = {}
+            if tool_call_id:
+                meta = self.state.tool_call_meta.get(tool_call_id) or {}
+                meta_name = str(meta.get("name") or "").strip()
+                if tool_name in {"", "unknown"} and meta_name:
+                    tool_name = meta_name
+                raw_args = meta.get("args")
+                if isinstance(raw_args, dict):
+                    tool_args = raw_args
+
+            if tool_name.lower() == "read":
+                file_path = str(
+                    tool_args.get("file_path") or tool_args.get("path") or ""
+                ).strip()
+                line = (
+                    f"- tool_result: name=Read id={_short_text(tool_call_id, 80)} "
+                    f"success={bool(event.data.get('success', True))}"
+                )
+                if file_path:
+                    line += f" file_path={file_path}"
+                _append_live_stream_line(live_stream_log, line)
+                return
+
             content = str(event.data.get("content") or "")
             _append_live_stream_event(
                 live_stream_log,
                 "tool_result",
-                name=str(event.data.get("name") or "unknown"),
-                id=str(event.data.get("id") or ""),
+                name=tool_name,
+                id=tool_call_id,
                 success=bool(event.data.get("success", True)),
                 content=content,
             )
@@ -715,10 +830,15 @@ class _StreamOutputProcessor:
             thinking = delta.get("thinking") or ""
             self.state.thinking_buffer.append(thinking)
             if thinking:
-                _append_live_stream_event(live_stream_log, "thinking", text=thinking)
+                self._append_stream_text_for_log(
+                    "thinking",
+                    thinking,
+                    live_stream_log,
+                )
             return
 
         self.flush_thinking_buffer()
+        self._append_stream_text_for_log("thinking", "", live_stream_log, force=True)
 
         for normalized_event in normalize_raw_messages(item):
             self._handle_normalized_event(normalized_event)
@@ -756,6 +876,12 @@ class _StreamOutputProcessor:
                 return
 
             if event_type == "message_stop":
+                self._append_stream_text_for_log(
+                    "assistant",
+                    "",
+                    live_stream_log,
+                    force=True,
+                )
                 self.state.current_assistant_stream_id = None
                 return
 
@@ -763,10 +889,10 @@ class _StreamOutputProcessor:
                 if delta_type == "text_delta":
                     chunk = delta.get("text") or ""
                     if chunk:
-                        _append_live_stream_event(
+                        self._append_stream_text_for_log(
+                            "assistant",
+                            chunk,
                             live_stream_log,
-                            "assistant_text",
-                            text=chunk,
                         )
                         self.renderer.add_ordered_assistant(
                             chunk,
@@ -852,12 +978,18 @@ def _run_subprocess(
     """运行子进程并返回退出码、输出与超时信息。"""
     workdir.mkdir(parents=True, exist_ok=True)
     start = time.monotonic()
-    artifacts_dir = workdir / "autorunner" / "artifacts"
-    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    logs_dir = workdir / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
     safe_title = (
         render_title.lower().replace(" ", "_").replace("(", "").replace(")", "")
     )
-    live_stream_log = artifacts_dir / f"live_stream_{safe_title}_{int(start)}.md"
+    for prefix in ("claude_agent_output_", "generator_", "evaluator_"):
+        if safe_title.startswith(prefix):
+            safe_title = safe_title[len(prefix) :]
+            break
+    safe_title = safe_title.strip("_") or "session"
+    stamp = datetime.now().strftime("%m%d-%H%M%S")
+    live_stream_log = logs_dir / f"{safe_title}-{stamp}.md"
     _append_live_stream_line(live_stream_log, f"# {render_title}")
     _append_live_stream_line(live_stream_log, f"- started_at: {int(start)}")
     _append_live_stream_line(live_stream_log, f"- workdir: {workdir}")
@@ -897,6 +1029,7 @@ def _run_subprocess(
                 and state.stream_closed["stderr"]
             ):
                 processor.flush_thinking_buffer()
+                processor.flush_live_log_buffers(live_stream_log)
                 break
 
             now = time.monotonic()

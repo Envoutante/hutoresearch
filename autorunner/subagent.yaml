@@ -34,7 +34,7 @@ generator:
 
     ## 输出要求
     请按以下格式输出，且不要粘贴整份代码：
-    DESCRIPTION: <一句话描述本轮 bootstrap 分析结论，中文，5-18词，不含制表符>
+    DESCRIPTION: <One sentence in English, 5-18 words, describing the concrete changes made in this round only. Do not mention what was not changed. No tabs.>
     仅使用纯文本，不要使用任何 Markdown 语法符号（例如 #、-、*、```）。
 
   refine: |
@@ -100,7 +100,7 @@ generator:
 
     ## 输出要求
     请按以下格式输出，且不要粘贴整份代码：
-    DESCRIPTION: <一句话描述本轮实验改动，中文，5-18词，不含制表符>
+    DESCRIPTION: <One sentence in English, 5-18 words, describing only the concrete code changes made this round. Do not mention unchanged items. No tabs.>
     仅使用纯文本，不要使用任何 Markdown 语法符号（例如 #、-、*、```）。
 
   repair: |
@@ -129,7 +129,7 @@ generator:
 
     ## 输出要求
     请按以下格式输出，且不要粘贴整份代码：
-    DESCRIPTION: <基于 refine 优化方向重写一句“本轮仍在验证的优化意图”，中文，5-18词，不含制表符，不要写修复过程>
+    DESCRIPTION: <One sentence in English, 5-18 words, describing only the concrete fix applied this round. Do not mention unchanged items. No tabs.>
     仅使用纯文本，不要使用任何 Markdown 语法符号（例如 #、-、*、```）。
 
 evaluator:

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import shutil
@@ -26,6 +25,10 @@ if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from autorunner.claude_code_agent import ClaudeCodeAgent
+from autorunner.embedding import (
+    DEFAULT_SIMILARITY_THRESHOLD,
+    DescriptionEmbeddingIndex,
+)
 from autorunner.experiment_executor import (
     ExperimentResult,
     analyze_failure,
@@ -51,7 +54,6 @@ class CandidateTask:
     workdir: Path
     train_py_path: Path
     refine_description: str
-    direction_fingerprint: str
     parent_ref: str
     created_at: float
     queued_at: float
@@ -383,40 +385,8 @@ def _normalize_text(s: str) -> str:
     return " ".join("".join(out).split())
 
 
-def _build_direction_fingerprint(description: str, changed_keys: list[str]) -> str:
-    payload = {
-        "desc": _normalize_text(description),
-        "keys": sorted(changed_keys),
-    }
-    raw = json.dumps(payload, sort_keys=True, ensure_ascii=True)
-    return "sha1:" + hashlib.sha1(raw.encode("utf-8")).hexdigest()
-
-
-def _load_failure_direction_set() -> set[str]:
-    if not FAILURE_DIRECTIONS_FILE.exists():
-        return set()
-    try:
-        obj = json.loads(FAILURE_DIRECTIONS_FILE.read_text())
-    except json.JSONDecodeError:
-        return set()
-
-    items = obj.get("items")
-    if not isinstance(items, list):
-        return set()
-
-    out: set[str] = set()
-    for it in items:
-        if not isinstance(it, dict):
-            continue
-        fp = str(it.get("fingerprint") or "").strip()
-        if fp:
-            out.add(fp)
-    return out
-
-
 def _append_failure_direction(
     *,
-    fingerprint: str,
     description: str,
     reason: str,
 ):
@@ -430,8 +400,14 @@ def _append_failure_direction(
         except json.JSONDecodeError:
             pass
 
+    norm_desc = _normalize_text(description)
+
     for item in data["items"]:
-        if item.get("fingerprint") == fingerprint:
+        if not isinstance(item, dict):
+            continue
+        old_desc = _normalize_text(str(item.get("description") or ""))
+        old_reason = str(item.get("reason") or "").strip()
+        if old_desc == norm_desc and old_reason == reason:
             item["count"] = int(item.get("count", 1)) + 1
             FAILURE_DIRECTIONS_FILE.write_text(
                 json.dumps(data, indent=2, ensure_ascii=False)
@@ -440,7 +416,6 @@ def _append_failure_direction(
 
     data["items"].append(
         {
-            "fingerprint": fingerprint,
             "description": description,
             "reason": reason,
             "count": 1,
@@ -555,7 +530,7 @@ def _create_candidate(
     agent: ClaudeCodeAgent,
     base_train_path: Path,
     run_summaries: list[str],
-    failure_fingerprints: set[str],
+    failure_semantic_index: DescriptionEmbeddingIndex,
     topic: str,
 ) -> CandidateTask | None:
     candidate_id = _next_candidate_id()
@@ -641,21 +616,19 @@ def _create_candidate(
         fallback=f"candidate {candidate_id}",
     )
     changed_keys = _changed_upper_keys(base_code, new_code)
-    fingerprint = _build_direction_fingerprint(desc, changed_keys)
 
-    if fingerprint in failure_fingerprints:
+    dup, matched, score = failure_semantic_index.is_duplicate(desc)
+    if dup:
+        matched_desc = str((matched or {}).get("description") or "")
         _append_queue_event(
             "candidate_rejected",
             {
                 "candidate_id": candidate_id,
-                "fingerprint": fingerprint,
-                "reason": "duplicate_failed_direction",
+                "reason": "duplicate_failed_direction_semantic",
+                "similarity": round(score, 4),
+                "matched_description": matched_desc,
+                "threshold": DEFAULT_SIMILARITY_THRESHOLD,
             },
-        )
-        _append_failure_direction(
-            fingerprint=fingerprint,
-            description=desc,
-            reason="duplicate_failed_direction",
         )
         return None
 
@@ -664,7 +637,6 @@ def _create_candidate(
         workdir=candidate_dir,
         train_py_path=candidate_train,
         refine_description=desc,
-        direction_fingerprint=fingerprint,
         parent_ref=base_train_path.name,
         created_at=time.time(),
         queued_at=time.time(),
@@ -679,7 +651,6 @@ def _create_candidate(
         "candidate_queued",
         {
             "candidate_id": candidate_id,
-            "fingerprint": fingerprint,
             "description": desc,
             "changed_upper_keys": changed_keys,
         },
@@ -822,7 +793,6 @@ def _repair_candidate_if_needed(
                 },
             )
             _append_failure_direction(
-                fingerprint=task.direction_fingerprint,
                 description=task.refine_description,
                 reason="repair_out_of_scope",
             )
@@ -904,7 +874,10 @@ def run_parallel_loop(
     running: dict[str, RunningTask] = {}
     completed_runs = 0
     executor = ThreadPoolExecutor(max_workers=max_running)
-    failure_fingerprints = _load_failure_direction_set()
+    failure_semantic_index = DescriptionEmbeddingIndex.from_failure_file(
+        FAILURE_DIRECTIONS_FILE,
+        similarity_threshold=DEFAULT_SIMILARITY_THRESHOLD,
+    )
     failure_reason_counts: dict[str, int] = {}
     repair_stats = {"start": 0, "success": 0, "failed": 0, "out_of_scope": 0}
     last_no_gpu_event_ts = 0.0
@@ -1012,7 +985,7 @@ def run_parallel_loop(
                                 agent=agent,
                                 base_train_path=BEST_TRAIN_FILE,
                                 run_summaries=run_summaries,
-                                failure_fingerprints=failure_fingerprints,
+                                failure_semantic_index=failure_semantic_index,
                                 topic=topic,
                             )
                             if task is not None:
@@ -1156,14 +1129,18 @@ def run_parallel_loop(
                             )
                         )
                         _append_failure_direction(
-                            fingerprint=task.direction_fingerprint,
                             description=task.refine_description,
                             reason=discard_reason,
+                        )
+                        failure_semantic_index.add_item(
+                            {
+                                "description": task.refine_description,
+                                "reason": discard_reason,
+                            }
                         )
                         failure_reason_counts[discard_reason] = (
                             failure_reason_counts.get(discard_reason, 0) + 1
                         )
-                        failure_fingerprints.add(task.direction_fingerprint)
                         _append_queue_event(
                             "candidate_discard",
                             {
