@@ -70,7 +70,7 @@ generator:
     2. 重新审阅已给出的上下文与历史结果，寻找未被充分尝试的角度。
     3. 组合此前“接近成功”的思路做小步重组。
     4. 在可控风险下尝试更激进的架构改动，并保持代码可运行与可评估。
-    5. 你在推进分支以便迭代；如果你感觉在某个方向陷入困境，可以回滚，但必须非常谨慎，并仅在有明确理由时进行。
+    5. 你在当前工作目录持续迭代；若某方向陷入困境，可基于 best_train.py 或已验证候选做保守回退，但必须给出明确理由。
 
     ## 当前文件
     {files_text}
@@ -96,7 +96,7 @@ generator:
     7. 严禁使用 Bash 运行任何训练命令或长任务命令（包括 uv run python train.py、python train.py、torchrun、nohup）。训练执行由外层调度器统一负责。
     8. 不要只在对话里返回代码块；最终结果应体现在文件系统中的 train.py 里。
     9. 无论是否回退到历史版本、重写文件或做最小修补，train.py 顶部都必须保留这一行：os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"。若缺失，必须在提交前补回。
-    10. 禁止使用 git 命令查看或切换历史版本（如 git show/log/checkout/restore）；历史实验必须基于 autorunner/candidates、results.tsv 和 artifacts 文件进行分析。
+    10. 禁止依赖版本控制历史进行分析或切换；历史实验必须基于 autorunner/candidates、results.tsv 和 artifacts 文件进行分析。
 
     ## 输出要求
     请按以下格式输出，且不要粘贴整份代码：
@@ -125,7 +125,7 @@ generator:
     7. 不要只在对话里返回代码块；最终结果应体现在文件系统中的 train.py 里。
     8. 无论是否回退到历史版本、重写文件或做最小修补，train.py 顶部都必须保留这一行：os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"。若缺失，必须在提交前补回。
     9. 严禁使用 Bash 运行任何训练命令或长任务命令（包括 uv run python train.py、python train.py、torchrun、nohup）。训练执行由外层调度器统一负责。
-    10. 禁止使用 git 命令查看或切换历史版本（如 git show/log/checkout/restore）；历史实验必须基于 autorunner/candidates、results.tsv 和 artifacts 文件进行分析。
+    10. 禁止依赖版本控制历史进行分析或切换；历史实验必须基于 autorunner/candidates、results.tsv 和 artifacts 文件进行分析。
 
     ## 输出要求
     请按以下格式输出，且不要粘贴整份代码：
@@ -143,7 +143,7 @@ evaluator:
     请按以下顺序执行：
     1. 使用 Read 工具读取 {iter_artifact_path}
     2. 使用 Read 工具读取 {run_log_path}（完整日志，不要只看尾部）
-    3. 使用 Bash 工具运行 git diff HEAD~1 train.py，查看本轮代码改动
+    3. 使用 Read 工具读取 train.py，并与 {best_candidate_path}（若存在）进行代码对比，查看本轮代码改动
     4. 使用 Read 工具读取 {current_state_path}（如果存在）
     5. 使用 Read 工具读取 {results_tsv_path}
     6. 使用 Read 工具读取 {best_candidate_path}（如果存在）
