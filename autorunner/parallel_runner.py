@@ -632,6 +632,10 @@ def _next_candidate_id() -> str:
     return f"cand-{max_n + 1:06d}"
 
 
+def _next_candidate_number() -> int:
+    return int(_next_candidate_id().split("-")[-1])
+
+
 def _gpu_snapshots() -> list[tuple[int, int, int]]:
     """返回 [(gpu_id, mem_used_mb, util_percent), ...]。"""
     try:
@@ -699,12 +703,12 @@ def _copy_base_train_to_candidate(base_train: Path, candidate_dir: Path) -> Path
 
 def _create_candidate(
     *,
+    candidate_id: str,
     agent: ClaudeCodeAgent,
     base_train_path: Path,
     run_summaries: list[str],
     topic: str,
 ) -> CandidateTask | None:
-    candidate_id = _next_candidate_id()
     candidate_dir = CANDIDATE_ROOT / candidate_id
     candidate_train = _copy_base_train_to_candidate(base_train_path, candidate_dir)
     base_code = candidate_train.read_text()
@@ -1032,8 +1036,11 @@ def run_parallel_loop(
 
     queued: list[CandidateTask] = []
     running: dict[str, RunningTask] = {}
+    generating_futures: set[Future[CandidateTask | None]] = set()
     completed_runs = 0
     executor = ThreadPoolExecutor(max_workers=max_running)
+    generator_workers = max(1, min(queue_capacity, low_watermark))
+    generator_executor = ThreadPoolExecutor(max_workers=generator_workers)
     failure_semantic_index = DescriptionEmbeddingIndex.from_failure_file(
         FAILURE_DIRECTIONS_FILE,
         similarity_threshold=DEFAULT_SIMILARITY_THRESHOLD,
@@ -1043,6 +1050,9 @@ def run_parallel_loop(
     last_no_gpu_event_ts = 0.0
     finished_recent: list[dict[str, str]] = []
     start_ts = time.time()
+    state_lock = threading.Lock()
+    candidate_id_lock = threading.Lock()
+    next_candidate_num = _next_candidate_number()
 
     try:
         with Live(
@@ -1078,26 +1088,160 @@ def run_parallel_loop(
                 # 在无锁前提下做快照，遇到并发修改重试，避免看板线程崩溃。
                 for _ in range(3):
                     try:
-                        return (
-                            completed_runs,
-                            baseline_bpb,
-                            list(queued),
-                            dict(running),
-                            list(finished_recent),
-                            dict(repair_stats),
-                            dict(failure_reason_counts),
-                        )
+                        with state_lock:
+                            return (
+                                completed_runs,
+                                baseline_bpb,
+                                list(queued),
+                                dict(running),
+                                list(finished_recent),
+                                dict(repair_stats),
+                                dict(failure_reason_counts),
+                            )
                     except RuntimeError:
                         continue
-                return (
-                    completed_runs,
-                    baseline_bpb,
-                    [],
-                    {},
-                    [],
-                    dict(repair_stats),
-                    dict(failure_reason_counts),
-                )
+                with state_lock:
+                    return (
+                        completed_runs,
+                        baseline_bpb,
+                        [],
+                        {},
+                        [],
+                        dict(repair_stats),
+                        dict(failure_reason_counts),
+                    )
+
+            def _generation_loop() -> None:
+                nonlocal next_candidate_num
+                interval = max(0.2, min(0.8, poll_interval_sec / 2))
+                while not stop_refresh.is_set():
+                    to_submit = 0
+                    with state_lock:
+                        queued_len = len(queued)
+                        running_len = len(running)
+                        generating_len = len(generating_futures)
+                        active_or_queued = queued_len + running_len + generating_len
+                        remaining = max_total_runs - (completed_runs + active_or_queued)
+                        if remaining > 0 and queued_len + generating_len < low_watermark:
+                            fill_target = low_watermark - (queued_len + generating_len)
+                            capacity_left = queue_capacity - (queued_len + generating_len)
+                            to_submit = max(0, min(fill_target, capacity_left, remaining))
+
+                    for _ in range(to_submit):
+                        with candidate_id_lock:
+                            candidate_id = f"cand-{next_candidate_num:06d}"
+                            next_candidate_num += 1
+                        with state_lock:
+                            run_summaries = _build_run_summaries()
+                            fut = generator_executor.submit(
+                                _create_candidate,
+                                candidate_id=candidate_id,
+                                agent=agent,
+                                base_train_path=BEST_TRAIN_FILE,
+                                run_summaries=run_summaries,
+                                topic=topic,
+                            )
+                            generating_futures.add(fut)
+
+                    stop_refresh.wait(interval)
+
+            def _dispatch_loop() -> None:
+                nonlocal last_no_gpu_event_ts
+                interval = max(0.2, min(0.8, poll_interval_sec / 2))
+                while not stop_refresh.is_set():
+                    queued_len = 0
+                    with state_lock:
+                        queued_len = len(queued)
+                        running_len = len(running)
+                        occupied = {
+                            rt.task.gpu_id
+                            for rt in running.values()
+                            if rt.task.gpu_id is not None
+                        }
+                        can_dispatch = (
+                            queued_len > 0
+                            and running_len < max_running
+                            and completed_runs + running_len < max_total_runs
+                        )
+
+                    if not can_dispatch:
+                        stop_refresh.wait(interval)
+                        continue
+
+                    free_gpu_ids = _find_free_gpu_ids(
+                        occupied_gpu_ids={int(x) for x in occupied},
+                        mem_idle_threshold_mb=mem_idle_threshold_mb,
+                        util_idle_threshold_pct=util_idle_threshold_pct,
+                    )
+
+                    if queued_len > 0 and not free_gpu_ids:
+                        now_ts = time.time()
+                        with state_lock:
+                            if now_ts - last_no_gpu_event_ts >= 10.0 and queued:
+                                oldest_wait = now_ts - min(x.queued_at for x in queued)
+                                _append_queue_event(
+                                    "dispatch_waiting_gpu",
+                                    {
+                                        "queued": len(queued),
+                                        "running": len(running),
+                                        "oldest_wait_sec": round(oldest_wait, 1),
+                                        "mem_idle_threshold_mb": mem_idle_threshold_mb,
+                                        "util_idle_threshold_pct": util_idle_threshold_pct,
+                                    },
+                                )
+                                last_no_gpu_event_ts = now_ts
+
+                    if (
+                        queued_len > 0
+                        and not free_gpu_ids
+                        and dispatch_stall_sec > 0
+                    ):
+                        with state_lock:
+                            oldest_wait = (
+                                time.time() - min(x.queued_at for x in queued)
+                                if queued
+                                else 0.0
+                            )
+                        if oldest_wait >= dispatch_stall_sec:
+                            fallback_gpu = _pick_least_loaded_gpu_id()
+                            free_gpu_ids = [fallback_gpu]
+                            _append_queue_event(
+                                "dispatch_fallback_gpu",
+                                {
+                                    "gpu_id": fallback_gpu,
+                                    "oldest_wait_sec": round(oldest_wait, 1),
+                                },
+                            )
+
+                    while free_gpu_ids:
+                        with state_lock:
+                            if (
+                                not queued
+                                or len(running) >= max_running
+                                or completed_runs + len(running) >= max_total_runs
+                            ):
+                                break
+                            gpu_id = free_gpu_ids.pop(0)
+                            task = queued.pop(0)
+                            task.status = "running"
+                            task.gpu_id = gpu_id
+                            task.launch_ts = time.time()
+                            fut = executor.submit(
+                                _run_one_candidate,
+                                task=task,
+                                gpu_id=gpu_id,
+                                time_budget=time_budget,
+                            )
+                            running[task.candidate_id] = RunningTask(task=task, future=fut)
+                            _append_queue_event(
+                                "candidate_running",
+                                {
+                                    "candidate_id": task.candidate_id,
+                                    "gpu_id": gpu_id,
+                                },
+                            )
+
+                    stop_refresh.wait(interval)
 
             def _refresh_loop() -> None:
                 interval = max(0.5, min(1.0, poll_interval_sec))
@@ -1131,104 +1275,39 @@ def run_parallel_loop(
 
             refresh_thread = threading.Thread(target=_refresh_loop, daemon=True)
             refresh_thread.start()
+            generation_thread = threading.Thread(target=_generation_loop, daemon=True)
+            generation_thread.start()
+            dispatch_thread = threading.Thread(target=_dispatch_loop, daemon=True)
+            dispatch_thread.start()
 
             while True:
-                # 1) 补充候选队列
-                if len(queued) < low_watermark and completed_runs < max_total_runs:
-                    need = min(
-                        queue_capacity - len(queued), low_watermark - len(queued)
-                    )
-                    if need > 0:
-                        run_summaries = _build_run_summaries()
-                        for _ in range(need):
-                            task = _create_candidate(
-                                agent=agent,
-                                base_train_path=BEST_TRAIN_FILE,
-                                run_summaries=run_summaries,
-                                topic=topic,
-                            )
-                            if task is not None:
-                                queued.append(task)
+                # 1) 回收生成完成的候选
+                completed_gen: list[Future[CandidateTask | None]] = []
+                with state_lock:
+                    for fut in list(generating_futures):
+                        if fut.done():
+                            completed_gen.append(fut)
+                            generating_futures.remove(fut)
+                for fut in completed_gen:
+                    task = fut.result()
+                    if task is not None:
+                        with state_lock:
+                            queued.append(task)
 
-                # 2) 空闲 GPU 启动实验
-                occupied = {
-                    rt.task.gpu_id
-                    for rt in running.values()
-                    if rt.task.gpu_id is not None
-                }
-                free_gpu_ids = _find_free_gpu_ids(
-                    occupied_gpu_ids={int(x) for x in occupied},
-                    mem_idle_threshold_mb=mem_idle_threshold_mb,
-                    util_idle_threshold_pct=util_idle_threshold_pct,
-                )
+                # 2) 回收完成任务
+                with state_lock:
+                    running_items = list(running.items())
 
-                # 队列存在但没有空闲 GPU 时，记录可观测事件，便于调参排障。
-                if queued and not free_gpu_ids and len(running) < max_running:
-                    now_ts = time.time()
-                    if now_ts - last_no_gpu_event_ts >= 10.0:
-                        oldest_wait = now_ts - min(x.queued_at for x in queued)
-                        _append_queue_event(
-                            "dispatch_waiting_gpu",
-                            {
-                                "queued": len(queued),
-                                "running": len(running),
-                                "oldest_wait_sec": round(oldest_wait, 1),
-                                "mem_idle_threshold_mb": mem_idle_threshold_mb,
-                                "util_idle_threshold_pct": util_idle_threshold_pct,
-                            },
-                        )
-                        last_no_gpu_event_ts = now_ts
-
-                # 若候选排队过久，使用最低负载 GPU 兜底派发，避免“已生成但不运行”。
-                if (
-                    queued
-                    and not free_gpu_ids
-                    and len(running) < max_running
-                    and dispatch_stall_sec > 0
-                ):
-                    oldest_wait = time.time() - min(x.queued_at for x in queued)
-                    if oldest_wait >= dispatch_stall_sec:
-                        fallback_gpu = _pick_least_loaded_gpu_id()
-                        free_gpu_ids = [fallback_gpu]
-                        _append_queue_event(
-                            "dispatch_fallback_gpu",
-                            {
-                                "gpu_id": fallback_gpu,
-                                "oldest_wait_sec": round(oldest_wait, 1),
-                            },
-                        )
-
-                while free_gpu_ids and queued and len(running) < max_running:
-                    gpu_id = free_gpu_ids.pop(0)
-                    task = queued.pop(0)
-                    task.status = "running"
-                    task.gpu_id = gpu_id
-                    task.launch_ts = time.time()
-                    fut = executor.submit(
-                        _run_one_candidate,
-                        task=task,
-                        gpu_id=gpu_id,
-                        time_budget=time_budget,
-                    )
-                    running[task.candidate_id] = RunningTask(task=task, future=fut)
-                    _append_queue_event(
-                        "candidate_running",
-                        {
-                            "candidate_id": task.candidate_id,
-                            "gpu_id": gpu_id,
-                        },
-                    )
-
-                # 3) 回收完成任务
                 finished_ids: list[str] = []
-                for cid, rt in running.items():
+                for cid, rt in running_items:
                     if not rt.future.done():
                         continue
 
                     exp_result = rt.future.result()
                     task = rt.task
                     finished_ids.append(cid)
-                    completed_runs += 1
+                    with state_lock:
+                        completed_runs += 1
 
                     task.status = "repairing"
                     exp_result, repaired, final_desc, repair_status, repair_attempts = (
@@ -1242,10 +1321,11 @@ def run_parallel_loop(
                     )
                     task.status = "running"
                     task.final_description = final_desc
-                    if repair_attempts > 0:
-                        repair_stats["start"] += repair_attempts
-                    if repair_status in {"success", "failed", "out_of_scope"}:
-                        repair_stats[repair_status] += 1
+                    with state_lock:
+                        if repair_attempts > 0:
+                            repair_stats["start"] += repair_attempts
+                        if repair_status in {"success", "failed", "out_of_scope"}:
+                            repair_stats[repair_status] += 1
 
                     if (
                         exp_result.status == "completed"
@@ -1268,7 +1348,8 @@ def run_parallel_loop(
 
                     discard_reason: str | None = None
                     if improved and exp_result.val_bpb is not None:
-                        baseline_bpb = exp_result.val_bpb
+                        with state_lock:
+                            baseline_bpb = exp_result.val_bpb
                         shutil.copy2(task.train_py_path, BEST_TRAIN_FILE)
                         _append_queue_event(
                             "candidate_keep",
@@ -1300,9 +1381,10 @@ def run_parallel_loop(
                                 "reason": discard_reason,
                             }
                         )
-                        failure_reason_counts[discard_reason] = (
-                            failure_reason_counts.get(discard_reason, 0) + 1
-                        )
+                        with state_lock:
+                            failure_reason_counts[discard_reason] = (
+                                failure_reason_counts.get(discard_reason, 0) + 1
+                            )
                         _append_queue_event(
                             "candidate_discard",
                             {
@@ -1354,18 +1436,29 @@ def run_parallel_loop(
                     if len(finished_recent) > 30:
                         finished_recent = finished_recent[-30:]
 
-                for cid in finished_ids:
-                    running.pop(cid, None)
+                with state_lock:
+                    for cid in finished_ids:
+                        running.pop(cid, None)
 
-                # 4) 终止条件
-                if completed_runs >= max_total_runs and not running:
+                # 3) 终止条件
+                with state_lock:
+                    should_stop = (
+                        completed_runs >= max_total_runs
+                        and not running
+                        and not queued
+                        and not generating_futures
+                    )
+                if should_stop:
                     break
 
                 time.sleep(poll_interval_sec)
 
             stop_refresh.set()
+            generation_thread.join(timeout=1.0)
+            dispatch_thread.join(timeout=1.0)
             refresh_thread.join(timeout=1.0)
     finally:
+        generator_executor.shutdown(wait=True)
         executor.shutdown(wait=True)
 
     console.print(
