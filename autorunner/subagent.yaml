@@ -88,15 +88,16 @@ generator:
 
     ## 执行要求（必须遵守）
     1. 使用 Read 工具读取 train.py。
-    2. 使用 Read 工具读取 autorunner/artifacts/current_state.md（若文件存在）。
-    3. 使用 Bash 工具定位最新的 autorunner/artifacts/eval-*.json（若存在），并用 Read 工具重点查看 recommendation 与 diagnosis。
-    4. 在改动方案中显式说明如何响应最新评估建议（continue/revert_and_retry/discard_and_pivot/investigate）。
-    5. 使用 Edit/Write 工具直接修改 train.py（原地修改，不新建同义副本）。
-    6. 可用 Bash 工具做轻量自检（例如 python -m py_compile train.py）。
-    7. 严禁使用 Bash 运行任何训练命令或长任务命令（包括 uv run python train.py、python train.py、torchrun、nohup）。训练执行由外层调度器统一负责。
-    8. 不要只在对话里返回代码块；最终结果应体现在文件系统中的 train.py 里。
-    9. 无论是否回退到历史版本、重写文件或做最小修补，train.py 顶部都必须保留这一行：os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"。若缺失，必须在提交前补回。
-    10. 禁止依赖版本控制历史进行分析或切换；历史实验必须基于 autorunner/candidates、results.tsv 和 artifacts 文件进行分析。
+    2. 使用 Read 工具读取 results.tsv，并总结最近实验方向，主动避免重复方向；若方向相近，必须说明关键差异。
+    3. 使用 Read 工具读取 autorunner/artifacts/current_state.md（若文件存在）。
+    4. 使用 Bash 工具定位最新的 autorunner/artifacts/eval-*.json（若存在），并用 Read 工具重点查看 recommendation 与 diagnosis。
+    5. 在改动方案中显式说明如何响应最新评估建议（continue/revert_and_retry/discard_and_pivot/investigate）。
+    6. 使用 Edit/Write 工具直接修改 train.py（原地修改，不新建同义副本）。
+    7. 可用 Bash 工具做轻量自检（例如 python -m py_compile train.py）。
+    8. 严禁使用 Bash 运行任何训练命令或长任务命令（包括 uv run python train.py、python train.py、torchrun、nohup）。训练执行由外层调度器统一负责。
+    9. 不要只在对话里返回代码块；最终结果应体现在文件系统中的 train.py 里。
+    10. 无论是否回退到历史版本、重写文件或做最小修补，train.py 顶部都必须保留这一行：os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"。若缺失，必须在提交前补回。
+    11. 禁止依赖版本控制历史进行分析或切换；历史实验必须基于 autorunner/candidates、results.tsv 和 artifacts 文件进行分析。
 
     ## 输出要求
     请按以下格式输出，且不要粘贴整份代码：

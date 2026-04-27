@@ -28,3 +28,4 @@ memory/
 skills/
 .vscode/
 .claude/
+autorunner/.env

@@ -19,6 +19,7 @@ if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from autorunner.claude_code_agent import ClaudeCodeAgent
+from autorunner.env_config import load_dotenv, project_root
 from autorunner.experiment_executor import (
     ExperimentResult,
     analyze_failure,
@@ -26,14 +27,16 @@ from autorunner.experiment_executor import (
     run as run_experiment,
 )
 
+PROJECT_ROOT = project_root()
+load_dotenv()
 
-WORKDIR = Path("/mount/disk1/rl-hyr/autoresearch")
+WORKDIR = Path(os.getenv("AR_WORKDIR", str(PROJECT_ROOT))).expanduser()
 ARTIFACTS_DIR = WORKDIR / "autorunner" / "artifacts"
 RUN_LOG_FILE = ARTIFACTS_DIR / "run.log"
 CURRENT_STATE_FILE = ARTIFACTS_DIR / "current_state.md"
 RESULTS_TSV_FILE = WORKDIR / "results.tsv"
 BEST_CANDIDATE_FILE = ARTIFACTS_DIR / "best_candidate.json"
-MODEL = "MiniMax-M2.7"
+MODEL = os.getenv("AR_MODEL", "deepseek-v4-pro[1m]")
 console = Console()
 _nvidia_live: Live | None = None
 

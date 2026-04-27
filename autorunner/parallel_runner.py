@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -25,6 +26,7 @@ if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from autorunner.claude_code_agent import ClaudeCodeAgent
+from autorunner.env_config import load_dotenv, project_root
 from autorunner.embedding import (
     DEFAULT_SIMILARITY_THRESHOLD,
     DescriptionEmbeddingIndex,
@@ -36,15 +38,18 @@ from autorunner.experiment_executor import (
     run,
 )
 
+PROJECT_ROOT = project_root()
+load_dotenv()
 
-WORKDIR = Path("/mount/disk1/rl-hyr/autoresearch")
+WORKDIR = Path(os.getenv("AR_WORKDIR", str(PROJECT_ROOT))).expanduser()
 ARTIFACTS_DIR = WORKDIR / "autorunner" / "artifacts"
 CANDIDATE_ROOT = WORKDIR / "autorunner" / "candidates"
 RESULTS_TSV_FILE = WORKDIR / "results.tsv"
 FAILURE_DIRECTIONS_FILE = ARTIFACTS_DIR / "failure_directions.json"
 QUEUE_EVENTS_FILE = ARTIFACTS_DIR / "parallel_queue.jsonl"
 BEST_TRAIN_FILE = ARTIFACTS_DIR / "best_train.py"
-MODEL = "MiniMax-M2.7"
+CURRENT_STATE_FILE = ARTIFACTS_DIR / "current_state.md"
+MODEL = os.getenv("AR_MODEL", "deepseek-v4-pro[1m]")
 console = Console()
 
 
@@ -319,6 +324,173 @@ def _build_run_summaries() -> list[str]:
     return summaries
 
 
+def _latest_eval_file() -> Path | None:
+    if not ARTIFACTS_DIR.exists():
+        return None
+    files = sorted(ARTIFACTS_DIR.glob("eval-*.json"))
+    return files[-1] if files else None
+
+
+def _build_eval_guidance() -> str:
+    latest_eval = _latest_eval_file()
+    if latest_eval is None:
+        return (
+            "请先读取 autorunner/artifacts/current_state.md（若存在）恢复上下文。"
+            "当前没有 eval-*.json，请基于 results.tsv、current_state 和 candidates 历史避免重复方向。"
+        )
+
+    return (
+        "请先读取 autorunner/artifacts/current_state.md（若存在）恢复上下文。"
+        f"最新评估文件：autorunner/artifacts/{latest_eval.name}。"
+        "必须重点参考 recommendation.next_action 与 diagnosis，再决定本轮方案；"
+        "若与近几轮方向相似，必须说明新增差异点。"
+    )
+
+
+def _to_outcome(exp_result: ExperimentResult) -> str:
+    if exp_result.status == "timeout":
+        return "timeout"
+    if exp_result.status == "crashed":
+        return "crashed"
+    if exp_result.status != "completed":
+        return "completed_anomaly"
+    if exp_result.val_bpb is None:
+        return "completed_anomaly"
+    return "completed_success"
+
+
+def _safe_relative_change_percent(
+    baseline_before: float,
+    val_bpb: float | None,
+) -> float | None:
+    if val_bpb is None:
+        return None
+    if not math.isfinite(baseline_before) or baseline_before == 0:
+        return None
+    return (val_bpb - baseline_before) / baseline_before * 100.0
+
+
+def _write_parallel_eval_artifact(
+    *,
+    task: CandidateTask,
+    exp_result: ExperimentResult,
+    baseline_before: float,
+    baseline_after: float,
+    improved: bool,
+    decision: str,
+    repaired: bool,
+    discard_reason: str | None,
+) -> Path:
+    ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+    eval_path = ARTIFACTS_DIR / f"eval-{task.candidate_id}.json"
+
+    next_action = "continue" if improved else "discard_and_pivot"
+    if exp_result.status in {"timeout", "crashed"}:
+        next_action = "investigate"
+
+    issues: list[str] = []
+    if exp_result.status != "completed":
+        issues.append(f"run_status={exp_result.status}")
+    if discard_reason:
+        issues.append(f"discard_reason={discard_reason}")
+    if repaired:
+        issues.append("candidate_required_repair")
+
+    payload = {
+        "candidate_id": task.candidate_id,
+        "evaluated_at": _now_iso(),
+        "outcome": _to_outcome(exp_result),
+        "metrics": {
+            "val_bpb": exp_result.val_bpb,
+            "best_val_bpb_before": (
+                baseline_before if math.isfinite(baseline_before) else None
+            ),
+            "best_val_bpb_after": (
+                baseline_after if math.isfinite(baseline_after) else None
+            ),
+            "relative_change_percent": _safe_relative_change_percent(
+                baseline_before,
+                exp_result.val_bpb,
+            ),
+            "peak_vram_mb": exp_result.peak_vram_mb,
+            "mfu_percent": exp_result.mfu_percent,
+            "training_seconds": exp_result.training_seconds,
+        },
+        "metrics_healthy": bool(
+            exp_result.status == "completed"
+            and exp_result.val_bpb is not None
+            and math.isfinite(exp_result.val_bpb)
+        ),
+        "diagnosis": {
+            "summary": (
+                "improved" if improved else "not_improved"
+            ),
+            "issues": issues,
+            "root_cause": discard_reason or "n/a",
+        },
+        "code_review": {
+            "diff_summary": task.final_description or task.refine_description,
+            "risks": ["direction_similarity_risk"],
+            "consistency": True,
+        },
+        "recommendation": {
+            "next_action": next_action,
+            "reasoning": (
+                "Metric improved; keep exploring nearby variants."
+                if improved
+                else "Metric did not improve; pivot with explicit novelty."
+            ),
+            "suggested_directions": [
+                "Propose a clearly differentiated direction from recent candidates.",
+                "Reference current_state.md and eval artifacts before editing train.py.",
+            ],
+        },
+        "decision": decision,
+        "repaired": repaired,
+    }
+    eval_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
+    return eval_path
+
+
+def _append_parallel_current_state(
+    *,
+    task: CandidateTask,
+    exp_result: ExperimentResult,
+    decision: str,
+    improved: bool,
+    baseline_before: float,
+    baseline_after: float,
+    eval_path: Path,
+) -> None:
+    ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+    lines = [
+        f"## {task.candidate_id} @ {_now_iso()}",
+        f"description: {task.final_description or task.refine_description}",
+        f"status: {exp_result.status}",
+        f"decision: {decision}",
+        f"improved: {improved}",
+        f"val_bpb: {exp_result.val_bpb}",
+        (
+            f"best_val_bpb_before: {baseline_before}"
+            if math.isfinite(baseline_before)
+            else "best_val_bpb_before: None"
+        ),
+        (
+            f"best_val_bpb_after: {baseline_after}"
+            if math.isfinite(baseline_after)
+            else "best_val_bpb_after: None"
+        ),
+        f"eval_file: autorunner/artifacts/{eval_path.name}",
+        "",
+    ]
+
+    mode = "a" if CURRENT_STATE_FILE.exists() else "w"
+    with CURRENT_STATE_FILE.open(mode, encoding="utf-8") as f:
+        if mode == "a":
+            f.write("\n")
+        f.write("\n".join(lines))
+
+
 def _extract_description_from_llm_reply(reply: str, fallback: str) -> str:
     if not reply:
         return fallback
@@ -530,7 +702,6 @@ def _create_candidate(
     agent: ClaudeCodeAgent,
     base_train_path: Path,
     run_summaries: list[str],
-    failure_semantic_index: DescriptionEmbeddingIndex,
     topic: str,
 ) -> CandidateTask | None:
     candidate_id = _next_candidate_id()
@@ -550,6 +721,7 @@ def _create_candidate(
         "禁止使用 git 命令查看、切换或回滚历史版本（如 git show/log/checkout/restore）。"
         "历史实验信息只能来自 autorunner/candidates 目录、results.tsv 与 artifacts 文件。"
     )
+    eval_guidance = _build_eval_guidance()
 
     result = agent.refine(
         current_files={"train.py": base_code},
@@ -561,6 +733,9 @@ def _create_candidate(
             "你需要产出一个新候选方向。"
             "必须显式避开以下已失败方向，不要重复同类尝试：\n"
             f"{failed_block}\n"
+            "必须通过读取历史结果自行识别并规避重复方向；"
+            "若方向近似，必须在 DESCRIPTION 中说明关键差异。\n"
+            f"{eval_guidance}\n"
             f"{forbidden_training_text}\n"
             f"{forbidden_git_history_text}"
         ),
@@ -616,21 +791,6 @@ def _create_candidate(
         fallback=f"candidate {candidate_id}",
     )
     changed_keys = _changed_upper_keys(base_code, new_code)
-
-    dup, matched, score = failure_semantic_index.is_duplicate(desc)
-    if dup:
-        matched_desc = str((matched or {}).get("description") or "")
-        _append_queue_event(
-            "candidate_rejected",
-            {
-                "candidate_id": candidate_id,
-                "reason": "duplicate_failed_direction_semantic",
-                "similarity": round(score, 4),
-                "matched_description": matched_desc,
-                "threshold": DEFAULT_SIMILARITY_THRESHOLD,
-            },
-        )
-        return None
 
     task = CandidateTask(
         candidate_id=candidate_id,
@@ -985,7 +1145,6 @@ def run_parallel_loop(
                                 agent=agent,
                                 base_train_path=BEST_TRAIN_FILE,
                                 run_summaries=run_summaries,
-                                failure_semantic_index=failure_semantic_index,
                                 topic=topic,
                             )
                             if task is not None:
@@ -1092,10 +1251,12 @@ def run_parallel_loop(
                         exp_result.status == "completed"
                         and exp_result.val_bpb is not None
                     ):
+                        baseline_before = baseline_bpb
                         improved, decision = metric_judge(
                             baseline_bpb, exp_result.val_bpb
                         )
                     else:
+                        baseline_before = baseline_bpb
                         improved, decision = False, "discard"
 
                     _append_results_tsv(
@@ -1105,6 +1266,7 @@ def run_parallel_loop(
                         description=task.final_description or task.refine_description,
                     )
 
+                    discard_reason: str | None = None
                     if improved and exp_result.val_bpb is not None:
                         baseline_bpb = exp_result.val_bpb
                         shutil.copy2(task.train_py_path, BEST_TRAIN_FILE)
@@ -1152,6 +1314,26 @@ def run_parallel_loop(
                             },
                         )
                         final_status = "discard"
+
+                    eval_path = _write_parallel_eval_artifact(
+                        task=task,
+                        exp_result=exp_result,
+                        baseline_before=baseline_before,
+                        baseline_after=baseline_bpb,
+                        improved=improved,
+                        decision=decision,
+                        repaired=repaired,
+                        discard_reason=discard_reason,
+                    )
+                    _append_parallel_current_state(
+                        task=task,
+                        exp_result=exp_result,
+                        decision=decision,
+                        improved=improved,
+                        baseline_before=baseline_before,
+                        baseline_after=baseline_bpb,
+                        eval_path=eval_path,
+                    )
 
                     runtime_s = int(
                         max(0, time.time() - (task.launch_ts or time.time()))

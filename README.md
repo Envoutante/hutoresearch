@@ -39,6 +39,22 @@ uv run train.py
 
 If the above commands all work ok, your setup is working and you can go into autonomous research mode.
 
+## Optional .env configuration
+
+You can configure runner defaults with a local `autorunner/.env` file (copy from `autorunner/.env.example`).
+
+Supported keys:
+
+- `AR_MODEL`: model name used by `autorunner/loop_runner.py` and `autorunner/parallel_runner.py`
+- `AR_WORKDIR`: workspace root path used by runners
+
+Example:
+
+```bash
+cp autorunner/.env.example autorunner/.env
+# then edit autorunner/.env as needed
+```
+
 ## Running the agent
 
 Simply spin up your Claude/Codex or whatever you want in this repo (and disable all permissions), then you can prompt something like:
