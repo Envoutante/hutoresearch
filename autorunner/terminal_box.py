@@ -292,6 +292,8 @@ class AgentOutputBox:
         in_tok = usage.get("input_tokens")
         out_tok = usage.get("output_tokens")
         cache_tok = usage.get("cache_read_input_tokens")
+        if cache_tok is None:
+            cache_tok = usage.get("cached_input_tokens")
 
         parts = []
         if in_tok is not None:

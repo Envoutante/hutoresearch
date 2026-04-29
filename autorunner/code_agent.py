@@ -1,4 +1,4 @@
-"""ClaudeCodeAgent: 调用 Claude Code CLI (claude -p) 生成/修改 train.py"""
+"""Code agents backed by Claude Code or Codex CLI."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import json
 import os
 import queue
 import signal
+import shlex
 import subprocess
 import threading
 import time
@@ -21,6 +22,7 @@ from autorunner.terminal_box import AgentOutputBox, StreamRenderConfig
 
 
 DEFAULT_PROMPT_CONFIG_NAME = "subagent.yaml"
+REFINE_SUMMARY_LIMIT = int(os.getenv("AR_REFINE_SUMMARY_LIMIT", "6"))
 
 
 @dataclass
@@ -199,6 +201,54 @@ def _extract_content_from_stream_json(stdout: str) -> str:
     return "".join(text_parts).strip()
 
 
+def _extract_content_from_codex_json(stdout: str) -> str:
+    """从 Codex CLI --json 输出中提取最终回复文本。"""
+    final_text = ""
+    text_parts: list[str] = []
+
+    for raw in stdout.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            text_parts.append(line)
+            continue
+
+        item = obj.get("item")
+        if isinstance(item, dict):
+            item_type = item.get("type")
+            text = item.get("text")
+            if (
+                obj.get("type") == "item.completed"
+                and item_type in {"agent_message", "reasoning"}
+                and isinstance(text, str)
+                and text.strip()
+            ):
+                if item_type == "agent_message":
+                    final_text = text.strip()
+                else:
+                    text_parts.append(text)
+
+        for key in ("last_message", "message", "content", "text", "output"):
+            value = obj.get(key)
+            if isinstance(value, str) and value.strip():
+                if obj.get("type") in {"result", "final", "agent_message"}:
+                    final_text = value.strip()
+                else:
+                    text_parts.append(value)
+
+        if obj.get("type") == "result":
+            result = obj.get("result")
+            if isinstance(result, str) and result.strip():
+                final_text = result.strip()
+
+    if final_text:
+        return final_text
+    return "\n".join(x.strip() for x in text_parts if x.strip()).strip()
+
+
 def _extract_error_from_stream_json(stdout: str) -> str:
     """从 stream-json 输出中提取可读的错误信息。"""
     error_text = ""
@@ -237,7 +287,7 @@ def _extract_error_from_stream_json(stdout: str) -> str:
 
 @dataclass
 class CodeAgentResult:
-    """ClaudeCodeAgent 的返回结果"""
+    """代码代理的返回结果。"""
 
     success: bool
     content: str  # Claude CLI 的文本回复（stdout）
@@ -277,8 +327,12 @@ def _append_live_stream_line(log_path: Path, payload: str) -> None:
 
 
 def _short_text(text: Any, max_len: int = 200) -> str:
-    _ = max_len
-    return str(text or "").replace("\n", " ").strip()
+    s = str(text or "").replace("\n", " ").strip()
+    if max_len <= 0 or len(s) <= max_len:
+        return s
+    if max_len <= 3:
+        return s[:max_len]
+    return s[: max_len - 3] + "..."
 
 
 def _append_live_stream_event(log_path: Path, kind: str, **fields: Any) -> None:
@@ -801,6 +855,132 @@ class _StreamOutputProcessor:
                 content=content,
             )
 
+    def _handle_codex_json_event(self, item: dict[str, Any], live_stream_log: Path) -> bool:
+        """记录 Codex CLI --json 事件，省略工具读取到的原始正文。"""
+        kind = str(item.get("type") or "")
+
+        if kind == "thread.started":
+            thread_id = _short_text(item.get("thread_id"), 80)
+            suffix = f" id={thread_id}" if thread_id else ""
+            _append_live_stream_line(live_stream_log, f"- thread: started{suffix}")
+            self.renderer.set_status("thread started")
+            return True
+
+        if kind == "turn.started":
+            _append_live_stream_line(live_stream_log, "- turn: started")
+            self.renderer.set_status("turn started")
+            return True
+
+        if kind == "turn.completed":
+            usage = item.get("usage") if isinstance(item.get("usage"), dict) else {}
+            usage_text = ""
+            if usage:
+                usage_text = " usage=" + _short_text(
+                    json.dumps(usage, ensure_ascii=False, separators=(",", ":")),
+                    500,
+                )
+            _append_live_stream_line(live_stream_log, f"- turn: completed{usage_text}")
+            self.renderer.set_usage(usage)
+            self.renderer.set_status("turn completed")
+            return True
+
+        if kind == "error":
+            message = _short_text(item.get("message"), 1000)
+            _append_live_stream_line(live_stream_log, f"- error: {message}")
+            self.renderer.add_stderr(message)
+            return True
+
+        if kind not in {"item.started", "item.completed"}:
+            return False
+
+        raw_item = item.get("item")
+        if not isinstance(raw_item, dict):
+            return False
+
+        event_phase = kind.split(".", 1)[1]
+        item_id = _short_text(raw_item.get("id"), 80)
+        item_type = str(raw_item.get("type") or "unknown")
+        status = str(raw_item.get("status") or event_phase)
+
+        if item_type in {"agent_message", "reasoning"}:
+            text = str(raw_item.get("text") or "")
+            if text:
+                log_kind = "thinking" if item_type == "reasoning" else "assistant"
+                self._append_stream_text_for_log(
+                    log_kind,
+                    text,
+                    live_stream_log,
+                    force=True,
+                )
+                if item_type == "reasoning":
+                    self.renderer.add_ordered_thinking(text)
+                else:
+                    self.renderer.add_ordered_assistant(text, stream_id=item_id or None)
+            return True
+
+        if item_type == "command_execution":
+            command = _short_text(raw_item.get("command"), 500)
+            if event_phase == "started":
+                _append_live_stream_line(
+                    live_stream_log,
+                    f"- tool_call: name=command_execution id={item_id} command={command}",
+                )
+                self.renderer.set_status("command running")
+                return True
+
+            output = str(raw_item.get("aggregated_output") or "")
+            exit_code = raw_item.get("exit_code")
+            exit_text = "none" if exit_code is None else str(exit_code)
+            _append_live_stream_line(
+                live_stream_log,
+                (
+                    "- tool_result: name=command_execution "
+                    f"id={item_id} status={status} exit_code={exit_text} "
+                    f"output_chars={len(output)}"
+                ),
+            )
+            self.renderer.set_status(f"command {status}")
+            return True
+
+        if item_type == "file_change":
+            changes = raw_item.get("changes")
+            change_summaries: list[str] = []
+            if isinstance(changes, list):
+                for change in changes[:8]:
+                    if not isinstance(change, dict):
+                        continue
+                    path = _short_text(change.get("path"), 160)
+                    change_kind = _short_text(change.get("kind"), 40)
+                    if path and change_kind:
+                        change_summaries.append(f"{change_kind}:{path}")
+                    elif path:
+                        change_summaries.append(path)
+                if len(changes) > len(change_summaries):
+                    change_summaries.append(f"+{len(changes) - len(change_summaries)} more")
+            changes_text = ", ".join(change_summaries) if change_summaries else "-"
+            if event_phase == "started":
+                _append_live_stream_line(
+                    live_stream_log,
+                    f"- tool_call: name=file_change id={item_id} changes={changes_text}",
+                )
+            else:
+                _append_live_stream_line(
+                    live_stream_log,
+                    (
+                        "- tool_result: name=file_change "
+                        f"id={item_id} status={status} changes={changes_text}"
+                    ),
+                )
+            self.renderer.set_status(f"file_change {status}")
+            return True
+
+        _append_live_stream_line(
+            live_stream_log,
+            f"- codex_item: event={event_phase} type={item_type} id={item_id} status={status}",
+        )
+        self.renderer.set_status(f"{item_type} {status}")
+        return True
+
     def handle_stdout_payload(self, payload: str, live_stream_log: Path) -> None:
         """处理并渲染标准输出中的单条负载。"""
         self.state.stdout_lines.append(payload)
@@ -821,6 +1001,9 @@ class _StreamOutputProcessor:
         event_type = event.get("type")
         delta = event.get("delta") or {}
         delta_type = delta.get("type")
+
+        if self._handle_codex_json_event(item, live_stream_log):
+            return
 
         if (
             kind == "stream_event"
@@ -1084,22 +1267,27 @@ def _run_subprocess(
     )
 
 
-class ClaudeCodeAgent:
-    """Backed by Claude Code CLI (claude -p)."""
+class BaseCodeAgent:
+    """Shared prompt rendering and task methods for CLI-backed coding agents."""
+
+    backend_name = "base"
+    default_binary = ""
+    supports_allowed_tools = False
 
     def __init__(
         self,
-        model: str = "sonnet",
+        model: str = "",
         timeout_sec: int = 600,
         extra_args: list[str] | None = None,
         stream_output: bool = True,
         prompt_config_path: Path | None = None,
+        binary: str | None = None,
     ):
-        """初始化 Claude Code Agent 的运行参数与提示词配置。"""
+        """初始化 Code Agent 的运行参数与提示词配置。"""
         self._model = model
         self._timeout_sec = timeout_sec
         self._extra_args = extra_args or []
-        self._binary = "claude"
+        self._binary = binary or self.default_binary
         self._stream_output = stream_output
         self._prompt_config_path = prompt_config_path or Path(__file__).with_name(
             DEFAULT_PROMPT_CONFIG_NAME
@@ -1133,6 +1321,13 @@ class ClaudeCodeAgent:
                 f"Missing prompt variable '{missing_key}' for {section}.{template_name}"
             ) from exc
 
+    def _extract_content(self, stdout: str) -> str:
+        return stdout.strip()
+
+    def _extract_error(self, stdout: str, stderr: str) -> str:
+        _ = stdout
+        return stderr.strip()
+
     def _build_result(
         self,
         workdir: Path,
@@ -1144,9 +1339,9 @@ class ClaudeCodeAgent:
     ) -> CodeAgentResult:
         """汇总执行产物并构造统一结果对象。"""
         files = _collect_py_files(workdir)
-        effective_stderr = stderr.strip()
+        effective_stderr = self._extract_error(stdout, stderr)
         if returncode != 0 and not effective_stderr:
-            effective_stderr = _extract_error_from_stream_json(stdout)
+            effective_stderr = stdout.strip()[:500]
 
         error = None
         if timed_out:
@@ -1154,8 +1349,8 @@ class ClaudeCodeAgent:
         elif returncode != 0:
             error = f"Exited {returncode}: {effective_stderr[:500]}"
 
-        # 日志内容记录 Claude 文本回复，代码改动通过 files['train.py'] 读取
-        content = _extract_content_from_stream_json(stdout)
+        # 日志内容记录 Agent 文本回复，代码改动通过 files['train.py'] 读取
+        content = self._extract_content(stdout)
         has_train_code = bool(files.get("train.py", "").strip())
         has_reply = bool(content)
 
@@ -1169,26 +1364,15 @@ class ClaudeCodeAgent:
             files=files,
         )
 
-    def _build_cmd(self, prompt: str, workdir: Path) -> list[str]:
-        """组装 Claude CLI 命令行参数。"""
-        cmd = [
-            self._binary,
-            "-p",
-            prompt,
-            "--dangerously-skip-permissions",
-            "--output-format",
-            "stream-json",
-            "--include-partial-messages",
-            "--verbose",
-            "--allowed-tools",
-            "Bash Edit Write Read",
-            "--add-dir",
-            str(workdir),
-        ]
-        if self._model:
-            cmd += ["--model", self._model]
-        cmd.extend(self._extra_args)
-        return cmd
+    def _build_cmd(
+        self,
+        prompt: str,
+        workdir: Path,
+        *,
+        allowed_tools: str = "Bash Edit Write Read",
+    ) -> list[str]:
+        _ = prompt, workdir, allowed_tools
+        raise NotImplementedError
 
     def _run_subprocess(
         self,
@@ -1236,7 +1420,9 @@ class ClaudeCodeAgent:
     ) -> str:
         """基于历史结果生成 refine 提示词。"""
         summaries_text = (
-            "\n".join(run_summaries[-10:]) if run_summaries else "无历史记录"
+            "\n".join(run_summaries[-REFINE_SUMMARY_LIMIT:])
+            if run_summaries
+            else "无历史记录"
         )
         files_text = ""
         for name, content in current_files.items():
@@ -1270,6 +1456,20 @@ class ClaudeCodeAgent:
             refine_description=refine_description,
         )
 
+    def _candidate_summary_prompt(
+        self,
+        *,
+        candidate_id: str,
+        diff_summary: str,
+    ) -> str:
+        """生成候选结构化摘要提示词，用于抢救超时但已修改的候选。"""
+        return self._render_prompt(
+            "candidate_summarizer",
+            "summarize",
+            candidate_id=candidate_id,
+            diff_summary=diff_summary[:12000],
+        )
+
     def _evaluate_prompt(
         self,
         *,
@@ -1292,6 +1492,22 @@ class ClaudeCodeAgent:
             results_tsv_path=results_tsv_path,
             best_candidate_path=best_candidate_path,
             eval_output_path=eval_output_path,
+        )
+
+    def _novelty_judge_prompt(
+        self,
+        *,
+        candidate_json: str,
+        registry_context_json: str,
+        diff_summary: str,
+    ) -> str:
+        """生成候选方向去重审查提示词。"""
+        return self._render_prompt(
+            "novelty_judge",
+            "judge",
+            candidate_json=candidate_json,
+            registry_context_json=registry_context_json,
+            diff_summary=diff_summary,
         )
 
     def generate(
@@ -1405,3 +1621,240 @@ class ClaudeCodeAgent:
             transient_output=True,
         )
         return self._build_result(workdir, rc, stdout, stderr, elapsed, to)
+
+    def summarize_candidate(
+        self,
+        *,
+        candidate_id: str,
+        diff_summary: str,
+        workdir: Path,
+        timeout_sec: int | None = None,
+    ) -> CodeAgentResult:
+        """对已修改候选生成结构化字段；不允许修改文件。"""
+        prompt = self._candidate_summary_prompt(
+            candidate_id=candidate_id,
+            diff_summary=diff_summary,
+        )
+        cmd = self._build_cmd(prompt, workdir, allowed_tools="Read")
+        rc, stdout, stderr, elapsed, to = self._run_subprocess(
+            cmd,
+            workdir,
+            timeout_sec or min(self._timeout_sec, 120),
+            render_title="Candidate Summarizer",
+            transient_output=True,
+        )
+        return self._build_result(workdir, rc, stdout, stderr, elapsed, to)
+
+    def judge_novelty(
+        self,
+        *,
+        candidate: dict[str, Any],
+        registry_context: list[dict[str, Any]],
+        diff_summary: str,
+        workdir: Path,
+        timeout_sec: int | None = None,
+    ) -> CodeAgentResult:
+        """执行候选方向 novelty 去重审查。"""
+        prompt = self._novelty_judge_prompt(
+            candidate_json=json.dumps(candidate, ensure_ascii=False, indent=2),
+            registry_context_json=json.dumps(
+                registry_context,
+                ensure_ascii=False,
+                indent=2,
+            ),
+            diff_summary=diff_summary[:12000],
+        )
+        cmd = self._build_cmd(prompt, workdir, allowed_tools="Read")
+        rc, stdout, stderr, elapsed, to = self._run_subprocess(
+            cmd,
+            workdir,
+            timeout_sec or min(self._timeout_sec, 240),
+            render_title="Novelty Judge",
+            transient_output=True,
+        )
+        return self._build_result(workdir, rc, stdout, stderr, elapsed, to)
+
+
+class ClaudeCodeAgent(BaseCodeAgent):
+    """Backed by Claude Code CLI (claude -p)."""
+
+    backend_name = "claude"
+    default_binary = "claude"
+    supports_allowed_tools = True
+
+    def __init__(
+        self,
+        model: str = "sonnet",
+        timeout_sec: int = 600,
+        extra_args: list[str] | None = None,
+        stream_output: bool = True,
+        prompt_config_path: Path | None = None,
+        binary: str | None = None,
+    ):
+        super().__init__(
+            model=model,
+            timeout_sec=timeout_sec,
+            extra_args=extra_args,
+            stream_output=stream_output,
+            prompt_config_path=prompt_config_path,
+            binary=binary,
+        )
+
+    def _extract_content(self, stdout: str) -> str:
+        return _extract_content_from_stream_json(stdout)
+
+    def _extract_error(self, stdout: str, stderr: str) -> str:
+        effective_stderr = stderr.strip()
+        if effective_stderr:
+            return effective_stderr
+        return _extract_error_from_stream_json(stdout)
+
+    def _build_cmd(
+        self,
+        prompt: str,
+        workdir: Path,
+        *,
+        allowed_tools: str = "Bash Edit Write Read",
+    ) -> list[str]:
+        """组装 Claude CLI 命令行参数。"""
+        cmd = [
+            self._binary,
+            "-p",
+            prompt,
+            "--dangerously-skip-permissions",
+            "--output-format",
+            "stream-json",
+            "--include-partial-messages",
+            "--verbose",
+            "--allowed-tools",
+            allowed_tools,
+            "--add-dir",
+            str(workdir),
+        ]
+        if self._model:
+            cmd += ["--model", self._model]
+        cmd.extend(self._extra_args)
+        return cmd
+
+
+class CodexCodeAgent(BaseCodeAgent):
+    """Backed by Codex CLI (codex exec)."""
+
+    backend_name = "codex"
+    default_binary = "codex"
+
+    def __init__(
+        self,
+        model: str = "",
+        timeout_sec: int = 600,
+        extra_args: list[str] | None = None,
+        stream_output: bool = True,
+        prompt_config_path: Path | None = None,
+        binary: str | None = None,
+        sandbox: str | None = None,
+        approval_policy: str | None = None,
+        ephemeral: bool | None = None,
+    ):
+        super().__init__(
+            model=model,
+            timeout_sec=timeout_sec,
+            extra_args=extra_args,
+            stream_output=stream_output,
+            prompt_config_path=prompt_config_path,
+            binary=binary,
+        )
+        self._sandbox = sandbox or os.getenv("AR_CODEX_SANDBOX", "danger-full-access")
+        self._approval_policy = approval_policy or os.getenv(
+            "AR_CODEX_APPROVAL_POLICY",
+            "never",
+        )
+        if ephemeral is None:
+            ephemeral = os.getenv("AR_CODEX_EPHEMERAL", "1").strip().lower() not in {
+                "0",
+                "false",
+                "no",
+            }
+        self._ephemeral = ephemeral
+
+    def _extract_content(self, stdout: str) -> str:
+        return _extract_content_from_codex_json(stdout) or stdout.strip()
+
+    def _build_cmd(
+        self,
+        prompt: str,
+        workdir: Path,
+        *,
+        allowed_tools: str = "Bash Edit Write Read",
+    ) -> list[str]:
+        """组装 Codex CLI 命令行参数。"""
+        _ = allowed_tools
+        cmd = [
+            self._binary,
+            "--ask-for-approval",
+            self._approval_policy,
+            "exec",
+            "--json",
+            "-C",
+            str(workdir),
+            "--add-dir",
+            str(workdir),
+            "--sandbox",
+            self._sandbox,
+        ]
+        if self._ephemeral:
+            cmd.append("--ephemeral")
+        if self._model:
+            cmd += ["--model", self._model]
+        cmd.extend(self._extra_args)
+        cmd.append(prompt)
+        return cmd
+
+
+def _split_extra_args(raw: str) -> list[str]:
+    raw = raw.strip()
+    if not raw:
+        return []
+    return shlex.split(raw)
+
+
+def make_code_agent(
+    *,
+    backend: str | None = None,
+    model: str | None = None,
+    timeout_sec: int = 600,
+    stream_output: bool = True,
+    prompt_config_path: Path | None = None,
+) -> BaseCodeAgent:
+    """按环境配置创建代码代理。"""
+    selected = (backend or os.getenv("AR_AGENT_BACKEND", "claude")).strip().lower()
+    selected = {
+        "anthropic": "claude",
+        "claude_code": "claude",
+        "openai": "codex",
+    }.get(selected, selected)
+
+    if selected == "claude":
+        agent_model = model if model is not None else os.getenv("AR_MODEL", "sonnet")
+        return ClaudeCodeAgent(
+            model=agent_model,
+            timeout_sec=timeout_sec,
+            extra_args=_split_extra_args(os.getenv("AR_CLAUDE_EXTRA_ARGS", "")),
+            stream_output=stream_output,
+            prompt_config_path=prompt_config_path,
+            binary=os.getenv("AR_CLAUDE_BINARY") or None,
+        )
+
+    if selected == "codex":
+        agent_model = model if model is not None else os.getenv("AR_CODEX_MODEL", "")
+        return CodexCodeAgent(
+            model=agent_model,
+            timeout_sec=timeout_sec,
+            extra_args=_split_extra_args(os.getenv("AR_CODEX_EXTRA_ARGS", "")),
+            stream_output=stream_output,
+            prompt_config_path=prompt_config_path,
+            binary=os.getenv("AR_CODEX_BINARY") or None,
+        )
+
+    raise ValueError(
+        f"Unsupported AR_AGENT_BACKEND={selected!r}; expected 'claude' or 'codex'"
+    )

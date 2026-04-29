@@ -24,17 +24,16 @@ generator:
     {extra_guidance}
 
     ## 执行要求（必须遵守）
-    1. 使用 Read 工具读取 train.py 和 results.tsv。
-    2. 在提出改动前，先读取 autorunner/artifacts/current_state.md（若文件存在）。
-    3. 使用 Bash 工具定位最新的 autorunner/artifacts/eval-*.json（若存在），并用 Read 工具重点查看 recommendation 与 diagnosis。
-    4. 若最新评估中的 recommendation.next_action 是 revert_and_retry 或 discard_and_pivot，必须在方案里显式响应该建议。
-    5. 禁止使用 Bash 主动运行训练；训练执行由外层脚本统一负责。
-    6. 禁止使用 Edit/Write 修改 train.py；只允许只读分析。
-    7. 不要只在对话里返回代码块；输出应聚焦历史总结与后续 refine 方向。
+    1. 只允许读取当前工作目录下的 train.py。
+    2. 历史结果、失败方向与后续建议只使用本提示词中的“额外指导”。
+    3. 禁止读取 results.tsv、autorunner/artifacts、autorunner/candidates、current_state.md、eval-*.json 或其它历史文件。
+    4. 禁止使用 Bash 主动运行训练；训练执行由外层脚本统一负责。
+    5. 禁止使用 Edit/Write 修改 train.py；只允许只读分析。
+    6. 不要只在对话里返回代码块；输出应聚焦历史总结与后续 refine 方向。
 
     ## 输出要求
     请按以下格式输出，且不要粘贴整份代码：
-    DESCRIPTION: <One sentence in English, 5-18 words, describing the concrete changes made in this round only. Do not mention what was not changed. No tabs.>
+    DESCRIPTION: <1-2个中文短句，总结本轮具体结论或改动；每句尽量短，不要使用逗号（包括中文逗号和英文逗号），不要使用制表符。>
     仅使用纯文本，不要使用任何 Markdown 语法符号（例如 #、-、*、```）。
 
   refine: |
@@ -50,13 +49,10 @@ generator:
     ## 历史运行摘要（按时间顺序，近似到远）
     {summaries_text}
 
-    请**充分分析**以上历史实验结果：
-    - 哪些改动带来了提升？提升了多少？
-    - 哪些改动没有效果，甚至变差了？
-    - 被 discard 的实验中，有哪些思路值得重新尝试（比如参数设置更合理）？
-    - 哪些优化方向还没有被探索过？
-
-    在分析的基础上，选择一个最有潜力的方向进行改进。
+    请快速使用以上历史摘要，只做必要判断：
+    - 用不超过 4 条短句识别有效、失败、未探索方向。
+    - 不要复盘每个候选，不要重新推导 runner 的历史选择。
+    - 选出一个最有潜力且未被 active 方向占用的具体改动。
 
     ## 约束与取舍原则
     1. VRAM 是软约束：为了获得有意义的 {metric_key} 改善，允许小幅增加显存，但严禁显存占用急剧膨胀。
@@ -64,13 +60,9 @@ generator:
     3. 复杂性与收益权衡：如果改动明显增加复杂性但收益很小（例如约 0.001 的改善却引入大量 hack 代码），通常不应采用。
     4. 简化奖励：若删除代码后取得相同或更好结果，应优先保留该方案；即便指标几乎不变，但代码明显更简单，也应倾向保留。
 
-    ## 想法耗尽时的探索策略
-    如果你感觉可尝试的想法变少，不要停下，请继续主动探索：
-    1. 回看代码中引用的论文与实现线索，提取可落地到当前 train.py 的改动点。
-    2. 重新审阅已给出的上下文与历史结果，寻找未被充分尝试的角度。
-    3. 组合此前“接近成功”的思路做小步重组。
-    4. 在可控风险下尝试更激进的架构改动，并保持代码可运行与可评估。
-    5. 你在当前工作目录持续迭代；若某方向陷入困境，可基于 best_train.py 或已验证候选做保守回退，但必须给出明确理由。
+    ## 决策边界
+    你不是历史审计员；外层 runner 已经提供足够的历史摘要、活跃方向和去重约束。
+    你必须快速选择一个具体方向并实现。不要反复比较大量历史文件，不要在多个候选想法之间长时间摇摆。
 
     ## 当前文件
     {files_text}
@@ -87,21 +79,26 @@ generator:
     {extra_hints}
 
     ## 执行要求（必须遵守）
-    1. 使用 Read 工具读取 train.py。
-    2. 使用 Read 工具读取 results.tsv，并总结最近实验方向，主动避免重复方向；若方向相近，必须说明关键差异。
-    3. 使用 Read 工具读取 autorunner/artifacts/current_state.md（若文件存在）。
-    4. 使用 Bash 工具定位最新的 autorunner/artifacts/eval-*.json（若存在），并用 Read 工具重点查看 recommendation 与 diagnosis。
-    5. 在改动方案中显式说明如何响应最新评估建议（continue/revert_and_retry/discard_and_pivot/investigate）。
-    6. 使用 Edit/Write 工具直接修改 train.py（原地修改，不新建同义副本）。
-    7. 可用 Bash 工具做轻量自检（例如 python -m py_compile train.py）。
-    8. 严禁使用 Bash 运行任何训练命令或长任务命令（包括 uv run python train.py、python train.py、torchrun、nohup）。训练执行由外层调度器统一负责。
-    9. 不要只在对话里返回代码块；最终结果应体现在文件系统中的 train.py 里。
-    10. 无论是否回退到历史版本、重写文件或做最小修补，train.py 顶部都必须保留这一行：os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"。若缺失，必须在提交前补回。
-    11. 禁止依赖版本控制历史进行分析或切换；历史实验必须基于 autorunner/candidates、results.tsv 和 artifacts 文件进行分析。
+    1. 只允许读取当前工作目录下的 train.py；禁止读取 results.tsv、autorunner/artifacts、autorunner/candidates、current_state.md、eval-*.json 或其它历史文件。
+    2. 历史与活跃方向只使用本提示词中“历史运行摘要”和“额外提示”提供的内容。
+    3. 先用最多 6 句话决定一个方向，然后立刻修改 train.py；选定后不要反复推翻自己的方案。
+    4. 使用 Edit/Write 工具直接修改 train.py（原地修改，不新建同义副本）。
+    5. 可用 Bash 工具做一次轻量自检（例如 python -m py_compile train.py），自检通过后必须立即输出最终结构化字段。
+    6. 严禁使用 Bash 运行任何训练命令或长任务命令（包括 uv run python train.py、python train.py、torchrun、nohup）。训练执行由外层调度器统一负责。
+    7. 不要只在对话里返回代码块；最终结果应体现在文件系统中的 train.py 里。
+    8. 无论是否回退到历史版本、重写文件或做最小修补，train.py 顶部都必须保留这一行：os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"。若缺失，必须在提交前补回。
+    9. 禁止依赖版本控制历史进行分析或切换。
+    10. 禁止读取其它候选目录来做人工对比；重复性由外层 Novelty Judge 负责。
+    11. 禁止输出长篇内心复盘；一旦决定方向，直接执行代码修改和自检。
 
     ## 输出要求
     请按以下格式输出，且不要粘贴整份代码：
-    DESCRIPTION: <One sentence in English, 5-18 words, describing only the concrete code changes made this round. Do not mention unchanged items. No tabs.>
+    DIRECTION_KEY: <A short hierarchical key such as lr_schedule.warmup_length or architecture.width. No tabs.>
+    HYPOTHESIS: <One sentence explaining why this change could improve val_bpb. No tabs.>
+    MECHANISM: <One sentence explaining the concrete code or parameter mechanism changed. No tabs.>
+    TOUCHED_SYMBOLS: <Comma-separated train.py symbols, hyperparameters, or concepts touched. No tabs.>
+    NOVELTY_CLAIM: <One sentence explaining how this differs from similar prior or active directions. No tabs.>
+    DESCRIPTION: <1-2个中文短句，总结本轮具体代码改动；每句尽量短，不要使用逗号（包括中文逗号和英文逗号），不要描述未改动内容，不要使用制表符。>
     仅使用纯文本，不要使用任何 Markdown 语法符号（例如 #、-、*、```）。
 
   repair: |
@@ -126,12 +123,76 @@ generator:
     7. 不要只在对话里返回代码块；最终结果应体现在文件系统中的 train.py 里。
     8. 无论是否回退到历史版本、重写文件或做最小修补，train.py 顶部都必须保留这一行：os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"。若缺失，必须在提交前补回。
     9. 严禁使用 Bash 运行任何训练命令或长任务命令（包括 uv run python train.py、python train.py、torchrun、nohup）。训练执行由外层调度器统一负责。
-    10. 禁止依赖版本控制历史进行分析或切换；历史实验必须基于 autorunner/candidates、results.tsv 和 artifacts 文件进行分析。
+    10. 禁止依赖版本控制历史进行分析或切换；不要读取其它候选目录来做人工对比。
 
     ## 输出要求
     请按以下格式输出，且不要粘贴整份代码：
-    DESCRIPTION: <One sentence in English, 5-18 words, describing only the concrete fix applied this round. Do not mention unchanged items. No tabs.>
+    DESCRIPTION: <1-2个中文短句，总结本轮具体修复；每句尽量短，不要使用逗号（包括中文逗号和英文逗号），不要描述未改动内容，不要使用制表符。>
     仅使用纯文本，不要使用任何 Markdown 语法符号（例如 #、-、*、```）。
+
+candidate_summarizer:
+  summarize: |
+    你是 AutoResearch 的 Candidate Summarizer Agent。
+
+    你的任务：根据候选 train.py 的 diff，为一个已经修改过但没有正常输出总结的候选补写结构化字段。
+    你只做总结，不修改文件，不读取历史文件。
+
+    ## 候选信息
+    candidate_id: {candidate_id}
+
+    ## 代码 diff 摘要
+    ```diff
+    {diff_summary}
+    ```
+
+    ## 输出要求
+    只输出以下纯文本字段，不要输出 Markdown、代码块或额外解释：
+    DIRECTION_KEY: <A short hierarchical key such as lr_schedule.warmup_length or architecture.width. No tabs.>
+    HYPOTHESIS: <One sentence explaining why this change could improve val_bpb. No tabs.>
+    MECHANISM: <One sentence explaining the concrete code or parameter mechanism changed. No tabs.>
+    TOUCHED_SYMBOLS: <Comma-separated train.py symbols, hyperparameters, or concepts touched. No tabs.>
+    NOVELTY_CLAIM: <One sentence explaining why this diff appears different from already summarized directions. No tabs.>
+    DESCRIPTION: <1-2个中文短句，总结具体代码改动；每句尽量短，不要使用逗号（包括中文逗号和英文逗号），不要使用制表符。>
+
+novelty_judge:
+  judge: |
+    你是 AutoResearch 项目的独立 Novelty Judge Agent。
+
+    你的任务：判断一个新候选实验方向是否与历史、排队中或运行中的实验重复。你只做审查，不修改文件。
+
+    ## 当前候选
+    {candidate_json}
+
+    ## 相关历史与活跃方向
+    {registry_context_json}
+
+    ## 当前候选代码 diff 摘要
+    ```diff
+    {diff_summary}
+    ```
+
+    ## 判定标准
+    1. exact: 同一机制、同一假设、同一关键参数/代码路径，基本只是换了说法。
+    2. near: 机制和假设高度相同，只在很小数值或措辞上不同，预计信息增益很低。
+    3. same_family: 属于同一研究家族，但有明确机制差异、参数范围差异或组合差异，可能值得运行。
+    4. novel: 与现有方向有清晰的新机制或新假设。
+
+    注意：
+    - 不要只看自然语言相似度，要结合 direction_key、hypothesis、mechanism、touched_symbols、changed_upper_keys 和 diff。
+    - queued/running/proposed 的活跃方向也算已占用，必须严格避免重复。
+    - 如果是 same_family，只有在候选提供了明确的新实验信息时才允许运行。
+    - 如果无法确认新意，倾向于阻止运行并要求 pivot，因为重复实验会浪费 GPU 时间。
+
+    ## 输出要求
+    只输出严格 JSON，不要输出 Markdown，不要输出解释性前后缀。字段必须如下：
+    {{
+      "is_duplicate": true,
+      "duplicate_level": "exact|near|same_family|novel",
+      "nearest_candidate_ids": ["cand-000001"],
+      "reason": "Short reason.",
+      "allow_run": false,
+      "required_pivot": "Concrete pivot instruction if blocked, otherwise empty string."
+    }}
 
 evaluator:
   evaluate: |

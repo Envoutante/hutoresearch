@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import time
@@ -18,7 +19,7 @@ from rich.text import Text
 if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from autorunner.claude_code_agent import ClaudeCodeAgent
+from autorunner.code_agent import BaseCodeAgent, make_code_agent
 from autorunner.env_config import load_dotenv, project_root
 from autorunner.experiment_executor import (
     ExperimentResult,
@@ -37,6 +38,7 @@ CURRENT_STATE_FILE = ARTIFACTS_DIR / "current_state.md"
 RESULTS_TSV_FILE = WORKDIR / "results.tsv"
 BEST_CANDIDATE_FILE = ARTIFACTS_DIR / "best_candidate.json"
 MODEL = os.getenv("AR_MODEL", "deepseek-v4-pro[1m]")
+AGENT_BACKEND = os.getenv("AR_AGENT_BACKEND", "claude")
 console = Console()
 _nvidia_live: Live | None = None
 
@@ -392,28 +394,12 @@ def _build_run_summaries() -> list[str]:
     return summaries
 
 
-def _latest_eval_file() -> Path | None:
-    """返回 artifacts 下最新的 eval-*.json。"""
-    if not ARTIFACTS_DIR.exists():
-        return None
-
-    files = sorted(ARTIFACTS_DIR.glob("eval-*.json"))
-    return files[-1] if files else None
-
-
 def _build_eval_guidance() -> str:
-    """构造给 Generator 的评估上下文读取提示。"""
-    latest_eval = _latest_eval_file()
-    if latest_eval is None:
-        return (
-            "请先读取 autorunner/artifacts/current_state.md（若存在）恢复上下文。"
-            "当前没有 eval-*.json，请基于 results.tsv 与 current_state 制定方向。"
-        )
-
+    """构造给 Generator 的一致历史约束。"""
     return (
-        "请先读取 autorunner/artifacts/current_state.md（若存在）恢复上下文。"
-        f"最新评估文件：autorunner/artifacts/{latest_eval.name}。"
-        "必须重点参考 recommendation.next_action 与 diagnosis，再决定本轮方案。"
+        "历史结果只使用本提示词中的历史运行摘要和额外提示；"
+        "不要读取 results.tsv、autorunner/artifacts、autorunner/candidates、"
+        "current_state.md、eval-*.json 或其它历史文件。"
     )
 
 
@@ -524,39 +510,21 @@ def _append_results_tsv(
 def _extract_description_from_llm_reply(
     reply: str, iteration: int, prefix: str = ""
 ) -> str:
-    """从 LLM 回复中提取 DESCRIPTION 字段，失败时回退到首行文本。"""
+    """从 LLM 回复中提取 DESCRIPTION 同行字段，失败时回退到迭代号。"""
     fallback = f"iter {iteration}"
     if not reply:
         return f"{prefix}{fallback}" if prefix else fallback
 
-    picked = ""
     for raw in reply.splitlines():
         line = raw.strip()
         if not line:
             continue
         upper = line.upper()
         if upper.startswith("DESCRIPTION:"):
-            picked = line.split(":", 1)[1].strip()
-            break
+            picked = line.split(":", 1)[1].strip() or fallback
+            return f"{prefix}{picked}" if prefix else picked
 
-    if not picked:
-        for raw in reply.splitlines():
-            line = raw.strip()
-            if not line or line.startswith("```"):
-                continue
-            picked = line.lstrip("-•* ")
-            if picked:
-                break
-
-    if not picked:
-        picked = fallback
-
-    # 清理 TSV 敏感字符，避免破坏列结构
-    picked = picked.replace("\t", " ").replace("\n", " ").replace("\r", " ")
-    picked = " ".join(picked.split())
-    if prefix:
-        picked = f"{prefix}{picked}"
-    return picked[:160]
+    return f"{prefix}{fallback}" if prefix else fallback
 
 
 def _extract_global_upper_assignments(code: str) -> dict[str, str]:
@@ -590,7 +558,7 @@ def _detect_forbidden_repair_changes(before_code: str, after_code: str) -> list[
 
 def _repair_once_on_failure(
     *,
-    agent: ClaudeCodeAgent,
+    agent: BaseCodeAgent,
     iteration: int,
     max_iterations: int,
     exp_result: ExperimentResult,
@@ -750,7 +718,7 @@ def _repair_once_on_failure(
 
 def _run_evaluator(
     *,
-    agent: ClaudeCodeAgent,
+    agent: BaseCodeAgent,
     iteration: int,
     max_iterations: int,
 ) -> Path | None:
@@ -862,7 +830,11 @@ def run_loop(
         console.print(line)
 
     no_improve_count = 0
-    agent = ClaudeCodeAgent(model=MODEL, timeout_sec=600)
+    agent = make_code_agent(
+        backend=AGENT_BACKEND,
+        model=MODEL if AGENT_BACKEND.strip().lower() == "claude" else None,
+        timeout_sec=600,
+    )
     best_commit, best_bpb_record = _load_best_keep_record()
 
     if topic is None:
