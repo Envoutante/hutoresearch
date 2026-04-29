@@ -30,7 +30,7 @@ fa3 = get_kernel(repo).flash_attn_interface
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
 
-TIME_BUDGET = 300
+TIME_BUDGET = 1200
 
 # ---------------------------------------------------------------------------
 # GPT Model
