@@ -39,6 +39,15 @@ from autorunner.experiment_executor import (
     judge as metric_judge,
     run,
 )
+from autorunner.search_policy import (
+    SearchPlan,
+    complete_plan_from_payload,
+    compute_reward,
+    plan_prompt_payload,
+    search_plan_to_prompt,
+    select_search_plan,
+    validate_search_plan,
+)
 
 PROJECT_ROOT = project_root()
 load_dotenv()
@@ -85,6 +94,14 @@ class CandidateTask:
     touched_symbols: list[str] | None = None
     novelty_claim: str = ""
     changed_upper_keys: list[str] | None = None
+    search_plan_id: str = ""
+    search_mode: str = ""
+    search_operator: str = ""
+    search_parent_id: str = ""
+    target_direction_key: str = ""
+    intent: str = ""
+    rationale: str = ""
+    avoid_direction_keys: list[str] | None = None
 
 
 @dataclass
@@ -227,6 +244,17 @@ def _read_experiment_registry_unlocked() -> list[dict[str, Any]]:
 def _update_registry_entry(candidate_id: str, **updates: Any) -> None:
     if not candidate_id:
         return
+    status = str(updates.get("status") or "").strip()
+    if "reward" not in updates:
+        if status == "blocked_duplicate":
+            updates["reward"] = -0.4
+            updates["reward_source"] = "blocked_duplicate_default"
+        elif status == "generation_failed":
+            updates["reward"] = -0.6
+            updates["reward_source"] = "generation_failed_default"
+        elif status == "aborted":
+            updates["reward"] = -1.0
+            updates["reward_source"] = "aborted_default"
     EXPERIMENT_REGISTRY_FILE.parent.mkdir(parents=True, exist_ok=True)
     with REGISTRY_LOCK:
         items = _read_experiment_registry_unlocked()
@@ -1137,6 +1165,44 @@ def _copy_base_train_to_candidate(base_train: Path, candidate_dir: Path) -> Path
     return target
 
 
+def _complete_search_plan_with_agent(
+    *,
+    agent: BaseCodeAgent,
+    plan: SearchPlan,
+    workdir: Path,
+) -> SearchPlan:
+    payload = plan_prompt_payload(plan)
+    result = agent.complete_search_plan(
+        plan_payload_json=payload,
+        workdir=workdir,
+    )
+    _raise_if_fatal_model_error(result.stderr, result.content)
+    (workdir / "llm_plan.log").write_text(result.content or "")
+    if not result.success:
+        _append_queue_event(
+            "search_plan_completion_failed",
+            {
+                "plan_id": plan.plan_id,
+                "reason": (result.stderr or "plan_agent_failed")[:200],
+            },
+        )
+        return plan
+
+    payload_obj = _parse_json_object(result.content)
+    completed = complete_plan_from_payload(plan, payload_obj)
+    ok, reason = validate_search_plan(completed)
+    if not ok:
+        _append_queue_event(
+            "search_plan_validation_failed",
+            {
+                "plan_id": plan.plan_id,
+                "reason": reason,
+            },
+        )
+        return plan
+    return completed
+
+
 def _create_candidate(
     *,
     candidate_id: str,
@@ -1144,6 +1210,7 @@ def _create_candidate(
     base_train_path: Path,
     run_summaries: list[str],
     topic: str,
+    search_plan: SearchPlan,
     max_duplicate_retries: int = 2,
 ) -> CandidateTask | None:
     candidate_dir = CANDIDATE_ROOT / candidate_id
@@ -1166,6 +1233,7 @@ def _create_candidate(
         generator_guidance = _refresh_generator_guidance(
             exclude_candidate_id=candidate_id,
         )
+        search_plan_text = search_plan_to_prompt(search_plan)
 
         result = agent.refine(
             current_files={"train.py": base_code},
@@ -1174,7 +1242,13 @@ def _create_candidate(
             metric_direction="minimize",
             topic=topic,
             extra_hints=(
-                "你需要产出一个新候选方向。"
+                "你不能自由选择研究方向。"
+                "你必须执行 runner 给出的 SEARCH_PLAN。"
+                "你只负责把该计划落实到 train.py。"
+                "如果认为计划不可行，只能做最接近该计划的最小可运行实现，"
+                "并在 DESCRIPTION 中说明偏差。\n"
+                "## SEARCH_PLAN\n"
+                f"{search_plan_text}\n"
                 "禁止再读取 results.tsv、autorunner/artifacts、autorunner/candidates 或其它历史文件；"
                 "以下 generator_guidance 是 runner 生成的权威建议上下文，"
                 "并且已经包含 best、active、recent、failed 和 blocked_duplicate 方向。"
@@ -1183,6 +1257,9 @@ def _create_candidate(
                 f"{pivot_guidance}"
                 "选定一个方向后立即修改 train.py；py_compile 通过后立刻输出结构化字段，"
                 "不要继续阅读、比较或复核其它文件。\n"
+                "如果 SEARCH_PLAN.search_mode 是 mechanism_search，禁止只调数字常量、"
+                "训练步数、学习率、batch size、dropout、hidden size、head 数或 depth；"
+                "必须改变计算机制或计算路径。\n"
                 f"{forbidden_training_text}\n"
                 f"{forbidden_git_history_text}"
             ),
@@ -1384,6 +1461,15 @@ def _create_candidate(
             "candidate_id": candidate_id,
             "status": "proposed",
             "parent_ref": base_train_path.name,
+            "search_plan_id": search_plan.plan_id,
+            "search_mode": search_plan.search_mode,
+            "search_operator": search_plan.operator,
+            "search_parent_id": search_plan.parent_candidate_id or "",
+            "target_direction_key": search_plan.target_direction_key,
+            "intent": search_plan.intent,
+            "rationale": search_plan.rationale,
+            "avoid_direction_keys": search_plan.avoid_direction_keys,
+            "search_plan": search_plan.to_dict(),
             "direction_key": structured["direction_key"],
             "hypothesis": structured["hypothesis"],
             "mechanism": structured["mechanism"],
@@ -1395,6 +1481,8 @@ def _create_candidate(
             "novelty_judge": None,
             "failure_reason": None,
             "salvaged_from_timeout": salvaged_from_timeout,
+            "reward": None,
+            "reward_source": None,
         }
         proposal_updates = dict(proposal)
         proposal_updates.pop("candidate_id", None)
@@ -1419,6 +1507,14 @@ def _create_candidate(
         allow_run = False
         if judge_result.success and judge_payload is not None:
             allow_run = bool(judge_payload.get("allow_run"))
+            if (
+                search_plan.search_mode == "mechanism_search"
+                and (
+                    bool(judge_payload.get("is_pure_tuning"))
+                    or judge_payload.get("mechanism_changed") is not True
+                )
+            ):
+                allow_run = False
         duplicate_level = (
             str(judge_payload.get("duplicate_level") or "judge_failed")
             if judge_payload
@@ -1451,10 +1547,19 @@ def _create_candidate(
                 touched_symbols=list(structured["touched_symbols"]),
                 novelty_claim=str(structured["novelty_claim"]),
                 changed_upper_keys=changed_keys,
+                search_plan_id=search_plan.plan_id,
+                search_mode=search_plan.search_mode,
+                search_operator=search_plan.operator,
+                search_parent_id=search_plan.parent_candidate_id or "",
+                target_direction_key=search_plan.target_direction_key,
+                intent=search_plan.intent,
+                rationale=search_plan.rationale,
+                avoid_direction_keys=list(search_plan.avoid_direction_keys),
             )
 
             meta_payload = asdict(task)
             meta_payload["novelty_judge"] = judge_payload
+            meta_payload["search_plan"] = search_plan.to_dict()
             (candidate_dir / "meta.json").write_text(
                 json.dumps(meta_payload, indent=2, ensure_ascii=False, default=str)
             )
@@ -1463,6 +1568,9 @@ def _create_candidate(
                 candidate_id,
                 status="queued",
                 novelty_judge=judge_payload,
+                failure_reason=None,
+                reward=None,
+                reward_source=None,
             )
             _refresh_generator_guidance()
             _append_queue_event(
@@ -1471,6 +1579,9 @@ def _create_candidate(
                     "candidate_id": candidate_id,
                     "description": desc,
                     "direction_key": structured["direction_key"],
+                    "search_plan_id": search_plan.plan_id,
+                    "search_mode": search_plan.search_mode,
+                    "search_operator": search_plan.operator,
                     "changed_upper_keys": changed_keys,
                     "novelty_level": duplicate_level,
                 },
@@ -1485,6 +1596,9 @@ def _create_candidate(
                 "allow_run": False,
                 "duplicate_level": duplicate_level,
                 "reason": reason,
+                "innovation_type": search_plan.search_mode,
+                "is_pure_tuning": None,
+                "mechanism_changed": None,
             },
         )
         _refresh_generator_guidance()
@@ -1909,12 +2023,74 @@ def run_parallel_loop(
                         with candidate_id_lock:
                             candidate_id = f"cand-{next_candidate_num:06d}"
                             next_candidate_num += 1
+                        registry_items = _load_experiment_registry()
+                        search_plan = select_search_plan(
+                            candidate_id=candidate_id,
+                            registry_items=registry_items,
+                            parent_ref=BEST_TRAIN_FILE.name,
+                            parent_candidate_id=None,
+                        )
                         _update_registry_entry(
                             candidate_id,
                             status="proposed",
                             parent_ref=BEST_TRAIN_FILE.name,
                             description=f"{candidate_id} generation in progress",
                             direction_key="generation.in_progress",
+                            search_plan_id=search_plan.plan_id,
+                            search_mode=search_plan.search_mode,
+                            search_operator=search_plan.operator,
+                            target_direction_key=search_plan.target_direction_key,
+                            intent=search_plan.intent,
+                            rationale=search_plan.rationale,
+                            avoid_direction_keys=search_plan.avoid_direction_keys,
+                            search_plan=search_plan.to_dict(),
+                        )
+                        candidate_dir = CANDIDATE_ROOT / candidate_id
+                        candidate_dir.mkdir(parents=True, exist_ok=True)
+                        try:
+                            search_plan = _complete_search_plan_with_agent(
+                                agent=agent,
+                                plan=search_plan,
+                                workdir=candidate_dir,
+                            )
+                        except FatalModelAPIError:
+                            _trigger_fatal_abort(source="plan_agent")
+                            continue
+                        except Exception as exc:
+                            _append_queue_event(
+                                "search_plan_completion_exception",
+                                {
+                                    "candidate_id": candidate_id,
+                                    "error": f"{type(exc).__name__}: {exc}"[:300],
+                                },
+                            )
+                        ok, reason = validate_search_plan(search_plan)
+                        if not ok:
+                            _update_registry_entry(
+                                candidate_id,
+                                status="generation_failed",
+                                failure_reason=f"invalid_search_plan:{reason}"[:200],
+                            )
+                            _append_queue_event(
+                                "candidate_generation_failed",
+                                {
+                                    "candidate_id": candidate_id,
+                                    "reason": f"invalid_search_plan:{reason}"[:200],
+                                },
+                            )
+                            continue
+                        _update_registry_entry(
+                            candidate_id,
+                            search_plan_id=search_plan.plan_id,
+                            search_mode=search_plan.search_mode,
+                            search_operator=search_plan.operator,
+                            target_direction_key=search_plan.target_direction_key,
+                            intent=search_plan.intent,
+                            rationale=search_plan.rationale,
+                            avoid_direction_keys=search_plan.avoid_direction_keys,
+                            search_plan=search_plan.to_dict(),
+                            reward=None,
+                            reward_source=None,
                         )
                         with state_lock:
                             run_summaries = _build_run_summaries()
@@ -1925,6 +2101,7 @@ def run_parallel_loop(
                                 base_train_path=BEST_TRAIN_FILE,
                                 run_summaries=run_summaries,
                                 topic=topic,
+                                search_plan=search_plan,
                             )
                             generating_futures.add(fut)
 
@@ -2252,10 +2429,24 @@ def run_parallel_loop(
                         )
                         final_status = "discard"
 
+                    reward, reward_source = compute_reward(
+                        baseline_before=baseline_before,
+                        val_bpb=exp_result.val_bpb,
+                        final_status=final_status,
+                        run_status=exp_result.status,
+                        discard_reason=discard_reason,
+                    )
                     _update_registry_entry(
                         task.candidate_id,
                         status=final_status,
                         description=task.final_description or task.refine_description,
+                        reward=round(reward, 6),
+                        reward_source=reward_source,
+                        parent_val_bpb=(
+                            baseline_before
+                            if math.isfinite(baseline_before)
+                            else None
+                        ),
                         result={
                             "run_status": exp_result.status,
                             "decision": decision,

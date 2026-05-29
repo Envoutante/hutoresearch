@@ -1510,6 +1510,18 @@ class BaseCodeAgent:
             diff_summary=diff_summary,
         )
 
+    def _plan_prompt(
+        self,
+        *,
+        plan_payload_json: str,
+    ) -> str:
+        """生成 SearchPlan 语义补全提示词。"""
+        return self._render_prompt(
+            "plan_agent",
+            "complete",
+            plan_payload_json=plan_payload_json,
+        )
+
     def generate(
         self,
         *,
@@ -1670,6 +1682,25 @@ class BaseCodeAgent:
             workdir,
             timeout_sec or min(self._timeout_sec, 240),
             render_title="Novelty Judge",
+            transient_output=True,
+        )
+        return self._build_result(workdir, rc, stdout, stderr, elapsed, to)
+
+    def complete_search_plan(
+        self,
+        *,
+        plan_payload_json: str,
+        workdir: Path,
+        timeout_sec: int | None = None,
+    ) -> CodeAgentResult:
+        """让 plan agent 在硬约束内补全 intent/rationale 等语义字段。"""
+        prompt = self._plan_prompt(plan_payload_json=plan_payload_json)
+        cmd = self._build_cmd(prompt, workdir, allowed_tools="Read")
+        rc, stdout, stderr, elapsed, to = self._run_subprocess(
+            cmd,
+            workdir,
+            timeout_sec or min(self._timeout_sec, 120),
+            render_title="Plan Agent",
             transient_output=True,
         )
         return self._build_result(workdir, rc, stdout, stderr, elapsed, to)

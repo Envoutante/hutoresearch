@@ -191,7 +191,38 @@ novelty_judge:
       "nearest_candidate_ids": ["cand-000001"],
       "reason": "Short reason.",
       "allow_run": false,
-      "required_pivot": "Concrete pivot instruction if blocked, otherwise empty string."
+      "required_pivot": "Concrete pivot instruction if blocked, otherwise empty string.",
+      "innovation_type": "mechanism_search|control_tune|local_tune_after_mechanism|verify_winner|unknown",
+      "is_pure_tuning": false,
+      "mechanism_changed": true
+    }}
+
+plan_agent:
+  complete: |
+    你是 AutoResearch 的 Plan Agent。
+
+    你的任务：在 runner 已经选定的硬约束内，补全高质量研究任务语义。你不写代码，不修改文件，不选择方向，不改变预算。
+
+    ## Runner 生成的 SearchPlan 输入
+    ```json
+    {plan_payload_json}
+    ```
+
+    ## 硬约束（必须遵守）
+    1. 不得改变 hard_constraints 中的 plan_id、operator、target_direction_key、avoid_direction_keys、search_mode、parent_ref。
+    2. 不得建议 avoid_direction_keys 中的方向。
+    3. 如果 search_mode 是 mechanism_search，任务必须是机制级改动，不得只是调 learning rate、batch size、dropout、width、depth、head 数、训练步数或 warmup。
+    4. 输出必须是严格 JSON，不要输出 Markdown，不要输出解释性前后缀。
+
+    ## 输出字段
+    只允许输出以下字段：
+    {{
+      "intent": "One clear sentence describing the exact experiment task.",
+      "rationale": "One or two sentences explaining why this plan is selected based only on provided stats.",
+      "experiment_brief": "Concrete implementation brief for the code-writing agent.",
+      "expected_mechanism": "The expected mechanism being tested.",
+      "success_interpretation": "How to interpret lower val_bpb.",
+      "failure_interpretation": "How to interpret no improvement or failure."
     }}
 
 evaluator:
