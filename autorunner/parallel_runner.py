@@ -30,10 +30,6 @@ if __name__ == "__main__":
 
 from autorunner.code_agent import BaseCodeAgent, make_code_agent
 from autorunner.env_config import load_dotenv, project_root
-from autorunner.embedding import (
-    DEFAULT_SIMILARITY_THRESHOLD,
-    DescriptionEmbeddingIndex,
-)
 from autorunner.experiment_executor import (
     ExperimentResult,
     analyze_failure,
@@ -1635,10 +1631,6 @@ def run_parallel_loop(
     executor = ThreadPoolExecutor(max_workers=max_running)
     generator_workers = max(1, min(queue_capacity, low_watermark))
     generator_executor = ThreadPoolExecutor(max_workers=generator_workers)
-    failure_semantic_index = DescriptionEmbeddingIndex.from_failure_file(
-        FAILURE_DIRECTIONS_FILE,
-        similarity_threshold=DEFAULT_SIMILARITY_THRESHOLD,
-    )
     failure_reason_counts: dict[str, int] = {}
     repair_stats = {"start": 0, "success": 0, "failed": 0, "out_of_scope": 0}
     last_no_gpu_event_ts = 0.0
@@ -1997,12 +1989,6 @@ def run_parallel_loop(
                         _append_failure_direction(
                             description=task.refine_description,
                             reason=discard_reason,
-                        )
-                        failure_semantic_index.add_item(
-                            {
-                                "description": task.refine_description,
-                                "reason": discard_reason,
-                            }
                         )
                         with state_lock:
                             failure_reason_counts[discard_reason] = (
