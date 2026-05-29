@@ -8,7 +8,9 @@ import json
 import math
 import os
 import py_compile
+import re
 import shutil
+import smtplib
 import subprocess
 import sys
 import threading
@@ -16,8 +18,9 @@ import time
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass
+from email.message import EmailMessage
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from rich.console import Console, Group
 from rich.live import Live
@@ -56,6 +59,8 @@ REGISTRY_LOCK = threading.Lock()
 GENERATOR_GUIDANCE_LOCK = threading.Lock()
 ACTIVE_REGISTRY_STALE_SEC = int(os.getenv("AR_REGISTRY_ACTIVE_STALE_SEC", "1800"))
 
+FATAL_STOP_REASON = "fatal_model_api_error"
+
 
 @dataclass
 class CandidateTask:
@@ -82,6 +87,88 @@ class CandidateTask:
 class RunningTask:
     task: CandidateTask
     future: Future[ExperimentResult]
+
+
+class FatalModelAPIError(RuntimeError):
+    """模型 API 出现致命错误时，用于触发全局熔断。"""
+
+
+def _has_fatal_model_error(*texts: str) -> bool:
+    merged = "\n".join(str(x or "") for x in texts if x).strip()
+    if not merged:
+        return False
+
+    lower = merged.lower()
+    for line in lower.splitlines():
+        if "status" not in line and "http" not in line and "error" not in line:
+            continue
+        if re.search(r"\b(?:4\d{2}|5\d{2})\b", line):
+            return True
+    return False
+
+
+def _raise_if_fatal_model_error(*texts: str) -> None:
+    if _has_fatal_model_error(*texts):
+        raise FatalModelAPIError(FATAL_STOP_REASON)
+
+
+def _send_qq_alert_email(subject: str, body: str) -> tuple[bool, str]:
+    enabled_raw = os.getenv("AR_ALERT_ENABLE", "1").strip().lower()
+    if enabled_raw in {"0", "false", "no", "off"}:
+        return False, "alert_disabled"
+
+    host = os.getenv("AR_ALERT_SMTP_HOST", "smtp.qq.com").strip()
+    port_text = os.getenv("AR_ALERT_SMTP_PORT", "465").strip()
+    user = os.getenv("AR_ALERT_SMTP_USER", "").strip()
+    password = os.getenv("AR_ALERT_SMTP_PASS", "").strip()
+    sender = os.getenv("AR_ALERT_FROM", user).strip()
+    recipient = os.getenv("AR_ALERT_TO", user).strip()
+    use_ssl = os.getenv("AR_ALERT_USE_SSL", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+    use_starttls = os.getenv("AR_ALERT_STARTTLS", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+    if not host:
+        return False, "smtp_host_missing"
+    if not user or not password or not recipient:
+        return False, "smtp_credentials_or_recipient_missing"
+
+    try:
+        port = int(port_text)
+    except ValueError:
+        return False, f"invalid_smtp_port={port_text}"
+
+    msg = EmailMessage()
+    msg["From"] = sender
+    msg["To"] = recipient
+    msg["Subject"] = subject
+    msg.set_content(body)
+
+    try:
+        if use_ssl:
+            with smtplib.SMTP_SSL(host, port, timeout=20) as smtp:
+                smtp.login(user, password)
+                smtp.send_message(msg)
+        else:
+            with smtplib.SMTP(host, port, timeout=20) as smtp:
+                smtp.ehlo()
+                if use_starttls:
+                    smtp.starttls()
+                    smtp.ehlo()
+                smtp.login(user, password)
+                smtp.send_message(msg)
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+
+    return True, "sent"
 
 
 def _now_iso() -> str:
@@ -155,7 +242,9 @@ def _update_registry_entry(candidate_id: str, **updates: Any) -> None:
         tmp_path = EXPERIMENT_REGISTRY_FILE.with_suffix(".jsonl.tmp")
         with tmp_path.open("w", encoding="utf-8") as f:
             for item in items:
-                f.write(json.dumps(item, ensure_ascii=False, default=_json_default) + "\n")
+                f.write(
+                    json.dumps(item, ensure_ascii=False, default=_json_default) + "\n"
+                )
         tmp_path.replace(EXPERIMENT_REGISTRY_FILE)
 
 
@@ -554,7 +643,11 @@ def _select_judge_context(
         seen = {str(x.get("candidate_id") or "") for x in cards}
         for item in reversed(registry_items):
             cid = str(item.get("candidate_id") or "")
-            if not cid or cid in seen or cid == str(candidate.get("candidate_id") or ""):
+            if (
+                not cid
+                or cid in seen
+                or cid == str(candidate.get("candidate_id") or "")
+            ):
                 continue
             cards.append(_registry_card(item))
             seen.add(cid)
@@ -1091,6 +1184,7 @@ def _create_candidate(
             ),
             workdir=candidate_dir,
         )
+        _raise_if_fatal_model_error(result.stderr, result.content)
 
         (candidate_dir / f"llm_refine_attempt_{attempt}.log").write_text(
             result.content or ""
@@ -1127,7 +1221,9 @@ def _create_candidate(
         salvaged_from_timeout = False
 
         if not result.success:
-            failure_reason = "generator_timeout" if result.timed_out else "generator_failed"
+            failure_reason = (
+                "generator_timeout" if result.timed_out else "generator_failed"
+            )
             code_changed = bool(new_code and new_code != base_code.strip())
             if result.timed_out and code_changed:
                 candidate_train.write_text(new_code)
@@ -1138,6 +1234,10 @@ def _create_candidate(
                         candidate_id=candidate_id,
                         diff_summary=diff_summary,
                         workdir=candidate_dir,
+                    )
+                    _raise_if_fatal_model_error(
+                        summary_result.stderr,
+                        summary_result.content,
                     )
                     (candidate_dir / f"llm_summarize_attempt_{attempt}.log").write_text(
                         summary_result.content or ""
@@ -1233,6 +1333,10 @@ def _create_candidate(
                 diff_summary=diff_summary,
                 workdir=candidate_dir,
             )
+            _raise_if_fatal_model_error(
+                summary_result.stderr,
+                summary_result.content,
+            )
             (candidate_dir / f"llm_summarize_attempt_{attempt}.log").write_text(
                 summary_result.content or ""
             )
@@ -1302,6 +1406,7 @@ def _create_candidate(
             diff_summary=diff_summary,
             workdir=candidate_dir,
         )
+        _raise_if_fatal_model_error(judge_result.stderr, judge_result.content)
         (candidate_dir / f"llm_novelty_judge_attempt_{attempt}.log").write_text(
             judge_result.content or ""
         )
@@ -1428,6 +1533,7 @@ def _run_one_candidate(
     task: CandidateTask,
     gpu_id: int,
     time_budget: int,
+    on_process_started: Callable[[int], None] | None = None,
 ) -> ExperimentResult:
     def _runtime_env_for_gpu(gid: int) -> dict[str, str]:
         existing_pythonpath = os.environ.get("PYTHONPATH", "").strip()
@@ -1443,6 +1549,7 @@ def _run_one_candidate(
         train_py_path=task.train_py_path,
         time_budget=time_budget,
         run_log_path=task.workdir / "run.log",
+        on_process_started=on_process_started,
         env_overrides=_runtime_env_for_gpu(gpu_id),
     )
     return result
@@ -1501,6 +1608,7 @@ def _repair_candidate_if_needed(
             refine_description=task.refine_description,
             workdir=task.workdir,
         )
+        _raise_if_fatal_model_error(repair_result.stderr, repair_result.content)
 
         (task.workdir / f"llm_repair_{attempt}.log").write_text(
             repair_result.content or ""
@@ -1639,6 +1747,9 @@ def run_parallel_loop(
     state_lock = threading.Lock()
     candidate_id_lock = threading.Lock()
     next_candidate_num = _next_candidate_number()
+    fatal_error_message: str | None = None
+    fatal_alert_result: str = "not_sent"
+    running_process_pids: dict[str, int] = {}
 
     try:
         with Live(
@@ -1661,6 +1772,72 @@ def run_parallel_loop(
             transient=False,
         ) as live:
             stop_refresh = threading.Event()
+
+            def _trigger_fatal_abort(*, source: str) -> None:
+                nonlocal fatal_error_message, fatal_alert_result
+                if fatal_error_message:
+                    return
+
+                fatal_error_message = FATAL_STOP_REASON
+                stop_refresh.set()
+
+                with state_lock:
+                    queued_ids = [x.candidate_id for x in queued]
+                    queued.clear()
+                    running_items = list(running.items())
+                    pending_generation = list(generating_futures)
+
+                for fut in pending_generation:
+                    fut.cancel()
+
+                aborted_ids = queued_ids
+                for cid in aborted_ids:
+                    _update_registry_entry(
+                        cid,
+                        status="aborted",
+                        failure_reason=FATAL_STOP_REASON,
+                        fatal_error=fatal_error_message,
+                    )
+
+                _append_queue_event(
+                    "fatal_abort_triggered",
+                    {
+                        "source": source,
+                        "aborted_candidates": aborted_ids[:50],
+                        "running_untouched": [cid for cid, _ in running_items][:50],
+                    },
+                )
+
+                alert_subject = "[AutoResearch] 实验已熔断停止：检测到模型API错误码"
+                alert_body = (
+                    f"time: {_now_iso()}\n"
+                    f"model: {MODEL}\n"
+                    f"backend: {AGENT_BACKEND}\n"
+                    f"source: {source}\n"
+                    f"aborted_queued_candidates: {len(aborted_ids)}\n"
+                    f"running_left_untouched: {len(running_items)}\n"
+                    f"workdir: {WORKDIR}\n"
+                )
+                sent, msg = _send_qq_alert_email(alert_subject, alert_body)
+                fatal_alert_result = f"{'sent' if sent else 'failed'}: {msg}"[:300]
+                _append_queue_event(
+                    "fatal_alert_email",
+                    {
+                        "sent": sent,
+                        "message": msg[:200],
+                    },
+                )
+
+                fatal_payload = {
+                    "ts": _now_iso(),
+                    "reason": fatal_error_message,
+                    "alert": fatal_alert_result,
+                    "aborted_count": len(aborted_ids),
+                }
+                (ARTIFACTS_DIR / "fatal_stop.json").write_text(
+                    json.dumps(fatal_payload, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
 
             def _snapshot_for_dashboard() -> tuple[
                 int,
@@ -1708,10 +1885,17 @@ def run_parallel_loop(
                         generating_len = len(generating_futures)
                         active_or_queued = queued_len + running_len + generating_len
                         remaining = max_total_runs - (completed_runs + active_or_queued)
-                        if remaining > 0 and queued_len + generating_len < low_watermark:
+                        if (
+                            remaining > 0
+                            and queued_len + generating_len < low_watermark
+                        ):
                             fill_target = low_watermark - (queued_len + generating_len)
-                            capacity_left = queue_capacity - (queued_len + generating_len)
-                            to_submit = max(0, min(fill_target, capacity_left, remaining))
+                            capacity_left = queue_capacity - (
+                                queued_len + generating_len
+                            )
+                            to_submit = max(
+                                0, min(fill_target, capacity_left, remaining)
+                            )
 
                     for _ in range(to_submit):
                         with candidate_id_lock:
@@ -1744,18 +1928,25 @@ def run_parallel_loop(
                 while not stop_refresh.is_set():
                     queued_len = 0
                     with state_lock:
-                        queued_len = len(queued)
-                        running_len = len(running)
-                        occupied = {
-                            rt.task.gpu_id
-                            for rt in running.values()
-                            if rt.task.gpu_id is not None
-                        }
-                        can_dispatch = (
-                            queued_len > 0
-                            and running_len < max_running
-                            and completed_runs + running_len < max_total_runs
-                        )
+                        if fatal_error_message is not None:
+                            can_dispatch = False
+                            queued_len = len(queued)
+                            running_len = len(running)
+                            occupied = set()
+
+                        else:
+                            queued_len = len(queued)
+                            running_len = len(running)
+                            occupied = {
+                                rt.task.gpu_id
+                                for rt in running.values()
+                                if rt.task.gpu_id is not None
+                            }
+                            can_dispatch = (
+                                queued_len > 0
+                                and running_len < max_running
+                                and completed_runs + running_len < max_total_runs
+                            )
 
                     if not can_dispatch:
                         stop_refresh.wait(interval)
@@ -1784,11 +1975,7 @@ def run_parallel_loop(
                                 )
                                 last_no_gpu_event_ts = now_ts
 
-                    if (
-                        queued_len > 0
-                        and not free_gpu_ids
-                        and dispatch_stall_sec > 0
-                    ):
+                    if queued_len > 0 and not free_gpu_ids and dispatch_stall_sec > 0:
                         with state_lock:
                             oldest_wait = (
                                 time.time() - min(x.queued_at for x in queued)
@@ -1819,13 +2006,23 @@ def run_parallel_loop(
                             task.status = "running"
                             task.gpu_id = gpu_id
                             task.launch_ts = time.time()
+
+                            def _on_process_started(
+                                pid: int, candidate_id: str = task.candidate_id
+                            ) -> None:
+                                with state_lock:
+                                    running_process_pids[candidate_id] = pid
+
                             fut = executor.submit(
                                 _run_one_candidate,
                                 task=task,
                                 gpu_id=gpu_id,
                                 time_budget=time_budget,
+                                on_process_started=_on_process_started,
                             )
-                            running[task.candidate_id] = RunningTask(task=task, future=fut)
+                            running[task.candidate_id] = RunningTask(
+                                task=task, future=fut
+                            )
                             _update_registry_entry(
                                 task.candidate_id,
                                 status="running",
@@ -1887,7 +2084,18 @@ def run_parallel_loop(
                             completed_gen.append(fut)
                             generating_futures.remove(fut)
                 for fut in completed_gen:
-                    task = fut.result()
+                    try:
+                        task = fut.result()
+                    except FatalModelAPIError as exc:
+                        _ = exc
+                        _trigger_fatal_abort(source="generator")
+                        task = None
+                    except Exception as exc:
+                        _append_queue_event(
+                            "candidate_generation_exception",
+                            {"error": f"{type(exc).__name__}: {exc}"[:300]},
+                        )
+                        task = None
                     if task is not None:
                         with state_lock:
                             queued.append(task)
@@ -1901,39 +2109,69 @@ def run_parallel_loop(
                     if not rt.future.done():
                         continue
 
-                    exp_result = rt.future.result()
+                    try:
+                        exp_result = rt.future.result()
+                    except FatalModelAPIError as exc:
+                        _ = exc
+                        _trigger_fatal_abort(source="runner")
+                        finished_ids.append(cid)
+                        continue
+                    except Exception as exc:
+                        _append_queue_event(
+                            "candidate_run_exception",
+                            {
+                                "candidate_id": cid,
+                                "error": f"{type(exc).__name__}: {exc}"[:300],
+                            },
+                        )
+                        finished_ids.append(cid)
+                        continue
+
                     task = rt.task
                     finished_ids.append(cid)
                     with state_lock:
                         completed_runs += 1
 
                     task.status = "repairing"
-                    try:
-                        (
-                            exp_result,
-                            repaired,
-                            final_desc,
-                            repair_status,
-                            repair_attempts,
-                        ) = _repair_candidate_if_needed(
-                            agent=agent,
-                            task=task,
-                            initial_result=exp_result,
-                            gpu_id=task.gpu_id if task.gpu_id is not None else 0,
-                            time_budget=time_budget,
-                        )
-                    except Exception as exc:
+                    if fatal_error_message is not None:
                         repaired = False
                         final_desc = task.refine_description
-                        repair_status = "failed"
+                        repair_status = "not_needed"
                         repair_attempts = 0
-                        _append_queue_event(
-                            "candidate_repair_exception",
-                            {
-                                "candidate_id": task.candidate_id,
-                                "error": f"{type(exc).__name__}: {exc}"[:300],
-                            },
-                        )
+                    else:
+                        try:
+                            (
+                                exp_result,
+                                repaired,
+                                final_desc,
+                                repair_status,
+                                repair_attempts,
+                            ) = _repair_candidate_if_needed(
+                                agent=agent,
+                                task=task,
+                                initial_result=exp_result,
+                                gpu_id=task.gpu_id if task.gpu_id is not None else 0,
+                                time_budget=time_budget,
+                            )
+                        except FatalModelAPIError as exc:
+                            _ = exc
+                            _trigger_fatal_abort(source="repair")
+                            repaired = False
+                            final_desc = task.refine_description
+                            repair_status = "failed"
+                            repair_attempts = 0
+                        except Exception as exc:
+                            repaired = False
+                            final_desc = task.refine_description
+                            repair_status = "failed"
+                            repair_attempts = 0
+                            _append_queue_event(
+                                "candidate_repair_exception",
+                                {
+                                    "candidate_id": task.candidate_id,
+                                    "error": f"{type(exc).__name__}: {exc}"[:300],
+                                },
+                            )
                     task.status = "running"
                     task.final_description = final_desc
                     with state_lock:
@@ -2045,10 +2283,11 @@ def run_parallel_loop(
                 with state_lock:
                     for cid in finished_ids:
                         running.pop(cid, None)
+                        running_process_pids.pop(cid, None)
 
                 # 3) 终止条件
                 with state_lock:
-                    should_stop = (
+                    should_stop = (fatal_error_message is not None and not running) or (
                         completed_runs >= max_total_runs
                         and not running
                         and not queued
@@ -2071,6 +2310,11 @@ def run_parallel_loop(
         f"[runner] finished completed_runs={completed_runs} "
         f"best_val_bpb={baseline_bpb if baseline_bpb != float('inf') else 'inf'}"
     )
+    if fatal_error_message is not None:
+        console.print(
+            "[runner] fatal abort triggered "
+            f"reason={fatal_error_message} alert={fatal_alert_result}"
+        )
 
 
 if __name__ == "__main__":

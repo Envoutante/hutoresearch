@@ -47,6 +47,15 @@ Supported keys:
 
 - `AR_MODEL`: model name used by `autorunner/runner.py`
 - `AR_WORKDIR`: workspace root path used by the runner
+- `AR_ALERT_ENABLE`: whether fatal error email alert is enabled (`1`/`0`, default `1`)
+- `AR_ALERT_SMTP_HOST`: SMTP host (QQ mail typically `smtp.qq.com`)
+- `AR_ALERT_SMTP_PORT`: SMTP port (QQ SSL typically `465`)
+- `AR_ALERT_SMTP_USER`: SMTP account (usually your QQ mailbox)
+- `AR_ALERT_SMTP_PASS`: SMTP password or QQ SMTP auth code
+- `AR_ALERT_FROM`: sender email (optional, default `AR_ALERT_SMTP_USER`)
+- `AR_ALERT_TO`: receiver email (optional, default `AR_ALERT_SMTP_USER`)
+- `AR_ALERT_USE_SSL`: use SMTP SSL (`1`/`0`, default `1`)
+- `AR_ALERT_STARTTLS`: use STARTTLS when SSL is off (`1`/`0`, default `1`)
 
 Example:
 
