@@ -68,6 +68,13 @@ def _read_registry(path: Path) -> list[dict[str, Any]]:
     return [merged[cid] for cid in ordered_ids]
 
 
+def _first_existing_path(*paths: Path) -> Path:
+    for path in paths:
+        if path.exists():
+            return path
+    return paths[0]
+
+
 def _to_float(value: Any) -> float | None:
     try:
         num = float(value)
@@ -563,8 +570,15 @@ def build_search_tree(
     workdir: Path,
 ) -> dict[str, Any]:
     artifacts_dir = workdir / "autorunner" / "artifacts"
-    registry_file = artifacts_dir / "experiment_registry.jsonl"
-    queue_events_file = artifacts_dir / "parallel_queue.jsonl"
+    state_dir = artifacts_dir / "state"
+    registry_file = _first_existing_path(
+        state_dir / "experiment_registry.jsonl",
+        artifacts_dir / "experiment_registry.jsonl",
+    )
+    queue_events_file = _first_existing_path(
+        state_dir / "parallel_queue.jsonl",
+        artifacts_dir / "parallel_queue.jsonl",
+    )
     results_file = workdir / "results.tsv"
 
     registry_items = _read_registry(registry_file)
@@ -1094,7 +1108,8 @@ def export_search_tree(
     root = workdir or Path(os.getenv("AR_WORKDIR", str(project_root()))).expanduser()
     root = root.resolve()
     tree = build_demo_search_tree(workdir=root) if demo else build_search_tree(workdir=root)
-    out = output_path or (root / "autorunner" / "artifacts" / "search_tree.json")
+    tree_dir = root / "autorunner" / "artifacts" / "tree"
+    out = output_path or (tree_dir / ("search_tree_demo.json" if demo else "search_tree.json"))
     out.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = out.with_suffix(out.suffix + ".tmp")
     tmp_path.write_text(
@@ -1121,7 +1136,7 @@ def main(argv: list[str] | None = None) -> int:
         "--output",
         type=Path,
         default=None,
-        help="Output JSON path. Defaults to autorunner/artifacts/search_tree.json.",
+        help="Output JSON path. Defaults to autorunner/artifacts/tree/search_tree.json.",
     )
     parser.add_argument(
         "--html-output",

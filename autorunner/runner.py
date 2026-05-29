@@ -47,11 +47,15 @@ WORKDIR = Path(os.getenv("AR_WORKDIR", str(PROJECT_ROOT))).expanduser()
 ARTIFACTS_DIR = WORKDIR / "autorunner" / "artifacts"
 CANDIDATE_ROOT = WORKDIR / "autorunner" / "candidates"
 RESULTS_TSV_FILE = WORKDIR / "results.tsv"
-FAILURE_DIRECTIONS_FILE = ARTIFACTS_DIR / "failure_directions.json"
-EXPERIMENT_REGISTRY_FILE = ARTIFACTS_DIR / "experiment_registry.jsonl"
-GENERATOR_GUIDANCE_FILE = ARTIFACTS_DIR / "generator_guidance.md"
-QUEUE_EVENTS_FILE = ARTIFACTS_DIR / "parallel_queue.jsonl"
-BEST_TRAIN_FILE = ARTIFACTS_DIR / "best_train.py"
+STATE_DIR = ARTIFACTS_DIR / "state"
+GUIDANCE_DIR = ARTIFACTS_DIR / "guidance"
+SNAPSHOTS_DIR = ARTIFACTS_DIR / "snapshots"
+ALERTS_DIR = ARTIFACTS_DIR / "alerts"
+FAILURE_DIRECTIONS_FILE = STATE_DIR / "failure_directions.json"
+EXPERIMENT_REGISTRY_FILE = STATE_DIR / "experiment_registry.jsonl"
+GENERATOR_GUIDANCE_FILE = GUIDANCE_DIR / "generator_guidance.md"
+QUEUE_EVENTS_FILE = STATE_DIR / "parallel_queue.jsonl"
+BEST_TRAIN_FILE = SNAPSHOTS_DIR / "best_train.py"
 MODEL = os.getenv("AR_MODEL", "deepseek-v4-pro[1m]")
 AGENT_BACKEND = os.getenv("AR_AGENT_BACKEND", "claude")
 console = Console()
@@ -176,7 +180,7 @@ def _now_iso() -> str:
 
 
 def _append_queue_event(event_type: str, payload: dict):
-    ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+    QUEUE_EVENTS_FILE.parent.mkdir(parents=True, exist_ok=True)
     entry = {
         "ts": _now_iso(),
         "event": event_type,
@@ -223,7 +227,7 @@ def _read_experiment_registry_unlocked() -> list[dict[str, Any]]:
 def _update_registry_entry(candidate_id: str, **updates: Any) -> None:
     if not candidate_id:
         return
-    ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+    EXPERIMENT_REGISTRY_FILE.parent.mkdir(parents=True, exist_ok=True)
     with REGISTRY_LOCK:
         items = _read_experiment_registry_unlocked()
         now = _now_iso()
@@ -580,7 +584,7 @@ def _build_generator_guidance_text(
 
 
 def _refresh_generator_guidance(*, exclude_candidate_id: str = "") -> str:
-    ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+    GENERATOR_GUIDANCE_FILE.parent.mkdir(parents=True, exist_ok=True)
     with GENERATOR_GUIDANCE_LOCK:
         text = _build_generator_guidance_text(
             registry_items=_load_experiment_registry(),
@@ -994,7 +998,7 @@ def _append_failure_direction(
     description: str,
     reason: str,
 ):
-    ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+    FAILURE_DIRECTIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
     data = {"items": []}
     if FAILURE_DIRECTIONS_FILE.exists():
         try:
@@ -1717,6 +1721,10 @@ def run_parallel_loop(
     poll_interval_sec: float,
 ):
     ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    GUIDANCE_DIR.mkdir(parents=True, exist_ok=True)
+    SNAPSHOTS_DIR.mkdir(parents=True, exist_ok=True)
+    ALERTS_DIR.mkdir(parents=True, exist_ok=True)
     CANDIDATE_ROOT.mkdir(parents=True, exist_ok=True)
     _mark_stale_active_registry_entries()
     _refresh_generator_guidance()
@@ -1834,7 +1842,7 @@ def run_parallel_loop(
                     "alert": fatal_alert_result,
                     "aborted_count": len(aborted_ids),
                 }
-                (ARTIFACTS_DIR / "fatal_stop.json").write_text(
+                (ALERTS_DIR / "fatal_stop.json").write_text(
                     json.dumps(fatal_payload, ensure_ascii=False, indent=2),
                     encoding="utf-8",
                 )
