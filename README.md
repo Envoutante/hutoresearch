@@ -45,8 +45,8 @@ You can configure runner defaults with a local `autorunner/.env` file (copy from
 
 Supported keys:
 
-- `AR_MODEL`: model name used by `autorunner/loop_runner.py` and `autorunner/parallel_runner.py`
-- `AR_WORKDIR`: workspace root path used by runners
+- `AR_MODEL`: model name used by `autorunner/runner.py`
+- `AR_WORKDIR`: workspace root path used by the runner
 
 Example:
 

@@ -1,4 +1,4 @@
-"""parallel_runner: 并行候选生成与实验调度（第一版，单文件实现）"""
+"""runner: 并行候选生成与实验调度。"""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
 
-# 支持直接运行: python autorunner/parallel_runner.py
+# 支持直接运行: python autorunner/runner.py
 if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -2068,7 +2068,7 @@ def run_parallel_loop(
         executor.shutdown(wait=True)
 
     console.print(
-        f"[parallel_runner] finished completed_runs={completed_runs} "
+        f"[runner] finished completed_runs={completed_runs} "
         f"best_val_bpb={baseline_bpb if baseline_bpb != float('inf') else 'inf'}"
     )
 
