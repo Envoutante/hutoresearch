@@ -39,6 +39,7 @@ OPERATOR_LABELS_ZH = {
     "explore_new_mechanism": "探索新机制",
     "exploit_best_mechanism": "强化有效机制",
     "near_miss_refine": "近失点微调",
+    "local_param_tune": "局部参数搜索",
     "pivot_near_miss": "近似失败转向",
     "avoid_failed_family": "避开失败族",
     "control_tune": "控制调参",
@@ -473,6 +474,11 @@ def _build_raw_nodes(
             ),
             "lineage_relation_type": item.get("lineage_relation_type") or "",
             "lineage_inferred": bool(item.get("lineage_inferred")),
+            "tuning_plan": (
+                item.get("tuning_plan")
+                if isinstance(item.get("tuning_plan"), dict)
+                else {}
+            ),
             "relation_edges": (
                 item.get("relation_edges")
                 if isinstance(item.get("relation_edges"), list)
@@ -932,6 +938,7 @@ def _node_tooltip(node: dict[str, Any]) -> str:
         f"direction: {node.get('direction_key')}",
         f"mode: {mode_display}",
         f"operator: {operator_display}",
+        f"tuning_plan: {node.get('tuning_plan')}",
         f"description: {node.get('description')}",
     ]
     return "\n".join(str(x) for x in parts if x is not None)

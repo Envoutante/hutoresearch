@@ -192,7 +192,7 @@ novelty_judge:
       "reason": "Short reason.",
       "allow_run": false,
       "required_pivot": "Concrete pivot instruction if blocked, otherwise empty string.",
-      "innovation_type": "mechanism_search|control_tune|local_tune_after_mechanism|verify_winner|unknown",
+      "innovation_type": "mechanism_search|control_tune|local_tune_after_mechanism|local_param_tune|verify_winner|unknown",
       "is_pure_tuning": false,
       "mechanism_changed": true
     }}
@@ -212,8 +212,9 @@ plan_agent:
     1. 不得改变 hard_constraints 中的 plan_id、operator、target_direction_key、avoid_direction_keys、search_mode、parent_ref。
     2. 不得建议 avoid_direction_keys 中的方向。
     3. 如果 search_mode 是 mechanism_search，任务必须是机制级改动，不得只是调 learning rate、batch size、dropout、width、depth、head 数、训练步数或 warmup。
-    4. 如果 search_mode 是 local_tune_after_mechanism，任务必须保留 near-miss 父节点的核心机制，只能提出一个局部小改动，例如机制强度、初始化、warmup/启用时机、阈值、温度、门控范围或稳定性常数；不得换成新的机制家族。
-    5. 输出必须是严格 JSON，不要输出 Markdown，不要输出解释性前后缀。
+    4. 如果 operator 是 near_miss_refine，任务必须保留 near-miss 父节点的核心机制，只能提出一个局部小改动，例如机制强度、初始化、warmup/启用时机、阈值、温度、门控范围或稳定性常数；不得换成新的机制家族。
+    5. 如果 operator 是 local_param_tune，必须分析 stats.tuning_context，只选择一个 control_name，给出最多 3 个 candidate_values，并说明为什么这些值有方向性；不得选择第二个控制量。
+    6. 输出必须是严格 JSON，不要输出 Markdown，不要输出解释性前后缀。
 
     ## 输出字段
     只允许输出以下字段：
@@ -223,7 +224,16 @@ plan_agent:
       "experiment_brief": "Concrete implementation brief for the code-writing agent.",
       "expected_mechanism": "The expected mechanism being tested.",
       "success_interpretation": "How to interpret lower val_bpb.",
-      "failure_interpretation": "How to interpret no improvement or failure."
+      "failure_interpretation": "How to interpret no improvement or failure.",
+      "tuning_plan": {{
+        "control_name": "Only required for local_param_tune; one existing mechanism control.",
+        "current_value": "Only required for local_param_tune; current value if known.",
+        "candidate_values": ["Only required for local_param_tune; 1-3 values."],
+        "rationale": "Why this control is the right one to tune.",
+        "expected_direction": "What lower/higher values test.",
+        "max_trials": 3,
+        "stop_condition": "When to stop tuning this parent."
+      }}
     }}
 
 evaluator:

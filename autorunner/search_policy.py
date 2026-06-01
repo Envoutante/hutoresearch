@@ -15,10 +15,13 @@ DEFAULT_OPERATORS = (
     "explore_new_mechanism",
     "exploit_best_mechanism",
     "near_miss_refine",
+    "local_param_tune",
     "pivot_near_miss",
     "avoid_failed_family",
 )
 NEAR_MISS_ABS_BPB = 0.001
+LOCAL_PARAM_MAX_TRIALS_PER_PARENT = 6
+LOCAL_PARAM_MAX_CONSECUTIVE_NONIMPROVE = 2
 DEFAULT_DIRECTION_POOL = (
     "architecture.attention",
     "architecture.mlp",
@@ -63,6 +66,7 @@ class SearchPlan:
     expected_mechanism: str = ""
     success_interpretation: str = ""
     failure_interpretation: str = ""
+    tuning_plan: dict[str, Any] = field(default_factory=dict)
     stats: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -128,6 +132,9 @@ def summarize_registry(registry_items: list[dict[str, Any]]) -> dict[str, Any]:
             "near_miss_candidate_id": "",
             "near_miss_val_bpb": None,
             "near_miss_delta_bpb": None,
+            "near_miss_tuning_count": 0,
+            "near_miss_tuning_active_count": 0,
+            "near_miss_tuning_consecutive_nonimprove": 0,
             "recent_failure_reasons": [],
             "last_candidate_id": "",
             "last_failed_candidate_id": "",
@@ -150,6 +157,9 @@ def summarize_registry(registry_items: list[dict[str, Any]]) -> dict[str, Any]:
                 "near_miss_candidate_id": "",
                 "near_miss_val_bpb": None,
                 "near_miss_delta_bpb": None,
+                "near_miss_tuning_count": 0,
+                "near_miss_tuning_active_count": 0,
+                "near_miss_tuning_consecutive_nonimprove": 0,
                 "recent_failure_reasons": [],
                 "last_candidate_id": "",
                 "last_failed_candidate_id": "",
@@ -238,6 +248,9 @@ def summarize_registry(registry_items: list[dict[str, Any]]) -> dict[str, Any]:
                     "near_miss_candidate_id": "",
                     "near_miss_val_bpb": None,
                     "near_miss_delta_bpb": None,
+                    "near_miss_tuning_count": 0,
+                    "near_miss_tuning_active_count": 0,
+                    "near_miss_tuning_consecutive_nonimprove": 0,
                     "recent_failure_reasons": [],
                     "last_candidate_id": "",
                     "last_failed_candidate_id": "",
@@ -256,6 +269,49 @@ def summarize_registry(registry_items: list[dict[str, Any]]) -> dict[str, Any]:
             str(x.get("candidate_id") or ""),
         )
     )
+
+    for stats in by_direction.values():
+        near_miss_id = str(stats.get("near_miss_candidate_id") or "").strip()
+        if not near_miss_id:
+            continue
+        parent_val = stats.get("near_miss_val_bpb")
+        try:
+            parent_val_bpb = float(parent_val)
+        except (TypeError, ValueError):
+            parent_val_bpb = None
+
+        tune_items = [
+            item
+            for item in registry_items
+            if str(item.get("search_operator") or "") == "local_param_tune"
+            and str(item.get("search_parent_id") or item.get("parent_candidate_id") or "")
+            == near_miss_id
+        ]
+        active_count = sum(
+            1
+            for item in tune_items
+            if _status(item) in active_statuses
+        )
+        completed = [
+            item
+            for item in tune_items
+            if _status(item)
+            in {"keep", "discard", "blocked_duplicate", "generation_failed", "repair_failed"}
+        ]
+        consecutive_nonimprove = 0
+        for item in reversed(completed):
+            val_bpb = _result_val_bpb(item)
+            improved_parent = (
+                val_bpb is not None
+                and parent_val_bpb is not None
+                and val_bpb < parent_val_bpb
+            )
+            if improved_parent:
+                break
+            consecutive_nonimprove += 1
+        stats["near_miss_tuning_count"] = len(completed)
+        stats["near_miss_tuning_active_count"] = active_count
+        stats["near_miss_tuning_consecutive_nonimprove"] = consecutive_nonimprove
 
     active_directions = [
         k for k, v in by_direction.items() if int(v.get("active_count") or 0) > 0
@@ -281,6 +337,17 @@ def _operator_for_direction(stats: dict[str, Any]) -> str:
     discard_count = int(stats.get("discard_count") or 0)
     blocked_count = int(stats.get("blocked_count") or 0)
     if stats.get("near_miss_candidate_id"):
+        tune_count = int(stats.get("near_miss_tuning_count") or 0)
+        tune_active = int(stats.get("near_miss_tuning_active_count") or 0)
+        tune_nonimprove = int(
+            stats.get("near_miss_tuning_consecutive_nonimprove") or 0
+        )
+        if (
+            tune_active == 0
+            and tune_count < LOCAL_PARAM_MAX_TRIALS_PER_PARENT
+            and tune_nonimprove < LOCAL_PARAM_MAX_CONSECUTIVE_NONIMPROVE
+        ):
+            return "local_param_tune"
         return "near_miss_refine"
     if blocked_count >= 2 or discard_count >= 3:
         return "avoid_failed_family"
@@ -305,6 +372,10 @@ def _search_parent_for_operator(operator: str, stats: dict[str, Any]) -> str | N
         return _clean_candidate_id(
             stats.get("near_miss_candidate_id") or stats.get("last_failed_candidate_id")
         )
+    if operator == "local_param_tune":
+        return _clean_candidate_id(
+            stats.get("near_miss_candidate_id") or stats.get("last_failed_candidate_id")
+        )
     if operator == "pivot_near_miss":
         return _clean_candidate_id(
             stats.get("last_failed_candidate_id") or stats.get("last_candidate_id")
@@ -319,6 +390,13 @@ def _search_parent_for_operator(operator: str, stats: dict[str, Any]) -> str | N
 
 
 def _default_experiment_brief(search_mode: str, operator: str) -> str:
+    if operator == "local_param_tune":
+        return (
+            "Start from the near-miss parent train.py. The plan agent must choose "
+            "one existing mechanism control and propose up to three candidate "
+            "values. The code agent must apply only the runner-selected value for "
+            "that one control and leave the mechanism family unchanged."
+        )
     if operator == "near_miss_refine" or search_mode == "local_tune_after_mechanism":
         return (
             "Start from the near-miss parent train.py and make exactly one small "
@@ -334,6 +412,11 @@ def _default_experiment_brief(search_mode: str, operator: str) -> str:
 
 
 def _default_expected_mechanism(search_mode: str, operator: str) -> str:
+    if operator == "local_param_tune":
+        return (
+            "The diff should test whether a better numeric control value can turn "
+            "a near-miss mechanism into an improvement without changing the mechanism."
+        )
     if operator == "near_miss_refine" or search_mode == "local_tune_after_mechanism":
         return (
             "The diff should preserve the near-miss mechanism while improving its "
@@ -395,6 +478,12 @@ def _default_intent(search_mode: str, operator: str, direction: str) -> str:
             "bounded change to its mechanism controls, initialization, schedule, "
             "or activation strength."
         )
+    if operator == "local_param_tune":
+        return (
+            f"Choose one numeric control for the near-miss {direction} candidate "
+            "and test a runner-selected candidate value while preserving the "
+            "existing mechanism."
+        )
     if operator == "pivot_near_miss":
         return (
             f"Keep the broad {direction} goal, but replace the concrete mechanism "
@@ -446,7 +535,7 @@ def select_search_plan(
     direction, stats, priority = _choose_direction(summary)
     operator = _operator_for_direction(stats)
     search_mode = "control_tune" if operator == "control_tune" else "mechanism_search"
-    if operator == "near_miss_refine":
+    if operator in {"near_miss_refine", "local_param_tune"}:
         search_mode = "local_tune_after_mechanism"
     elif operator == "avoid_failed_family":
         search_mode = "pivot_after_failure"
@@ -468,6 +557,9 @@ def select_search_plan(
             "near_miss_candidate_id": "",
             "near_miss_val_bpb": None,
             "near_miss_delta_bpb": None,
+            "near_miss_tuning_count": 0,
+            "near_miss_tuning_active_count": 0,
+            "near_miss_tuning_consecutive_nonimprove": 0,
             "recent_failure_reasons": [],
             "last_candidate_id": "",
             "last_failed_candidate_id": "",
@@ -518,7 +610,49 @@ def complete_plan_from_payload(plan: SearchPlan, payload: dict[str, Any] | None)
         value = payload.get(key)
         if isinstance(value, str) and value.strip():
             data[key] = value.strip()[:2000]
+    if plan.operator == "local_param_tune" and isinstance(
+        payload.get("tuning_plan"), dict
+    ):
+        data["tuning_plan"] = _normalize_tuning_plan(payload.get("tuning_plan"))
     return SearchPlan(**data)
+
+
+def _normalize_tuning_plan(value: dict[str, Any]) -> dict[str, Any]:
+    control_name = str(value.get("control_name") or "").strip()[:160]
+    candidate_values_raw = value.get("candidate_values")
+    if not isinstance(candidate_values_raw, list):
+        candidate_values_raw = []
+
+    candidate_values: list[Any] = []
+    seen: set[str] = set()
+    for raw in candidate_values_raw:
+        key = json.dumps(raw, sort_keys=True, ensure_ascii=False, default=str)
+        if key in seen:
+            continue
+        seen.add(key)
+        candidate_values.append(raw)
+        if len(candidate_values) >= 3:
+            break
+
+    selected_value = value.get("selected_value")
+    if selected_value is None and candidate_values:
+        selected_value = candidate_values[0]
+
+    try:
+        max_trials = int(value.get("max_trials") or 3)
+    except (TypeError, ValueError):
+        max_trials = 3
+
+    return {
+        "control_name": control_name,
+        "current_value": value.get("current_value"),
+        "candidate_values": candidate_values,
+        "selected_value": selected_value,
+        "rationale": str(value.get("rationale") or "").strip()[:1000],
+        "expected_direction": str(value.get("expected_direction") or "").strip()[:1000],
+        "stop_condition": str(value.get("stop_condition") or "").strip()[:1000],
+        "max_trials": min(6, max(1, max_trials)),
+    }
 
 
 def _looks_like_pure_tuning_text(text: str) -> bool:
@@ -556,6 +690,15 @@ def validate_search_plan(plan: SearchPlan) -> tuple[bool, str]:
         return False, "missing_intent"
     if not plan.rationale.strip():
         return False, "missing_rationale"
+    if plan.operator == "local_param_tune":
+        tuning_plan = plan.tuning_plan if isinstance(plan.tuning_plan, dict) else {}
+        if not str(tuning_plan.get("control_name") or "").strip():
+            return False, "missing_tuning_control_name"
+        if tuning_plan.get("selected_value") is None:
+            return False, "missing_tuning_selected_value"
+        candidate_values = tuning_plan.get("candidate_values")
+        if not isinstance(candidate_values, list) or not candidate_values:
+            return False, "missing_tuning_candidate_values"
     if plan.search_mode == "mechanism_search":
         merged = " ".join(
             [
@@ -572,11 +715,11 @@ def validate_search_plan(plan: SearchPlan) -> tuple[bool, str]:
 
 def plan_prompt_payload(plan: SearchPlan) -> str:
     payload = {
-            "hard_constraints": {
-                "plan_id": plan.plan_id,
-                "parent_candidate_id": plan.parent_candidate_id,
-                "search_parent_id": plan.search_parent_id,
-                "parent_ref": plan.parent_ref,
+        "hard_constraints": {
+            "plan_id": plan.plan_id,
+            "parent_candidate_id": plan.parent_candidate_id,
+            "search_parent_id": plan.search_parent_id,
+            "parent_ref": plan.parent_ref,
             "operator": plan.operator,
             "target_direction_key": plan.target_direction_key,
             "avoid_direction_keys": plan.avoid_direction_keys,
@@ -589,6 +732,7 @@ def plan_prompt_payload(plan: SearchPlan) -> str:
             "expected_mechanism": plan.expected_mechanism,
             "success_interpretation": plan.success_interpretation,
             "failure_interpretation": plan.failure_interpretation,
+            "tuning_plan": plan.tuning_plan,
         },
         "stats": plan.stats,
     }
