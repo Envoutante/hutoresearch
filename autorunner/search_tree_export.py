@@ -29,6 +29,7 @@ SEARCH_MODE_LABELS_ZH = {
     "baseline_intake": "基线导入",
     "mechanism_search": "机制搜索",
     "control_tune": "控制调参",
+    "local_tune_after_mechanism": "近失点局部微调",
     "pivot_after_failure": "失败后转向",
     "verify_winner": "优胜复验",
 }
@@ -37,6 +38,7 @@ OPERATOR_LABELS_ZH = {
     "root": "根节点",
     "explore_new_mechanism": "探索新机制",
     "exploit_best_mechanism": "强化有效机制",
+    "near_miss_refine": "近失点微调",
     "pivot_near_miss": "近似失败转向",
     "avoid_failed_family": "避开失败族",
     "control_tune": "控制调参",

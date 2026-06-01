@@ -996,6 +996,84 @@ def _write_best_snapshot_unlocked(
     return payload
 
 
+def _relative_path_text(path: Path) -> str:
+    try:
+        return str(path.relative_to(WORKDIR))
+    except ValueError:
+        return str(path)
+
+
+def _candidate_train_path(candidate_id: str) -> Path | None:
+    candidate_id = str(candidate_id or "").strip()
+    if not candidate_id or candidate_id == "baseline":
+        return None
+    path = CANDIDATE_ROOT / candidate_id / "train.py"
+    return path if path.exists() else None
+
+
+def _candidate_result_val_bpb(candidate_id: str) -> float | None:
+    for item in _load_experiment_registry():
+        if str(item.get("candidate_id") or "") != candidate_id:
+            continue
+        result = item.get("result")
+        if not isinstance(result, dict):
+            return None
+        try:
+            val_bpb = float(result.get("val_bpb"))
+        except (TypeError, ValueError):
+            return None
+        return val_bpb if math.isfinite(val_bpb) else None
+    return None
+
+
+def _snapshot_for_train_path(
+    *,
+    candidate_id: str,
+    train_path: Path,
+    source: str,
+) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "best_candidate_id": candidate_id or "baseline",
+        "best_val_bpb": _candidate_result_val_bpb(candidate_id),
+        "best_train_path": _relative_path_text(train_path),
+        "code_hash": _file_sha256(train_path),
+        "updated_at": _now_iso(),
+        "source": source,
+    }
+
+
+def _select_code_parent_for_plan(
+    *,
+    search_plan: SearchPlan,
+    fallback_train_path: Path,
+) -> tuple[Path, dict[str, Any]]:
+    if search_plan.operator == "near_miss_refine":
+        candidate_id = _plan_search_parent_id(search_plan)
+        candidate_train = _candidate_train_path(candidate_id)
+        if candidate_train is not None:
+            return candidate_train, _snapshot_for_train_path(
+                candidate_id=candidate_id,
+                train_path=candidate_train,
+                source="near_miss_refine_parent",
+            )
+
+    with BEST_TRAIN_LOCK:
+        snapshot = _read_best_snapshot_unlocked()
+        if not snapshot:
+            snapshot = _write_best_snapshot_unlocked(
+                best_candidate_id="baseline",
+                best_val_bpb=None,
+                source="copy_fallback",
+            )
+    return fallback_train_path, snapshot
+
+
+def _set_search_plan_parent_ref(plan: SearchPlan, parent_path: Path) -> SearchPlan:
+    plan.parent_ref = _relative_path_text(parent_path)
+    return plan
+
+
 def _infer_best_snapshot_from_registry(
     baseline_bpb: float,
 ) -> tuple[str, float | None, str]:
@@ -1257,18 +1335,21 @@ def _pick_least_loaded_gpu_id() -> int:
 def _copy_base_train_to_candidate(
     base_train: Path,
     candidate_dir: Path,
+    code_parent_snapshot: dict[str, Any] | None = None,
 ) -> tuple[Path, dict[str, Any]]:
     candidate_dir.mkdir(parents=True, exist_ok=True)
     target = candidate_dir / "train.py"
-    with BEST_TRAIN_LOCK:
-        snapshot = _read_best_snapshot_unlocked()
-        if not snapshot:
-            snapshot = _write_best_snapshot_unlocked(
-                best_candidate_id="baseline",
-                best_val_bpb=None,
-                source="copy_fallback",
-            )
-        shutil.copy2(base_train, target)
+    snapshot = code_parent_snapshot
+    if snapshot is None:
+        with BEST_TRAIN_LOCK:
+            snapshot = _read_best_snapshot_unlocked()
+            if not snapshot:
+                snapshot = _write_best_snapshot_unlocked(
+                    best_candidate_id="baseline",
+                    best_val_bpb=None,
+                    source="copy_fallback",
+                )
+    shutil.copy2(base_train, target)
     return target, snapshot
 
 
@@ -1279,6 +1360,7 @@ def _plan_search_parent_id(plan: SearchPlan) -> str:
 def _search_relation_type(operator: str) -> str:
     return {
         "exploit_best_mechanism": "exploit_after_same_direction",
+        "near_miss_refine": "local_refine_near_miss",
         "pivot_near_miss": "pivot_from_same_direction",
         "avoid_failed_family": "avoid_failed_family_from_same_direction",
     }.get(operator, "search_parent")
@@ -1428,9 +1510,14 @@ def _create_candidate(
     pivot_guidance = ""
 
     for attempt in range(1, max_duplicate_retries + 2):
+        code_parent_train_path, code_parent_snapshot = _select_code_parent_for_plan(
+            search_plan=search_plan,
+            fallback_train_path=base_train_path,
+        )
         candidate_train, code_parent_snapshot = _copy_base_train_to_candidate(
-            base_train_path,
+            code_parent_train_path,
             candidate_dir,
+            code_parent_snapshot=code_parent_snapshot,
         )
         base_lineage = _lineage_updates(
             candidate_id=candidate_id,
@@ -1468,6 +1555,10 @@ def _create_candidate(
                 "如果 SEARCH_PLAN.search_mode 是 mechanism_search，禁止只调数字常量、"
                 "训练步数、学习率、batch size、dropout、hidden size、head 数或 depth；"
                 "必须改变计算机制或计算路径。\n"
+                "如果 SEARCH_PLAN.search_mode 是 local_tune_after_mechanism，"
+                "必须保留当前 near-miss 代码中的核心机制，只允许做一个局部小改动，"
+                "例如机制强度、初始化、warmup/启用时机、阈值、温度、门控范围或稳定性常数；"
+                "不要换成新的机制家族。\n"
                 f"{forbidden_training_text}\n"
                 f"{forbidden_git_history_text}"
             ),
@@ -1491,7 +1582,7 @@ def _create_candidate(
                 _update_registry_entry(
                     candidate_id,
                     status="generation_failed",
-                    parent_ref=base_train_path.name,
+                    parent_ref=_relative_path_text(code_parent_train_path),
                     **base_lineage,
                     description=f"candidate {candidate_id}",
                     failure_reason="agent_attempted_training",
@@ -1558,7 +1649,7 @@ def _create_candidate(
                 _update_registry_entry(
                     candidate_id,
                     status="generation_failed",
-                    parent_ref=base_train_path.name,
+                    parent_ref=_relative_path_text(code_parent_train_path),
                     **base_lineage,
                     description=f"candidate {candidate_id}",
                     failure_reason=(result.stderr or failure_reason)[:200],
@@ -1576,7 +1667,7 @@ def _create_candidate(
             _update_registry_entry(
                 candidate_id,
                 status="generation_failed",
-                parent_ref=base_train_path.name,
+                parent_ref=_relative_path_text(code_parent_train_path),
                 **base_lineage,
                 description=f"candidate {candidate_id}",
                 failure_reason="train.py not updated",
@@ -1596,7 +1687,7 @@ def _create_candidate(
             _update_registry_entry(
                 candidate_id,
                 status="generation_failed",
-                parent_ref=base_train_path.name,
+                parent_ref=_relative_path_text(code_parent_train_path),
                 **base_lineage,
                 description=f"candidate {candidate_id}",
                 failure_reason=f"py_compile_failed: {compile_error}"[:200],
@@ -1654,7 +1745,7 @@ def _create_candidate(
                 _update_registry_entry(
                     candidate_id,
                     status="generation_failed",
-                    parent_ref=base_train_path.name,
+                    parent_ref=_relative_path_text(code_parent_train_path),
                     **base_lineage,
                     description=f"candidate {candidate_id}",
                     failure_reason="missing_structured_fields",
@@ -1673,7 +1764,7 @@ def _create_candidate(
         proposal = {
             "candidate_id": candidate_id,
             "status": "proposed",
-            "parent_ref": base_train_path.name,
+            "parent_ref": _relative_path_text(code_parent_train_path),
             "search_plan_id": search_plan.plan_id,
             "search_mode": search_plan.search_mode,
             "search_operator": search_plan.operator,
@@ -1728,6 +1819,10 @@ def _create_candidate(
                 )
             ):
                 allow_run = False
+            elif search_plan.search_mode == "local_tune_after_mechanism" and bool(
+                judge_payload.get("is_duplicate")
+            ):
+                allow_run = False
         duplicate_level = (
             str(judge_payload.get("duplicate_level") or "judge_failed")
             if judge_payload
@@ -1757,7 +1852,7 @@ def _create_candidate(
                 workdir=candidate_dir,
                 train_py_path=candidate_train,
                 refine_description=desc,
-                parent_ref=base_train_path.name,
+                parent_ref=_relative_path_text(code_parent_train_path),
                 created_at=time.time(),
                 queued_at=time.time(),
                 status="queued",
@@ -2257,17 +2352,29 @@ def run_parallel_loop(
                             parent_ref=BEST_TRAIN_FILE.name,
                             parent_candidate_id=None,
                         )
+                        code_parent_train_path, code_parent_snapshot = (
+                            _select_code_parent_for_plan(
+                                search_plan=search_plan,
+                                fallback_train_path=BEST_TRAIN_FILE,
+                            )
+                        )
+                        search_plan = _set_search_plan_parent_ref(
+                            search_plan,
+                            code_parent_train_path,
+                        )
                         search_parent_id = _plan_search_parent_id(search_plan)
                         search_relation_edges = _build_relation_edges(
                             candidate_id=candidate_id,
                             search_parent_id=search_parent_id,
                             search_operator=search_plan.operator,
-                            code_parent_id="",
+                            code_parent_id=str(
+                                code_parent_snapshot.get("best_candidate_id") or ""
+                            ),
                         )
                         _update_registry_entry(
                             candidate_id,
                             status="proposed",
-                            parent_ref=BEST_TRAIN_FILE.name,
+                            parent_ref=_relative_path_text(code_parent_train_path),
                             description=f"{candidate_id} generation in progress",
                             direction_key="generation.in_progress",
                             search_plan_id=search_plan.plan_id,
@@ -2275,6 +2382,15 @@ def run_parallel_loop(
                             search_operator=search_plan.operator,
                             search_parent_id=search_parent_id,
                             semantic_parent_id=search_parent_id,
+                            code_parent_id=str(
+                                code_parent_snapshot.get("best_candidate_id") or ""
+                            ),
+                            code_parent_ref=str(
+                                code_parent_snapshot.get("best_train_path") or ""
+                            ),
+                            code_parent_hash=str(
+                                code_parent_snapshot.get("code_hash") or ""
+                            ),
                             target_direction_key=search_plan.target_direction_key,
                             intent=search_plan.intent,
                             rationale=search_plan.rationale,
@@ -2300,15 +2416,31 @@ def run_parallel_loop(
                                     "candidate_id": candidate_id,
                                     "error": f"{type(exc).__name__}: {exc}"[:300],
                                 },
-                            )
+                        )
                         ok, reason = validate_search_plan(search_plan)
                         if not ok:
                             search_parent_id = _plan_search_parent_id(search_plan)
+                            code_parent_train_path, code_parent_snapshot = (
+                                _select_code_parent_for_plan(
+                                    search_plan=search_plan,
+                                    fallback_train_path=BEST_TRAIN_FILE,
+                                )
+                            )
                             _update_registry_entry(
                                 candidate_id,
                                 status="generation_failed",
+                                parent_ref=_relative_path_text(code_parent_train_path),
                                 search_parent_id=search_parent_id,
                                 semantic_parent_id=search_parent_id,
+                                code_parent_id=str(
+                                    code_parent_snapshot.get("best_candidate_id") or ""
+                                ),
+                                code_parent_ref=str(
+                                    code_parent_snapshot.get("best_train_path") or ""
+                                ),
+                                code_parent_hash=str(
+                                    code_parent_snapshot.get("code_hash") or ""
+                                ),
                                 failure_reason=f"invalid_search_plan:{reason}"[:200],
                             )
                             _append_queue_event(
@@ -2320,11 +2452,23 @@ def run_parallel_loop(
                             )
                             continue
                         search_parent_id = _plan_search_parent_id(search_plan)
+                        code_parent_train_path, code_parent_snapshot = (
+                            _select_code_parent_for_plan(
+                                search_plan=search_plan,
+                                fallback_train_path=BEST_TRAIN_FILE,
+                            )
+                        )
+                        search_plan = _set_search_plan_parent_ref(
+                            search_plan,
+                            code_parent_train_path,
+                        )
                         search_relation_edges = _build_relation_edges(
                             candidate_id=candidate_id,
                             search_parent_id=search_parent_id,
                             search_operator=search_plan.operator,
-                            code_parent_id="",
+                            code_parent_id=str(
+                                code_parent_snapshot.get("best_candidate_id") or ""
+                            ),
                         )
                         _update_registry_entry(
                             candidate_id,
@@ -2333,6 +2477,16 @@ def run_parallel_loop(
                             search_operator=search_plan.operator,
                             search_parent_id=search_parent_id,
                             semantic_parent_id=search_parent_id,
+                            parent_ref=_relative_path_text(code_parent_train_path),
+                            code_parent_id=str(
+                                code_parent_snapshot.get("best_candidate_id") or ""
+                            ),
+                            code_parent_ref=str(
+                                code_parent_snapshot.get("best_train_path") or ""
+                            ),
+                            code_parent_hash=str(
+                                code_parent_snapshot.get("code_hash") or ""
+                            ),
                             target_direction_key=search_plan.target_direction_key,
                             intent=search_plan.intent,
                             rationale=search_plan.rationale,
@@ -2348,7 +2502,7 @@ def run_parallel_loop(
                                 _create_candidate,
                                 candidate_id=candidate_id,
                                 agent=agent,
-                                base_train_path=BEST_TRAIN_FILE,
+                                base_train_path=code_parent_train_path,
                                 run_summaries=run_summaries,
                                 topic=topic,
                                 search_plan=search_plan,

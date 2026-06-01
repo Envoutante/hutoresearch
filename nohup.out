@@ -1,0 +1,168 @@
+       pid: 697711
+       pid: 701236
+       pid: 710739
+       pid: 715254
+       pid: 889246
+       pid: 899043
+       pid: 966772
+       pid: 966991
+       pid: 985629
+       pid: 988192
+       pid: 1163578
+       pid: 1164511
+       pid: 1208004
+       pid: 1208961
+       pid: 1382455
+       pid: 1383985
+       pid: 1430548
+       pid: 1433953
+       pid: 1575610
+       pid: 1577702
+       pid: 1622203
+       pid: 1630456
+       pid: 1785612
+       pid: 1786238
+       pid: 1840629
+       pid: 1849989
+       pid: 2000108
+       pid: 2002021
+       pid: 2056024
+       pid: 2065911
+       pid: 2120786
+╭────────────────────── AutoResearch Parallel Dashboard ───────────────────────╮
+│ elapsed: 10167s | progress: 26/30     queued: 0 | running: 4 | baseline:     │
+│                                       0.985507                               │
+│ repair: start=1 success=1 failed=0    filter: all                            │
+│ out_of_scope=0                                                               │
+│                                     GPU                                      │
+│ ┏━━━━━━━━┳━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━┳━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━┓ │
+│ ┃    gpu ┃         mem(MiB) ┃     util(%) ┃ state       ┃ candidate        ┃ │
+│ ┡━━━━━━━━╇━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━╇━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━┩ │
+│ │      0 │       3901/20000 │       94/85 │ running     │ cand-000047      │ │
+│ │      1 │       4135/20000 │       93/85 │ running     │ cand-000046      │ │
+│ │      2 │       4826/20000 │       95/85 │ running     │ cand-000049      │ │
+│ │      3 │       5149/20000 │       94/85 │ running     │ cand-000048      │ │
+│ └────────┴──────────────────┴─────────────┴─────────────┴──────────────────┘ │
+│                                  Candidates                                  │
+│ ┏━━━━━━━━━━━━━┳━━━━━━━━━━━┳━━━━━┳━━━━━━━━━┳━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━┓ │
+│ ┃ id          ┃ status    ┃ gpu ┃ wait(s) ┃ runtime(s) ┃ desc              ┃ │
+│ ┡━━━━━━━━━━━━━╇━━━━━━━━━━━╇━━━━━╇━━━━━━━━━╇━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━┩ │
+│ │ cand-000047 │ repairing │   0 │    1784 │       1205 │ 新增训练期 token  │ │
+│ │             │           │     │         │            │ 级 norm           │ │
+│ │             │           │     │         │            │ skip。主干 attn   │ │
+│ │             │           │     │         │            │ 和 mlp 输...      │ │
+│ │ cand-000046 │ running   │   1 │    1776 │       1195 │ 新增查询温度门控… │ │
+│ │             │           │     │         │            │ token             │ │
+│ │             │           │     │         │            │ 可调节各注意力头… │ │
+│ │ cand-000048 │ running   │   3 │    1011 │        890 │ 新增字节复杂度分… │ │
+│ │ cand-000049 │ running   │   2 │     950 │        844 │ 新增窄瓶颈通道调… │ │
+│ │ cand-000027 │ discard   │   1 │    1179 │       1248 │ 将熵奖励改为批内… │ │
+│ │             │           │     │         │            │ token             │ │
+│ │             │           │     │         │            │ 获得熵奖励。      │ │
+│ │ cand-000026 │ discard   │   0 │    2065 │       1257 │ 将 norm 改为 128  │ │
+│ │             │           │     │         │            │ 通道分组 RMS      │ │
+│ │             │           │     │         │            │ 统计。QK 的 128   │ │
+│ │             │           │     │         │            │ 维 he...          │ │
+│ │ cand-000028 │ discard   │   2 │       0 │       1252 │ 将 MLP            │ │
+│ │             │           │     │         │            │ 中间通道拆成两组… │ │
+│ │             │           │     │         │            │ ReLU 平方和       │ │
+│ │             │           │     │         │            │ GELU。            │ │
+│ │ cand-000029 │ discard   │   3 │       1 │       1261 │ 将注意力主路径限… │ │
+│ │             │           │     │         │            │ causal            │ │
+│ │             │           │     │         │            │ 窗口。新增固定步… │ │
+│ │             │           │     │         │            │ causa...          │ │
+│ │ cand-000031 │ discard   │   0 │     800 │       1241 │ 新增梯度中心化函… │ │
+│ │             │           │     │         │            │ step              │ │
+│ │             │           │     │         │            │ 前对二维及以上梯… │ │
+│ │ cand-000030 │ discard   │   1 │     890 │       1254 │ 门使用 2 times    │ │
+│ │             │           │     │         │            │ sigmoid           │ │
+│ │             │           │     │         │            │ 参数化并以中性值… │ │
+│ │ cand-000032 │ discard   │   2 │       0 │       1249 │ 将训练目标改为    │ │
+│ │             │           │     │         │            │ label smoothing   │ │
+│ │             │           │     │         │            │ 软标签交叉熵。验… │ │
+│ │ cand-000033 │ discard   │   3 │       1 │       1258 │ 将默认 norm       │ │
+│ │             │           │     │         │            │ 改为前半通道统计… │ │
+│ │             │           │     │         │            │ partial           │ │
+│ │             │           │     │         │            │ RMSNorm。新增     │ │
+│ │             │           │     │         │            │ q...              │ │
+│ │ cand-000035 │ discard   │   0 │     697 │       1240 │ 新增后段 SWA      │ │
+│ │             │           │     │         │            │ 快照平均。最终验… │ │
+│ │ cand-000034 │ discard   │   1 │     695 │       1244 │ 新增按训练进度展… │ │
+│ │ cand-000037 │ discard   │   3 │      23 │       1267 │ 将 MLP            │ │
+│ │             │           │     │         │            │ 改为三倍展开的    │ │
+│ │             │           │     │         │            │ ReLU              │ │
+│ │             │           │     │         │            │ 平方主干。新增低… │ │
+│ │ cand-000036 │ discard   │   2 │      54 │       1297 │ 在注意力 softmax  │ │
+│ │             │           │     │         │            │ 后加入头间概率混… │ │
+│ │ cand-000039 │ discard   │   0 │     708 │       1250 │ 将训练损失改为    │ │
+│ │             │           │     │         │            │ focal 风格 CE     │ │
+│ │             │           │     │         │            │ 重加权。按目标概… │ │
+│ │ cand-000038 │ discard   │   1 │     623 │       1242 │ 将非 Muon         │ │
+│ │             │           │     │         │            │ 参数组改为        │ │
+│ │             │           │     │         │            │ RMSProp           │ │
+│ │             │           │     │         │            │ 归一化梯度更新。… │ │
+│ │             │           │     │         │            │ AdamW ...         │ │
+│ │ cand-000041 │ discard   │   3 │      19 │       1252 │ 新增固定主干归一… │ │
+│ │ cand-000040 │ discard   │   2 │       1 │       1257 │ 在每次子层残差相… │ │
+│ │             │           │     │         │            │ RMSNorm。未新增 … │ │
+│ │ cand-000042 │ discard   │   0 │     717 │       1245 │ 新增确定性短 spa… │ │
+│ │             │           │     │         │            │ 采样课程。按进度… │ │
+│ │ cand-000043 │ discard   │   1 │     664 │       1251 │ 新增非目标最高概… │ │
+│ │ cand-000045 │ discard   │   3 │       2 │       1242 │ 新增二维权重梯度… │ │
+│ │ cand-000044 │ discard   │   2 │      31 │       1240 │ 新增全局梯度范数  │ │
+│ │             │           │     │         │            │ EMA               │ │
+│ │             │           │     │         │            │ 基线。超过阈值的… │ │
+│ └─────────────┴───────────┴─────┴─────────┴────────────┴───────────────────┘ │
+│                               Failure Reasons                                │
+│ ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━┓ │
+│ ┃ reason                                                ┃            count ┃ │
+│ ┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━┩ │
+│ │ metric_not_improved                                   │               25 │ │
+│ └───────────────────────────────────────────────────────┴──────────────────┘ │
+│                                Recent Events                                 │
+│ ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓ │
+│ ┃ event                                                                    ┃ │
+│ ┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩ │
+│ │ 2026-06-01T14:15:18 | candidate_queued (cand-000049)                     │ │
+│ │ 2026-06-01T14:16:16 | candidate_discard (cand-000045)                    │ │
+│ │ 2026-06-01T14:16:17 | candidate_running (cand-000048, gpu=3)             │ │
+│ │ 2026-06-01T14:17:02 | candidate_discard (cand-000044)                    │ │
+│ │ 2026-06-01T14:17:03 | candidate_running (cand-000049, gpu=2)             │ │
+│ │ 2026-06-01T14:19:20 | candidate_blocked_duplicate (cand-000050, try=1)   │ │
+│ │ 2026-06-01T14:20:15 | candidate_repair_start (cand-000047, try=1)        │ │
+│ │ 2026-06-01T14:21:54 | candidate_queued (cand-000050)                     │ │
+│ └──────────────────────────────────────────────────────────────────────────┘ │
+╰──────────────────────────────────────────────────────────────────────────────╯Traceback (most recent call last):
+  File "/mount/disk1/rl-hyr/autoresearch/autorunner/runner.py", line 2584, in run_parallel_loop
+    ) = _repair_candidate_if_needed(
+  File "/mount/disk1/rl-hyr/autoresearch/autorunner/runner.py", line 2005, in _repair_candidate_if_needed
+    rerun_result = run(
+  File "/mount/disk1/rl-hyr/autoresearch/autorunner/experiment_executor.py", line 247, in run
+    for line in process.stdout:
+KeyboardInterrupt
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/mount/disk1/rl-hyr/autoresearch/autorunner/runner.py", line 2809, in <module>
+    run_parallel_loop(
+  File "/mount/disk1/rl-hyr/autoresearch/autorunner/runner.py", line 2768, in run_parallel_loop
+    executor.shutdown(wait=True)
+  File "/home/rl-hyr/.conda/envs/autoresearch/lib/python3.10/concurrent/futures/thread.py", line 235, in shutdown
+    t.join()
+  File "/home/rl-hyr/.conda/envs/autoresearch/lib/python3.10/threading.py", line 1096, in join
+    self._wait_for_tstate_lock()
+  File "/home/rl-hyr/.conda/envs/autoresearch/lib/python3.10/threading.py", line 1116, in _wait_for_tstate_lock
+    if lock.acquire(block, timeout):
+KeyboardInterrupt
+Exception ignored in: <module 'threading' from '/home/rl-hyr/.conda/envs/autoresearch/lib/python3.10/threading.py'>
+Traceback (most recent call last):
+  File "/home/rl-hyr/.conda/envs/autoresearch/lib/python3.10/threading.py", line 1537, in _shutdown
+    atexit_call()
+  File "/home/rl-hyr/.conda/envs/autoresearch/lib/python3.10/concurrent/futures/thread.py", line 31, in _python_exit
+    t.join()
+  File "/home/rl-hyr/.conda/envs/autoresearch/lib/python3.10/threading.py", line 1096, in join
+    self._wait_for_tstate_lock()
+  File "/home/rl-hyr/.conda/envs/autoresearch/lib/python3.10/threading.py", line 1116, in _wait_for_tstate_lock
+    if lock.acquire(block, timeout):
+KeyboardInterrupt: 

@@ -212,7 +212,8 @@ plan_agent:
     1. 不得改变 hard_constraints 中的 plan_id、operator、target_direction_key、avoid_direction_keys、search_mode、parent_ref。
     2. 不得建议 avoid_direction_keys 中的方向。
     3. 如果 search_mode 是 mechanism_search，任务必须是机制级改动，不得只是调 learning rate、batch size、dropout、width、depth、head 数、训练步数或 warmup。
-    4. 输出必须是严格 JSON，不要输出 Markdown，不要输出解释性前后缀。
+    4. 如果 search_mode 是 local_tune_after_mechanism，任务必须保留 near-miss 父节点的核心机制，只能提出一个局部小改动，例如机制强度、初始化、warmup/启用时机、阈值、温度、门控范围或稳定性常数；不得换成新的机制家族。
+    5. 输出必须是严格 JSON，不要输出 Markdown，不要输出解释性前后缀。
 
     ## 输出字段
     只允许输出以下字段：

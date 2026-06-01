@@ -14,9 +14,11 @@ from typing import Any
 DEFAULT_OPERATORS = (
     "explore_new_mechanism",
     "exploit_best_mechanism",
+    "near_miss_refine",
     "pivot_near_miss",
     "avoid_failed_family",
 )
+NEAR_MISS_ABS_BPB = 0.001
 DEFAULT_DIRECTION_POOL = (
     "architecture.attention",
     "architecture.mlp",
@@ -123,6 +125,9 @@ def summarize_registry(registry_items: list[dict[str, Any]]) -> dict[str, Any]:
             "active_count": 0,
             "best_val_bpb": None,
             "best_candidate_id": "",
+            "near_miss_candidate_id": "",
+            "near_miss_val_bpb": None,
+            "near_miss_delta_bpb": None,
             "recent_failure_reasons": [],
             "last_candidate_id": "",
             "last_failed_candidate_id": "",
@@ -142,6 +147,9 @@ def summarize_registry(registry_items: list[dict[str, Any]]) -> dict[str, Any]:
                 "active_count": 0,
                 "best_val_bpb": None,
                 "best_candidate_id": "",
+                "near_miss_candidate_id": "",
+                "near_miss_val_bpb": None,
+                "near_miss_delta_bpb": None,
                 "recent_failure_reasons": [],
                 "last_candidate_id": "",
                 "last_failed_candidate_id": "",
@@ -184,6 +192,71 @@ def summarize_registry(registry_items: list[dict[str, Any]]) -> dict[str, Any]:
                 stats["best_val_bpb"] = val_bpb
                 stats["best_candidate_id"] = candidate_id
 
+    global_best_val_bpb: float | None = None
+    global_best_candidate_id = ""
+    for item in registry_items:
+        if not _is_keep(item):
+            continue
+        val_bpb = _result_val_bpb(item)
+        if val_bpb is None:
+            continue
+        if global_best_val_bpb is None or val_bpb < global_best_val_bpb:
+            global_best_val_bpb = val_bpb
+            global_best_candidate_id = str(item.get("candidate_id") or "")
+
+    near_misses: list[dict[str, Any]] = []
+    if global_best_val_bpb is not None:
+        for item in registry_items:
+            if not _is_discard(item):
+                continue
+            val_bpb = _result_val_bpb(item)
+            if val_bpb is None:
+                continue
+            delta = val_bpb - global_best_val_bpb
+            if delta < 0 or delta > NEAR_MISS_ABS_BPB:
+                continue
+            candidate_id = str(item.get("candidate_id") or "")
+            direction = _direction(item)
+            near_miss = {
+                "candidate_id": candidate_id,
+                "direction_key": direction,
+                "val_bpb": val_bpb,
+                "delta_bpb": delta,
+            }
+            near_misses.append(near_miss)
+            stats = by_direction.setdefault(
+                direction,
+                {
+                    "direction_key": direction,
+                    "visits": 0,
+                    "keep_count": 0,
+                    "discard_count": 0,
+                    "blocked_count": 0,
+                    "active_count": 0,
+                    "best_val_bpb": None,
+                    "best_candidate_id": "",
+                    "near_miss_candidate_id": "",
+                    "near_miss_val_bpb": None,
+                    "near_miss_delta_bpb": None,
+                    "recent_failure_reasons": [],
+                    "last_candidate_id": "",
+                    "last_failed_candidate_id": "",
+                    "last_blocked_candidate_id": "",
+                },
+            )
+            old_delta = stats.get("near_miss_delta_bpb")
+            if old_delta is None or delta < float(old_delta):
+                stats["near_miss_candidate_id"] = candidate_id
+                stats["near_miss_val_bpb"] = val_bpb
+                stats["near_miss_delta_bpb"] = delta
+
+    near_misses.sort(
+        key=lambda x: (
+            float(x.get("delta_bpb") or 0.0),
+            str(x.get("candidate_id") or ""),
+        )
+    )
+
     active_directions = [
         k for k, v in by_direction.items() if int(v.get("active_count") or 0) > 0
     ]
@@ -195,6 +268,10 @@ def summarize_registry(registry_items: list[dict[str, Any]]) -> dict[str, Any]:
         "active_directions": sorted(active_directions),
         "blocked_directions": sorted(blocked_directions),
         "total_items": len(registry_items),
+        "global_best_candidate_id": global_best_candidate_id,
+        "global_best_val_bpb": global_best_val_bpb,
+        "near_miss_abs_bpb": NEAR_MISS_ABS_BPB,
+        "near_misses": near_misses[:12],
     }
 
 
@@ -203,6 +280,8 @@ def _operator_for_direction(stats: dict[str, Any]) -> str:
     keep_count = int(stats.get("keep_count") or 0)
     discard_count = int(stats.get("discard_count") or 0)
     blocked_count = int(stats.get("blocked_count") or 0)
+    if stats.get("near_miss_candidate_id"):
+        return "near_miss_refine"
     if blocked_count >= 2 or discard_count >= 3:
         return "avoid_failed_family"
     if visits == 0:
@@ -222,6 +301,10 @@ def _search_parent_for_operator(operator: str, stats: dict[str, Any]) -> str | N
         return _clean_candidate_id(
             stats.get("best_candidate_id") or stats.get("last_candidate_id")
         )
+    if operator == "near_miss_refine":
+        return _clean_candidate_id(
+            stats.get("near_miss_candidate_id") or stats.get("last_failed_candidate_id")
+        )
     if operator == "pivot_near_miss":
         return _clean_candidate_id(
             stats.get("last_failed_candidate_id") or stats.get("last_candidate_id")
@@ -235,10 +318,46 @@ def _search_parent_for_operator(operator: str, stats: dict[str, Any]) -> str | N
     return None
 
 
+def _default_experiment_brief(search_mode: str, operator: str) -> str:
+    if operator == "near_miss_refine" or search_mode == "local_tune_after_mechanism":
+        return (
+            "Start from the near-miss parent train.py and make exactly one small "
+            "local refinement. Prefer tuning mechanism strength, initialization, "
+            "warmup/activation schedule, clipping threshold, or a narrow control "
+            "constant tied to the existing mechanism. Do not replace the mechanism "
+            "family or add an unrelated new component."
+        )
+    return (
+        "Implement one minimal train.py change that follows this plan and "
+        "keeps unrelated settings fixed."
+    )
+
+
+def _default_expected_mechanism(search_mode: str, operator: str) -> str:
+    if operator == "near_miss_refine" or search_mode == "local_tune_after_mechanism":
+        return (
+            "The diff should preserve the near-miss mechanism while improving its "
+            "calibration, stability, or activation strength."
+        )
+    return "The diff should change the assigned mechanism, not merely tune capacity."
+
+
 def _choose_direction(summary: dict[str, Any]) -> tuple[str, dict[str, Any], float]:
     by_direction = summary.get("by_direction")
     if not isinstance(by_direction, dict) or not by_direction:
         return "architecture.attention", {}, 1.0
+
+    active_directions = set(summary.get("active_directions") or [])
+    for near_miss in summary.get("near_misses") or []:
+        if not isinstance(near_miss, dict):
+            continue
+        direction = str(near_miss.get("direction_key") or "").strip()
+        if not direction or direction in active_directions:
+            continue
+        stats = by_direction.get(direction)
+        if isinstance(stats, dict):
+            delta = float(near_miss.get("delta_bpb") or 0.0)
+            return direction, stats, round(3.0 - delta, 6)
 
     scored: list[tuple[float, str, dict[str, Any]]] = []
     for direction, stats in by_direction.items():
@@ -250,6 +369,8 @@ def _choose_direction(summary: dict[str, Any]) -> tuple[str, dict[str, Any], flo
         keep_rate = keep_count / max(1, visits)
         exploration = 1.0 / math.sqrt(max(1, visits))
         score = keep_rate * 2.0 + exploration
+        if stats.get("near_miss_candidate_id"):
+            score += 2.5
         score -= active_count * 2.0
         score -= blocked_count * 0.8
         score -= discard_count * 0.25
@@ -267,6 +388,12 @@ def _default_intent(search_mode: str, operator: str, direction: str) -> str:
         return (
             f"Tune only control hyperparameters for {direction} to stabilize "
             "training and keep the parent node comparable."
+        )
+    if operator == "near_miss_refine":
+        return (
+            f"Locally refine the near-miss {direction} candidate with one small "
+            "bounded change to its mechanism controls, initialization, schedule, "
+            "or activation strength."
         )
     if operator == "pivot_near_miss":
         return (
@@ -319,7 +446,9 @@ def select_search_plan(
     direction, stats, priority = _choose_direction(summary)
     operator = _operator_for_direction(stats)
     search_mode = "control_tune" if operator == "control_tune" else "mechanism_search"
-    if operator == "avoid_failed_family":
+    if operator == "near_miss_refine":
+        search_mode = "local_tune_after_mechanism"
+    elif operator == "avoid_failed_family":
         search_mode = "pivot_after_failure"
     elif operator == "pivot_near_miss":
         search_mode = "pivot_after_failure"
@@ -336,6 +465,9 @@ def select_search_plan(
             "blocked_count": 0,
             "active_count": 0,
             "best_candidate_id": "",
+            "near_miss_candidate_id": "",
+            "near_miss_val_bpb": None,
+            "near_miss_delta_bpb": None,
             "recent_failure_reasons": [],
             "last_candidate_id": "",
             "last_failed_candidate_id": "",
@@ -358,11 +490,8 @@ def select_search_plan(
         priority=round(priority, 6),
         search_mode=search_mode,
         search_parent_id=search_parent_id,
-        experiment_brief=(
-            "Implement one minimal train.py change that follows this plan and "
-            "keeps unrelated settings fixed."
-        ),
-        expected_mechanism="The diff should change the assigned mechanism, not merely tune capacity.",
+        experiment_brief=_default_experiment_brief(search_mode, operator),
+        expected_mechanism=_default_expected_mechanism(search_mode, operator),
         success_interpretation="Lower val_bpb supports the selected mechanism under this parent.",
         failure_interpretation="No improvement suggests pivoting or rejecting this mechanism family.",
         stats={
@@ -474,12 +603,20 @@ def compute_reward(
     run_status: str,
     discard_reason: str | None = None,
 ) -> tuple[float, str]:
+    if (
+        final_status in {"keep", "discard"}
+        and val_bpb is not None
+        and math.isfinite(baseline_before)
+        and baseline_before > 0
+    ):
+        return (
+            (baseline_before - val_bpb) / baseline_before * 100.0,
+            "relative_bpb_improvement_percent",
+        )
     if final_status == "keep" and val_bpb is not None:
-        if math.isfinite(baseline_before) and baseline_before > 0:
-            return (baseline_before - val_bpb) / baseline_before * 100.0, "relative_bpb_improvement_percent"
         return 1.0, "keep_default"
     if final_status == "discard" and run_status == "completed":
-        return -0.2, "completed_not_improved"
+        return -0.2, "completed_not_improved_no_metric"
     if discard_reason == "repair_out_of_scope":
         return -1.0, "repair_out_of_scope"
     if run_status in {"timeout", "oom", "failed", "crashed"}:
