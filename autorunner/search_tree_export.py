@@ -23,6 +23,27 @@ from autorunner.env_config import load_dotenv, project_root
 
 BASELINE_NODE_ID = "baseline"
 CANDIDATE_ID_RE = re.compile(r"cand-\d+")
+CANDIDATE_ID_FULL_RE = re.compile(r"^cand-(\d+)$")
+
+SEARCH_MODE_LABELS_ZH = {
+    "baseline_intake": "基线导入",
+    "mechanism_search": "机制搜索",
+    "control_tune": "控制调参",
+    "pivot_after_failure": "失败后转向",
+    "verify_winner": "优胜复验",
+}
+
+OPERATOR_LABELS_ZH = {
+    "root": "根节点",
+    "explore_new_mechanism": "探索新机制",
+    "exploit_best_mechanism": "强化有效机制",
+    "pivot_near_miss": "近似失败转向",
+    "avoid_failed_family": "避开失败族",
+    "control_tune": "控制调参",
+    "verify_winner": "复验优胜分支",
+    "merge_validate": "合并验证",
+    "simplify_winner": "简化优胜分支",
+}
 
 
 def _now_iso() -> str:
@@ -323,6 +344,33 @@ def _coalesce(*values: Any) -> Any:
     return None
 
 
+def _candidate_sort_key(candidate_id: Any) -> tuple[int, str]:
+    text = str(candidate_id or "").strip()
+    if text == BASELINE_NODE_ID:
+        return (-1, text)
+    match = CANDIDATE_ID_FULL_RE.match(text)
+    if match:
+        return (int(match.group(1)), text)
+    return (10**9, text)
+
+
+def _zh_label(mapping: dict[str, str], value: Any) -> str:
+    key = str(value or "").strip()
+    if not key:
+        return ""
+    return mapping.get(key, key)
+
+
+def _zh_display(raw_value: Any, label_value: Any) -> str:
+    raw = str(raw_value or "").strip()
+    label = str(label_value or "").strip()
+    if not raw:
+        return ""
+    if not label or label == raw:
+        return raw
+    return f"{label} ({raw})"
+
+
 def _build_raw_nodes(
     *,
     registry_items: list[dict[str, Any]],
@@ -414,6 +462,20 @@ def _build_raw_nodes(
                 item.get("parent_candidate_id"),
                 "",
             ),
+            "semantic_parent_id": item.get("semantic_parent_id") or "",
+            "code_parent_id": item.get("code_parent_id") or "",
+            "code_parent_ref": _coalesce(
+                item.get("code_parent_ref"),
+                item.get("parent_ref"),
+                "",
+            ),
+            "lineage_relation_type": item.get("lineage_relation_type") or "",
+            "lineage_inferred": bool(item.get("lineage_inferred")),
+            "relation_edges": (
+                item.get("relation_edges")
+                if isinstance(item.get("relation_edges"), list)
+                else []
+            ),
             "parent_ref": item.get("parent_ref") or "",
             "epoch_id": item.get("epoch_id"),
             "search_depth": item.get("search_depth"),
@@ -467,6 +529,14 @@ def _build_raw_nodes(
     return nodes
 
 
+def _apply_display_labels(nodes_by_id: dict[str, dict[str, Any]]) -> None:
+    for node in nodes_by_id.values():
+        search_mode = node.get("search_mode")
+        operator = node.get("operator")
+        node["search_mode_label"] = _zh_label(SEARCH_MODE_LABELS_ZH, search_mode)
+        node["operator_label"] = _zh_label(OPERATOR_LABELS_ZH, operator)
+
+
 def _assign_depths(nodes: dict[str, dict[str, Any]]) -> None:
     def depth_for(node_id: str, visiting: set[str]) -> int:
         node = nodes.get(node_id)
@@ -500,6 +570,7 @@ def _finalize_tree_payload(
     demo: bool = False,
 ) -> dict[str, Any]:
     _assign_depths(nodes_by_id)
+    _apply_display_labels(nodes_by_id)
 
     rewards = [
         float(node["reward"])
@@ -553,6 +624,10 @@ def _finalize_tree_payload(
                 "negative": "light-to-dark red",
                 "unknown": "gray",
             },
+        },
+        "display_labels": {
+            "search_mode": SEARCH_MODE_LABELS_ZH,
+            "operator": OPERATOR_LABELS_ZH,
         },
         "summary": {
             "node_count": len(nodes),
@@ -804,17 +879,76 @@ def _layout_tree(tree: dict[str, Any]) -> tuple[dict[str, tuple[int, int]], int,
 
 
 def _node_tooltip(node: dict[str, Any]) -> str:
+    mode_display = _zh_display(
+        node.get("search_mode"),
+        node.get("search_mode_label"),
+    )
+    operator_display = _zh_display(
+        node.get("operator"),
+        node.get("operator_label"),
+    )
+    search_parent_display = node.get("parent_id") or ""
+    code_parent_display = (
+        _coalesce(node.get("code_parent_id"), node.get("code_parent_ref"), "") or ""
+    )
     parts = [
         f"id: {node.get('id')}",
+        f"search_parent: {search_parent_display}",
+        f"code_parent: {code_parent_display}",
         f"status: {node.get('status')}",
         f"reward: {node.get('reward')}",
         f"val_bpb: {node.get('val_bpb')}",
         f"direction: {node.get('direction_key')}",
-        f"mode: {node.get('search_mode')}",
-        f"operator: {node.get('operator')}",
+        f"mode: {mode_display}",
+        f"operator: {operator_display}",
         f"description: {node.get('description')}",
     ]
     return "\n".join(str(x) for x in parts if x is not None)
+
+
+def _table_group_root_id(
+    node: dict[str, Any],
+    node_by_id: dict[str, dict[str, Any]],
+) -> str:
+    node_id = str(node.get("id") or "")
+    if not node_id or node_id == BASELINE_NODE_ID:
+        return BASELINE_NODE_ID
+
+    current = node
+    root_id = node_id
+    visited: set[str] = set()
+    while True:
+        current_id = str(current.get("id") or "")
+        if current_id in visited:
+            return root_id
+        visited.add(current_id)
+
+        parent_id = str(current.get("parent_id") or "")
+        if not parent_id or parent_id == BASELINE_NODE_ID:
+            return root_id
+        parent = node_by_id.get(parent_id)
+        if not parent:
+            return root_id
+        root_id = parent_id
+        current = parent
+
+
+def _table_group_label(
+    root_id: str,
+    rows: list[dict[str, Any]],
+    node_by_id: dict[str, dict[str, Any]],
+) -> str:
+    if root_id == BASELINE_NODE_ID:
+        return "基线"
+    root_node = node_by_id.get(root_id) or {}
+    direction = str(
+        _coalesce(
+            root_node.get("direction_key"),
+            rows[0].get("direction_key") if rows else "",
+            "unknown",
+        )
+    )
+    return f"相关组：{direction} · root {root_id} · {len(rows)} nodes"
 
 
 def render_search_tree_html(tree: dict[str, Any]) -> str:
@@ -869,21 +1003,52 @@ def render_search_tree_html(tree: dict[str, Any]) -> str:
             )
         )
 
-    details_rows: list[str] = []
+    grouped_nodes: dict[str, list[dict[str, Any]]] = {}
     for node in nodes:
+        root_id = _table_group_root_id(node, node_by_id)
+        grouped_nodes.setdefault(root_id, []).append(node)
+
+    details_rows: list[str] = []
+    table_column_count = 10
+    for root_id in sorted(grouped_nodes, key=_candidate_sort_key):
+        group_rows = sorted(
+            grouped_nodes[root_id],
+            key=lambda item: _candidate_sort_key(item.get("id")),
+        )
+        group_label = _table_group_label(root_id, group_rows, node_by_id)
         details_rows.append(
-            "<tr>"
-            f"<td>{html.escape(str(node.get('id') or ''))}</td>"
-            f"<td>{html.escape(str(node.get('parent_id') or ''))}</td>"
-            f"<td>{html.escape(str(node.get('status') or ''))}</td>"
-            f"<td>{html.escape(str(node.get('reward') if node.get('reward') is not None else ''))}</td>"
-            f"<td>{html.escape(str(node.get('val_bpb') if node.get('val_bpb') is not None else ''))}</td>"
-            f"<td>{html.escape(str(node.get('direction_key') or ''))}</td>"
-            f"<td>{html.escape(str(node.get('search_mode') or ''))}</td>"
-            f"<td>{html.escape(str(node.get('operator') or ''))}</td>"
-            f"<td>{html.escape(str(node.get('description') or ''))}</td>"
+            '<tr class="group-row">'
+            f'<td colspan="{table_column_count}">{html.escape(group_label)}</td>'
             "</tr>"
         )
+        for node in group_rows:
+            mode_display = _zh_display(
+                node.get("search_mode"),
+                node.get("search_mode_label"),
+            )
+            operator_display = _zh_display(
+                node.get("operator"),
+                node.get("operator_label"),
+            )
+            code_parent_display = _coalesce(
+                node.get("code_parent_id"),
+                node.get("code_parent_ref"),
+                "",
+            )
+            details_rows.append(
+                "<tr>"
+                f"<td>{html.escape(str(node.get('id') or ''))}</td>"
+                f"<td>{html.escape(str(node.get('parent_id') or ''))}</td>"
+                f"<td>{html.escape(str(code_parent_display or ''))}</td>"
+                f"<td>{html.escape(str(node.get('status') or ''))}</td>"
+                f"<td>{html.escape(str(node.get('reward') if node.get('reward') is not None else ''))}</td>"
+                f"<td>{html.escape(str(node.get('val_bpb') if node.get('val_bpb') is not None else ''))}</td>"
+                f"<td>{html.escape(str(node.get('direction_key') or ''))}</td>"
+                f"<td>{html.escape(mode_display)}</td>"
+                f"<td>{html.escape(operator_display)}</td>"
+                f"<td>{html.escape(str(node.get('description') or ''))}</td>"
+                "</tr>"
+            )
 
     demo_note = (
         '<span class="badge">DEMO DATA</span>'
@@ -947,12 +1112,46 @@ def render_search_tree_html(tree: dict[str, Any]) -> str:
       color: #166534;
       background: #f0fdf4;
     }}
-    main {{
-      padding: 18px 24px 32px;
-    }}
-    .legend {{
-      display: flex;
-      flex-wrap: wrap;
+	    main {{
+	      padding: 18px 24px 32px;
+	    }}
+	    .tabs {{
+	      display: flex;
+	      flex-wrap: wrap;
+	      gap: 6px;
+	      margin-bottom: 14px;
+	      border-bottom: 1px solid #d9e2ec;
+	    }}
+	    .tab-button {{
+	      appearance: none;
+	      border: 1px solid transparent;
+	      border-bottom: 0;
+	      background: transparent;
+	      color: #475569;
+	      padding: 9px 14px;
+	      font: inherit;
+	      font-size: 13px;
+	      font-weight: 700;
+	      cursor: pointer;
+	    }}
+	    .tab-button:hover {{
+	      color: #0f172a;
+	      background: #f8fafc;
+	    }}
+	    .tab-button[aria-selected="true"] {{
+	      color: #0f172a;
+	      background: #ffffff;
+	      border-color: #d9e2ec;
+	    }}
+	    .tab-panel {{
+	      display: none;
+	    }}
+	    .tab-panel.active {{
+	      display: block;
+	    }}
+	    .legend {{
+	      display: flex;
+	      flex-wrap: wrap;
       gap: 10px;
       margin-bottom: 14px;
       color: #475569;
@@ -1022,14 +1221,20 @@ def render_search_tree_html(tree: dict[str, Any]) -> str:
       text-align: left;
       vertical-align: top;
     }}
-    th {{
-      background: #f1f5f9;
-      font-weight: 700;
-      color: #334155;
-    }}
-    td {{
-      color: #334155;
-    }}
+	    th {{
+	      background: #f1f5f9;
+	      font-weight: 700;
+	      color: #334155;
+	    }}
+	    .group-row td {{
+	      background: #e2e8f0;
+	      color: #0f172a;
+	      font-weight: 800;
+	      border-top: 2px solid #cbd5e1;
+	    }}
+	    td {{
+	      color: #334155;
+	    }}
   </style>
 </head>
 <body>
@@ -1041,49 +1246,71 @@ def render_search_tree_html(tree: dict[str, Any]) -> str:
       <span>nodes: {html.escape(str(summary.get("node_count") or 0))}</span>
       <span>edges: {html.escape(str(summary.get("edge_count") or 0))}</span>
     </div>
-  </header>
-  <main>
-    <div class="legend">
-      <span><span class="swatch" style="background:#166534"></span>positive reward</span>
-      <span><span class="swatch" style="background:#991b1b"></span>negative reward</span>
-      <span><span class="swatch" style="background:#9ca3af"></span>unknown reward</span>
-      <span>border color indicates status</span>
-    </div>
-    <div class="canvas">
-      <svg width="{width}" height="{height}" viewBox="0 0 {width} {height}" role="img" aria-label="AutoResearch search tree">
-        <g class="edges">
-          {"".join(edge_svg)}
-        </g>
-        <g class="nodes">
-          {"".join(node_svg)}
-        </g>
-      </svg>
-    </div>
-    <section>
-      <h2>Node Details</h2>
-      <table>
+	  </header>
+	  <main>
+	    <div class="tabs" role="tablist" aria-label="Search tree views">
+	      <button class="tab-button" id="tab-tree" type="button" role="tab" aria-controls="panel-tree" aria-selected="true" data-tab-target="panel-tree">搜索树</button>
+	      <button class="tab-button" id="tab-table" type="button" role="tab" aria-controls="panel-table" aria-selected="false" data-tab-target="panel-table">表格信息</button>
+	    </div>
+	    <section id="panel-tree" class="tab-panel active" role="tabpanel" aria-labelledby="tab-tree">
+	      <div class="legend">
+	        <span><span class="swatch" style="background:#166534"></span>positive reward</span>
+	        <span><span class="swatch" style="background:#991b1b"></span>negative reward</span>
+	        <span><span class="swatch" style="background:#9ca3af"></span>unknown reward</span>
+	        <span>border color indicates status</span>
+	      </div>
+	      <div class="canvas">
+	        <svg width="{width}" height="{height}" viewBox="0 0 {width} {height}" role="img" aria-label="AutoResearch search tree">
+	          <g class="edges">
+	            {"".join(edge_svg)}
+	          </g>
+	          <g class="nodes">
+	            {"".join(node_svg)}
+	          </g>
+	        </svg>
+	      </div>
+	    </section>
+	    <section id="panel-table" class="tab-panel" role="tabpanel" aria-labelledby="tab-table">
+	      <h2>节点详情</h2>
+	      <table>
         <thead>
-          <tr>
-            <th>ID</th>
-            <th>Parent</th>
-            <th>Status</th>
+            <tr>
+              <th>ID</th>
+            <th>搜索父节点</th>
+            <th>代码父节点</th>
+            <th>状态</th>
             <th>Reward</th>
             <th>Val BPB</th>
-            <th>Direction</th>
-            <th>Mode</th>
-            <th>Operator</th>
-            <th>Description</th>
+            <th>方向</th>
+            <th>模式</th>
+            <th>算子</th>
+            <th>描述</th>
           </tr>
         </thead>
         <tbody>
           {"".join(details_rows)}
         </tbody>
-      </table>
-    </section>
-  </main>
-</body>
-</html>
-"""
+	      </table>
+	    </section>
+	  </main>
+	  <script>
+	    const tabButtons = Array.from(document.querySelectorAll("[data-tab-target]"));
+	    const tabPanels = Array.from(document.querySelectorAll(".tab-panel"));
+	    for (const button of tabButtons) {{
+	      button.addEventListener("click", () => {{
+	        const targetId = button.getAttribute("data-tab-target");
+	        for (const item of tabButtons) {{
+	          item.setAttribute("aria-selected", String(item === button));
+	        }}
+	        for (const panel of tabPanels) {{
+	          panel.classList.toggle("active", panel.id === targetId);
+	        }}
+	      }});
+	    }}
+	  </script>
+	</body>
+	</html>
+	"""
 
 
 def export_search_tree_html(
