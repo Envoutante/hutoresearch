@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import hashlib
 import json
 import math
 import os
@@ -65,11 +66,13 @@ EXPERIMENT_REGISTRY_FILE = STATE_DIR / "experiment_registry.jsonl"
 GENERATOR_GUIDANCE_FILE = GUIDANCE_DIR / "generator_guidance.md"
 QUEUE_EVENTS_FILE = STATE_DIR / "parallel_queue.jsonl"
 BEST_TRAIN_FILE = SNAPSHOTS_DIR / "best_train.py"
+BEST_SNAPSHOT_FILE = STATE_DIR / "best_snapshot.json"
 MODEL = os.getenv("AR_MODEL", "deepseek-v4-pro[1m]")
 AGENT_BACKEND = os.getenv("AR_AGENT_BACKEND", "claude")
 console = Console()
 REGISTRY_LOCK = threading.Lock()
 GENERATOR_GUIDANCE_LOCK = threading.Lock()
+BEST_TRAIN_LOCK = threading.Lock()
 ACTIVE_REGISTRY_STALE_SEC = int(os.getenv("AR_REGISTRY_ACTIVE_STALE_SEC", "1800"))
 
 FATAL_STOP_REASON = "fatal_model_api_error"
@@ -98,6 +101,11 @@ class CandidateTask:
     search_mode: str = ""
     search_operator: str = ""
     search_parent_id: str = ""
+    semantic_parent_id: str = ""
+    code_parent_id: str = ""
+    code_parent_ref: str = ""
+    code_parent_hash: str = ""
+    relation_edges: list[dict[str, Any]] | None = None
     target_direction_key: str = ""
     intent: str = ""
     rationale: str = ""
@@ -943,6 +951,94 @@ def _load_baseline() -> float:
     return best if best is not None else float("inf")
 
 
+def _file_sha256(path: Path) -> str:
+    if not path.exists():
+        return ""
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _read_best_snapshot_unlocked() -> dict[str, Any]:
+    if not BEST_SNAPSHOT_FILE.exists():
+        return {}
+    try:
+        data = json.loads(BEST_SNAPSHOT_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_best_snapshot_unlocked(
+    *,
+    best_candidate_id: str,
+    best_val_bpb: float | None,
+    source: str,
+) -> dict[str, Any]:
+    BEST_SNAPSHOT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema_version": 1,
+        "best_candidate_id": best_candidate_id or "baseline",
+        "best_val_bpb": best_val_bpb if best_val_bpb is not None else None,
+        "best_train_path": str(BEST_TRAIN_FILE.relative_to(WORKDIR)),
+        "code_hash": _file_sha256(BEST_TRAIN_FILE),
+        "updated_at": _now_iso(),
+        "source": source,
+    }
+    tmp_path = BEST_SNAPSHOT_FILE.with_suffix(".json.tmp")
+    tmp_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    tmp_path.replace(BEST_SNAPSHOT_FILE)
+    return payload
+
+
+def _infer_best_snapshot_from_registry(
+    baseline_bpb: float,
+) -> tuple[str, float | None, str]:
+    best_candidate_id = "baseline"
+    best_val_bpb = baseline_bpb if math.isfinite(baseline_bpb) else None
+    source = "baseline_init"
+    for item in _load_experiment_registry():
+        if str(item.get("status") or "") != "keep":
+            continue
+        result = item.get("result")
+        if not isinstance(result, dict):
+            continue
+        try:
+            val_bpb = float(result.get("val_bpb"))
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(val_bpb):
+            continue
+        if best_val_bpb is None or val_bpb <= best_val_bpb:
+            best_candidate_id = str(item.get("candidate_id") or "baseline")
+            best_val_bpb = val_bpb
+            source = "registry_inferred"
+    return best_candidate_id, best_val_bpb, source
+
+
+def _initialize_best_snapshot(baseline_bpb: float) -> None:
+    with BEST_TRAIN_LOCK:
+        if not BEST_TRAIN_FILE.exists():
+            BEST_TRAIN_FILE.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(WORKDIR / "train.py", BEST_TRAIN_FILE)
+        snapshot = _read_best_snapshot_unlocked()
+        if snapshot.get("best_candidate_id") and snapshot.get("code_hash"):
+            return
+        best_candidate_id, best_val_bpb, source = _infer_best_snapshot_from_registry(
+            baseline_bpb
+        )
+        _write_best_snapshot_unlocked(
+            best_candidate_id=best_candidate_id,
+            best_val_bpb=best_val_bpb,
+            source=source,
+        )
+
+
 def _build_run_summaries() -> list[str]:
     if not RESULTS_TSV_FILE.exists():
         return []
@@ -1158,11 +1254,115 @@ def _pick_least_loaded_gpu_id() -> int:
     return best_gpu
 
 
-def _copy_base_train_to_candidate(base_train: Path, candidate_dir: Path) -> Path:
+def _copy_base_train_to_candidate(
+    base_train: Path,
+    candidate_dir: Path,
+) -> tuple[Path, dict[str, Any]]:
     candidate_dir.mkdir(parents=True, exist_ok=True)
     target = candidate_dir / "train.py"
-    shutil.copy2(base_train, target)
-    return target
+    with BEST_TRAIN_LOCK:
+        snapshot = _read_best_snapshot_unlocked()
+        if not snapshot:
+            snapshot = _write_best_snapshot_unlocked(
+                best_candidate_id="baseline",
+                best_val_bpb=None,
+                source="copy_fallback",
+            )
+        shutil.copy2(base_train, target)
+    return target, snapshot
+
+
+def _plan_search_parent_id(plan: SearchPlan) -> str:
+    return str(plan.search_parent_id or plan.parent_candidate_id or "").strip()
+
+
+def _search_relation_type(operator: str) -> str:
+    return {
+        "exploit_best_mechanism": "exploit_after_same_direction",
+        "pivot_near_miss": "pivot_from_same_direction",
+        "avoid_failed_family": "avoid_failed_family_from_same_direction",
+    }.get(operator, "search_parent")
+
+
+def _normalized_candidate_ids(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    out: list[str] = []
+    for item in value:
+        text = str(item or "").strip()
+        if text and text not in out:
+            out.append(text)
+    return out[:8]
+
+
+def _build_relation_edges(
+    *,
+    candidate_id: str,
+    search_parent_id: str,
+    search_operator: str,
+    code_parent_id: str,
+    nearest_candidate_ids: list[str] | None = None,
+    duplicate_level: str = "",
+) -> list[dict[str, str]]:
+    edges: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add(target: str, edge_type: str, source: str) -> None:
+        target = str(target or "").strip()
+        if not target or target == candidate_id:
+            return
+        key = (target, edge_type)
+        if key in seen:
+            return
+        seen.add(key)
+        edges.append({"target": target, "type": edge_type, "source": source})
+
+    if search_parent_id:
+        add(search_parent_id, _search_relation_type(search_operator), "search_plan")
+    if code_parent_id and code_parent_id not in {"baseline", search_parent_id}:
+        add(code_parent_id, "code_parent", "best_snapshot")
+    for nearest_id in nearest_candidate_ids or []:
+        if nearest_id == search_parent_id:
+            continue
+        add(
+            nearest_id,
+            duplicate_level or "nearest_candidate",
+            "novelty_judge.nearest_candidate_ids",
+        )
+    return edges
+
+
+def _lineage_updates(
+    *,
+    candidate_id: str,
+    search_plan: SearchPlan,
+    code_parent_snapshot: dict[str, Any],
+    nearest_candidate_ids: list[str] | None = None,
+    duplicate_level: str = "",
+) -> dict[str, Any]:
+    search_parent_id = _plan_search_parent_id(search_plan)
+    code_parent_id = str(
+        code_parent_snapshot.get("best_candidate_id") or "baseline"
+    ).strip()
+    code_parent_ref = str(
+        code_parent_snapshot.get("best_train_path") or BEST_TRAIN_FILE.name
+    )
+    code_parent_hash = str(code_parent_snapshot.get("code_hash") or "")
+    return {
+        "search_parent_id": search_parent_id,
+        "semantic_parent_id": search_parent_id,
+        "code_parent_id": code_parent_id,
+        "code_parent_ref": code_parent_ref,
+        "code_parent_hash": code_parent_hash,
+        "relation_edges": _build_relation_edges(
+            candidate_id=candidate_id,
+            search_parent_id=search_parent_id,
+            search_operator=search_plan.operator,
+            code_parent_id=code_parent_id,
+            nearest_candidate_ids=nearest_candidate_ids,
+            duplicate_level=duplicate_level,
+        ),
+    }
 
 
 def _complete_search_plan_with_agent(
@@ -1228,7 +1428,15 @@ def _create_candidate(
     pivot_guidance = ""
 
     for attempt in range(1, max_duplicate_retries + 2):
-        candidate_train = _copy_base_train_to_candidate(base_train_path, candidate_dir)
+        candidate_train, code_parent_snapshot = _copy_base_train_to_candidate(
+            base_train_path,
+            candidate_dir,
+        )
+        base_lineage = _lineage_updates(
+            candidate_id=candidate_id,
+            search_plan=search_plan,
+            code_parent_snapshot=code_parent_snapshot,
+        )
         base_code = candidate_train.read_text()
         generator_guidance = _refresh_generator_guidance(
             exclude_candidate_id=candidate_id,
@@ -1284,6 +1492,7 @@ def _create_candidate(
                     candidate_id,
                     status="generation_failed",
                     parent_ref=base_train_path.name,
+                    **base_lineage,
                     description=f"candidate {candidate_id}",
                     failure_reason="agent_attempted_training",
                 )
@@ -1350,6 +1559,7 @@ def _create_candidate(
                     candidate_id,
                     status="generation_failed",
                     parent_ref=base_train_path.name,
+                    **base_lineage,
                     description=f"candidate {candidate_id}",
                     failure_reason=(result.stderr or failure_reason)[:200],
                 )
@@ -1367,6 +1577,7 @@ def _create_candidate(
                 candidate_id,
                 status="generation_failed",
                 parent_ref=base_train_path.name,
+                **base_lineage,
                 description=f"candidate {candidate_id}",
                 failure_reason="train.py not updated",
             )
@@ -1386,6 +1597,7 @@ def _create_candidate(
                 candidate_id,
                 status="generation_failed",
                 parent_ref=base_train_path.name,
+                **base_lineage,
                 description=f"candidate {candidate_id}",
                 failure_reason=f"py_compile_failed: {compile_error}"[:200],
             )
@@ -1443,6 +1655,7 @@ def _create_candidate(
                     candidate_id,
                     status="generation_failed",
                     parent_ref=base_train_path.name,
+                    **base_lineage,
                     description=f"candidate {candidate_id}",
                     failure_reason="missing_structured_fields",
                 )
@@ -1464,7 +1677,7 @@ def _create_candidate(
             "search_plan_id": search_plan.plan_id,
             "search_mode": search_plan.search_mode,
             "search_operator": search_plan.operator,
-            "search_parent_id": search_plan.parent_candidate_id or "",
+            **base_lineage,
             "target_direction_key": search_plan.target_direction_key,
             "intent": search_plan.intent,
             "rationale": search_plan.rationale,
@@ -1521,7 +1734,7 @@ def _create_candidate(
             else "judge_failed"
         )
         nearest = (
-            judge_payload.get("nearest_candidate_ids")
+            _normalized_candidate_ids(judge_payload.get("nearest_candidate_ids"))
             if isinstance(judge_payload, dict)
             else []
         )
@@ -1529,6 +1742,13 @@ def _create_candidate(
             str(judge_payload.get("reason") or "")
             if isinstance(judge_payload, dict)
             else (judge_result.stderr or "novelty_judge_failed")
+        )
+        judge_lineage = _lineage_updates(
+            candidate_id=candidate_id,
+            search_plan=search_plan,
+            code_parent_snapshot=code_parent_snapshot,
+            nearest_candidate_ids=nearest,
+            duplicate_level=duplicate_level,
         )
 
         if allow_run:
@@ -1550,7 +1770,12 @@ def _create_candidate(
                 search_plan_id=search_plan.plan_id,
                 search_mode=search_plan.search_mode,
                 search_operator=search_plan.operator,
-                search_parent_id=search_plan.parent_candidate_id or "",
+                search_parent_id=str(judge_lineage.get("search_parent_id") or ""),
+                semantic_parent_id=str(judge_lineage.get("semantic_parent_id") or ""),
+                code_parent_id=str(judge_lineage.get("code_parent_id") or ""),
+                code_parent_ref=str(judge_lineage.get("code_parent_ref") or ""),
+                code_parent_hash=str(judge_lineage.get("code_parent_hash") or ""),
+                relation_edges=list(judge_lineage.get("relation_edges") or []),
                 target_direction_key=search_plan.target_direction_key,
                 intent=search_plan.intent,
                 rationale=search_plan.rationale,
@@ -1568,6 +1793,7 @@ def _create_candidate(
                 candidate_id,
                 status="queued",
                 novelty_judge=judge_payload,
+                **judge_lineage,
                 failure_reason=None,
                 reward=None,
                 reward_source=None,
@@ -1582,6 +1808,8 @@ def _create_candidate(
                     "search_plan_id": search_plan.plan_id,
                     "search_mode": search_plan.search_mode,
                     "search_operator": search_plan.operator,
+                    "search_parent_id": judge_lineage.get("search_parent_id") or "",
+                    "code_parent_id": judge_lineage.get("code_parent_id") or "",
                     "changed_upper_keys": changed_keys,
                     "novelty_level": duplicate_level,
                 },
@@ -1591,6 +1819,7 @@ def _create_candidate(
         _update_registry_entry(
             candidate_id,
             status="blocked_duplicate",
+            **judge_lineage,
             novelty_judge=judge_payload
             or {
                 "allow_run": False,
@@ -1843,9 +2072,6 @@ def run_parallel_loop(
     _mark_stale_active_registry_entries()
     _refresh_generator_guidance()
 
-    if not BEST_TRAIN_FILE.exists():
-        shutil.copy2(WORKDIR / "train.py", BEST_TRAIN_FILE)
-
     agent = make_code_agent(
         backend=AGENT_BACKEND,
         model=MODEL if AGENT_BACKEND.strip().lower() == "claude" else None,
@@ -1853,6 +2079,7 @@ def run_parallel_loop(
         stream_output=False,
     )
     baseline_bpb = _load_baseline()
+    _initialize_best_snapshot(baseline_bpb)
 
     queued: list[CandidateTask] = []
     running: dict[str, RunningTask] = {}
@@ -2030,6 +2257,13 @@ def run_parallel_loop(
                             parent_ref=BEST_TRAIN_FILE.name,
                             parent_candidate_id=None,
                         )
+                        search_parent_id = _plan_search_parent_id(search_plan)
+                        search_relation_edges = _build_relation_edges(
+                            candidate_id=candidate_id,
+                            search_parent_id=search_parent_id,
+                            search_operator=search_plan.operator,
+                            code_parent_id="",
+                        )
                         _update_registry_entry(
                             candidate_id,
                             status="proposed",
@@ -2039,10 +2273,13 @@ def run_parallel_loop(
                             search_plan_id=search_plan.plan_id,
                             search_mode=search_plan.search_mode,
                             search_operator=search_plan.operator,
+                            search_parent_id=search_parent_id,
+                            semantic_parent_id=search_parent_id,
                             target_direction_key=search_plan.target_direction_key,
                             intent=search_plan.intent,
                             rationale=search_plan.rationale,
                             avoid_direction_keys=search_plan.avoid_direction_keys,
+                            relation_edges=search_relation_edges,
                             search_plan=search_plan.to_dict(),
                         )
                         candidate_dir = CANDIDATE_ROOT / candidate_id
@@ -2066,9 +2303,12 @@ def run_parallel_loop(
                             )
                         ok, reason = validate_search_plan(search_plan)
                         if not ok:
+                            search_parent_id = _plan_search_parent_id(search_plan)
                             _update_registry_entry(
                                 candidate_id,
                                 status="generation_failed",
+                                search_parent_id=search_parent_id,
+                                semantic_parent_id=search_parent_id,
                                 failure_reason=f"invalid_search_plan:{reason}"[:200],
                             )
                             _append_queue_event(
@@ -2079,15 +2319,25 @@ def run_parallel_loop(
                                 },
                             )
                             continue
+                        search_parent_id = _plan_search_parent_id(search_plan)
+                        search_relation_edges = _build_relation_edges(
+                            candidate_id=candidate_id,
+                            search_parent_id=search_parent_id,
+                            search_operator=search_plan.operator,
+                            code_parent_id="",
+                        )
                         _update_registry_entry(
                             candidate_id,
                             search_plan_id=search_plan.plan_id,
                             search_mode=search_plan.search_mode,
                             search_operator=search_plan.operator,
+                            search_parent_id=search_parent_id,
+                            semantic_parent_id=search_parent_id,
                             target_direction_key=search_plan.target_direction_key,
                             intent=search_plan.intent,
                             rationale=search_plan.rationale,
                             avoid_direction_keys=search_plan.avoid_direction_keys,
+                            relation_edges=search_relation_edges,
                             search_plan=search_plan.to_dict(),
                             reward=None,
                             reward_source=None,
@@ -2388,7 +2638,13 @@ def run_parallel_loop(
                     if improved and exp_result.val_bpb is not None:
                         with state_lock:
                             baseline_bpb = exp_result.val_bpb
-                        shutil.copy2(task.train_py_path, BEST_TRAIN_FILE)
+                        with BEST_TRAIN_LOCK:
+                            shutil.copy2(task.train_py_path, BEST_TRAIN_FILE)
+                            _write_best_snapshot_unlocked(
+                                best_candidate_id=task.candidate_id,
+                                best_val_bpb=exp_result.val_bpb,
+                                source="candidate_keep",
+                            )
                         _append_queue_event(
                             "candidate_keep",
                             {
@@ -2440,6 +2696,12 @@ def run_parallel_loop(
                         task.candidate_id,
                         status=final_status,
                         description=task.final_description or task.refine_description,
+                        search_parent_id=task.search_parent_id,
+                        semantic_parent_id=task.semantic_parent_id,
+                        code_parent_id=task.code_parent_id,
+                        code_parent_ref=task.code_parent_ref,
+                        code_parent_hash=task.code_parent_hash,
+                        relation_edges=task.relation_edges or [],
                         reward=round(reward, 6),
                         reward_source=reward_source,
                         parent_val_bpb=(

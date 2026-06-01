@@ -56,6 +56,7 @@ class SearchPlan:
     avoid_direction_keys: list[str]
     priority: float
     search_mode: str = "mechanism_search"
+    search_parent_id: str | None = None
     experiment_brief: str = ""
     expected_mechanism: str = ""
     success_interpretation: str = ""
@@ -121,8 +122,11 @@ def summarize_registry(registry_items: list[dict[str, Any]]) -> dict[str, Any]:
             "blocked_count": 0,
             "active_count": 0,
             "best_val_bpb": None,
+            "best_candidate_id": "",
             "recent_failure_reasons": [],
             "last_candidate_id": "",
+            "last_failed_candidate_id": "",
+            "last_blocked_candidate_id": "",
         }
 
     for item in registry_items:
@@ -137,12 +141,16 @@ def summarize_registry(registry_items: list[dict[str, Any]]) -> dict[str, Any]:
                 "blocked_count": 0,
                 "active_count": 0,
                 "best_val_bpb": None,
+                "best_candidate_id": "",
                 "recent_failure_reasons": [],
                 "last_candidate_id": "",
+                "last_failed_candidate_id": "",
+                "last_blocked_candidate_id": "",
             },
         )
         stats["visits"] += 1
-        stats["last_candidate_id"] = str(item.get("candidate_id") or "")
+        candidate_id = str(item.get("candidate_id") or "")
+        stats["last_candidate_id"] = candidate_id
         status = _status(item)
         if status in active_statuses:
             stats["active_count"] += 1
@@ -150,8 +158,13 @@ def summarize_registry(registry_items: list[dict[str, Any]]) -> dict[str, Any]:
             stats["keep_count"] += 1
         if _is_discard(item):
             stats["discard_count"] += 1
+            stats["last_failed_candidate_id"] = candidate_id
         if status == "blocked_duplicate":
             stats["blocked_count"] += 1
+            stats["last_blocked_candidate_id"] = candidate_id
+            stats["last_failed_candidate_id"] = candidate_id
+        elif status in {"generation_failed", "repair_failed", "aborted"}:
+            stats["last_failed_candidate_id"] = candidate_id
 
         result = _result_dict(item)
         reason = str(
@@ -169,6 +182,7 @@ def summarize_registry(registry_items: list[dict[str, Any]]) -> dict[str, Any]:
             best = stats["best_val_bpb"]
             if best is None or val_bpb < best:
                 stats["best_val_bpb"] = val_bpb
+                stats["best_candidate_id"] = candidate_id
 
     active_directions = [
         k for k, v in by_direction.items() if int(v.get("active_count") or 0) > 0
@@ -196,6 +210,29 @@ def _operator_for_direction(stats: dict[str, Any]) -> str:
     if keep_count > 0:
         return "exploit_best_mechanism"
     return "pivot_near_miss"
+
+
+def _clean_candidate_id(value: Any) -> str | None:
+    text = str(value or "").strip()
+    return text or None
+
+
+def _search_parent_for_operator(operator: str, stats: dict[str, Any]) -> str | None:
+    if operator == "exploit_best_mechanism":
+        return _clean_candidate_id(
+            stats.get("best_candidate_id") or stats.get("last_candidate_id")
+        )
+    if operator == "pivot_near_miss":
+        return _clean_candidate_id(
+            stats.get("last_failed_candidate_id") or stats.get("last_candidate_id")
+        )
+    if operator == "avoid_failed_family":
+        return _clean_candidate_id(
+            stats.get("last_failed_candidate_id")
+            or stats.get("last_blocked_candidate_id")
+            or stats.get("last_candidate_id")
+        )
+    return None
 
 
 def _choose_direction(summary: dict[str, Any]) -> tuple[str, dict[str, Any], float]:
@@ -298,12 +335,20 @@ def select_search_plan(
             "discard_count": 0,
             "blocked_count": 0,
             "active_count": 0,
+            "best_candidate_id": "",
             "recent_failure_reasons": [],
+            "last_candidate_id": "",
+            "last_failed_candidate_id": "",
+            "last_blocked_candidate_id": "",
         }
+
+    search_parent_id = parent_candidate_id or _search_parent_for_operator(
+        operator, stats
+    )
 
     return SearchPlan(
         plan_id=_new_plan_id(candidate_id, operator, direction),
-        parent_candidate_id=parent_candidate_id,
+        parent_candidate_id=search_parent_id,
         parent_ref=parent_ref,
         operator=operator,
         target_direction_key=direction,
@@ -312,6 +357,7 @@ def select_search_plan(
         avoid_direction_keys=sorted(avoid),
         priority=round(priority, 6),
         search_mode=search_mode,
+        search_parent_id=search_parent_id,
         experiment_brief=(
             "Implement one minimal train.py change that follows this plan and "
             "keeps unrelated settings fixed."
@@ -397,10 +443,11 @@ def validate_search_plan(plan: SearchPlan) -> tuple[bool, str]:
 
 def plan_prompt_payload(plan: SearchPlan) -> str:
     payload = {
-        "hard_constraints": {
-            "plan_id": plan.plan_id,
-            "parent_candidate_id": plan.parent_candidate_id,
-            "parent_ref": plan.parent_ref,
+            "hard_constraints": {
+                "plan_id": plan.plan_id,
+                "parent_candidate_id": plan.parent_candidate_id,
+                "search_parent_id": plan.search_parent_id,
+                "parent_ref": plan.parent_ref,
             "operator": plan.operator,
             "target_direction_key": plan.target_direction_key,
             "avoid_direction_keys": plan.avoid_direction_keys,

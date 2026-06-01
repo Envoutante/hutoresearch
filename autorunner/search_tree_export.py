@@ -589,6 +589,8 @@ def _finalize_tree_payload(
     nodes.sort(key=lambda x: (int(x.get("depth") or 0), str(x.get("id") or "")))
 
     edges = []
+    auxiliary_edges = []
+    auxiliary_seen: set[tuple[str, str, str]] = set()
     for node in nodes:
         node_id = str(node.get("id") or "")
         parent_id = node.get("parent_id")
@@ -601,6 +603,31 @@ def _finalize_tree_payload(
                 "target": node_id,
             }
         )
+        for relation in node.get("relation_edges") or []:
+            if not isinstance(relation, dict):
+                continue
+            target = str(relation.get("target") or "").strip()
+            edge_type = str(relation.get("type") or "related").strip() or "related"
+            if (
+                not target
+                or target == node_id
+                or target == parent_id
+                or target not in nodes_by_id
+            ):
+                continue
+            key = (target, node_id, edge_type)
+            if key in auxiliary_seen:
+                continue
+            auxiliary_seen.add(key)
+            auxiliary_edges.append(
+                {
+                    "id": f"aux:{target}->{node_id}:{edge_type}",
+                    "source": target,
+                    "target": node_id,
+                    "type": edge_type,
+                    "source_field": str(relation.get("source") or ""),
+                }
+            )
 
     status_counts: dict[str, int] = {}
     direction_counts: dict[str, int] = {}
@@ -632,11 +659,13 @@ def _finalize_tree_payload(
         "summary": {
             "node_count": len(nodes),
             "edge_count": len(edges),
+            "auxiliary_edge_count": len(auxiliary_edges),
             "status_counts": status_counts,
             "direction_counts": direction_counts,
         },
         "nodes": nodes,
         "edges": edges,
+        "auxiliary_edges": auxiliary_edges,
     }
 
 
@@ -967,7 +996,7 @@ def render_search_tree_html(tree: dict[str, Any]) -> str:
         sx, sy = positions[source]
         tx, ty = positions[target]
         edge_svg.append(
-            f'<path d="M {sx + 62} {sy} C {sx + 150} {sy}, {tx - 150} {ty}, {tx - 62} {ty}" />'
+            f'<path class="main-edge" d="M {sx + 62} {sy} C {sx + 150} {sy}, {tx - 150} {ty}, {tx - 62} {ty}" />'
         )
 
     node_svg: list[str] = []
@@ -987,13 +1016,12 @@ def render_search_tree_html(tree: dict[str, Any]) -> str:
         reward_text = "reward ?" if reward is None else f"reward {float(reward):+.2f}"
         metric_text = "" if val_bpb is None else f"val {float(val_bpb):.4f}"
         tooltip = html.escape(_node_tooltip(node))
-        dash = ' stroke-dasharray="6 5"' if status in {"blocked_duplicate", "queued"} else ""
         node_svg.append(
             "\n".join(
                 [
                     f'<g class="node" transform="translate({x},{y})">',
                     f"<title>{tooltip}</title>",
-                    f'<rect x="-72" y="-42" width="144" height="84" rx="8" fill="{fill}" stroke="{stroke}" stroke-width="3"{dash}/>',
+                    f'<rect x="-72" y="-42" width="144" height="84" rx="8" fill="{fill}" stroke="{stroke}" stroke-width="3"/>',
                     f'<text class="node-title" x="0" y="-17">{label}</text>',
                     f'<text class="node-subtitle" x="0" y="4">{html.escape(status)}</text>',
                     f'<text class="node-small" x="0" y="22">{html.escape(reward_text)}</text>',
@@ -1157,16 +1185,24 @@ def render_search_tree_html(tree: dict[str, Any]) -> str:
       color: #475569;
       font-size: 13px;
     }}
-    .swatch {{
-      display: inline-block;
-      width: 16px;
+	    .swatch {{
+	      display: inline-block;
+	      width: 16px;
       height: 16px;
       border-radius: 4px;
       border: 1px solid #94a3b8;
-      vertical-align: text-bottom;
-      margin-right: 4px;
-    }}
-    .canvas {{
+	      vertical-align: text-bottom;
+	      margin-right: 4px;
+	    }}
+	    .line-sample {{
+	      display: inline-block;
+	      width: 28px;
+	      height: 0;
+	      border-top: 2px solid #94a3b8;
+	      vertical-align: middle;
+	      margin-right: 4px;
+	    }}
+	    .canvas {{
       overflow: auto;
       border: 1px solid #d9e2ec;
       background: #ffffff;
@@ -1177,11 +1213,11 @@ def render_search_tree_html(tree: dict[str, Any]) -> str:
       display: block;
       min-width: 100%;
     }}
-    path {{
-      fill: none;
-      stroke: #94a3b8;
-      stroke-width: 2;
-    }}
+	    path.main-edge {{
+	      fill: none;
+	      stroke: #94a3b8;
+	      stroke-width: 2;
+	    }}
     .node-title {{
       font-size: 14px;
       font-weight: 700;
@@ -1242,10 +1278,10 @@ def render_search_tree_html(tree: dict[str, Any]) -> str:
     <h1>AutoResearch Search Tree</h1>
     <div class="meta">
       {demo_note}
-      <span>generated_at: {html.escape(str(tree.get("generated_at") or ""))}</span>
-      <span>nodes: {html.escape(str(summary.get("node_count") or 0))}</span>
-      <span>edges: {html.escape(str(summary.get("edge_count") or 0))}</span>
-    </div>
+	      <span>generated_at: {html.escape(str(tree.get("generated_at") or ""))}</span>
+	      <span>nodes: {html.escape(str(summary.get("node_count") or 0))}</span>
+	      <span>edges: {html.escape(str(summary.get("edge_count") or 0))}</span>
+	    </div>
 	  </header>
 	  <main>
 	    <div class="tabs" role="tablist" aria-label="Search tree views">
@@ -1257,6 +1293,7 @@ def render_search_tree_html(tree: dict[str, Any]) -> str:
 	        <span><span class="swatch" style="background:#166534"></span>positive reward</span>
 	        <span><span class="swatch" style="background:#991b1b"></span>negative reward</span>
 	        <span><span class="swatch" style="background:#9ca3af"></span>unknown reward</span>
+	        <span><span class="line-sample"></span>search parent</span>
 	        <span>border color indicates status</span>
 	      </div>
 	      <div class="canvas">
