@@ -49,6 +49,12 @@ from autorunner.search_policy import (
     select_search_plan,
     validate_search_plan,
 )
+from autorunner.tuning_policy import (
+    normalize_tuning_plan_with_policy,
+    strip_inline_comment,
+    tuning_value_key,
+    tuning_values_equal,
+)
 
 PROJECT_ROOT = project_root()
 load_dotenv()
@@ -1265,7 +1271,7 @@ def _extract_tunable_controls(
 
 
 def _tuning_plan_value_key(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    return tuning_value_key(value)
 
 
 def _registry_item_is_valid_local_tuning_trial(item: dict[str, Any]) -> bool:
@@ -1328,8 +1334,10 @@ def _tuning_trials_for_parent(parent_candidate_id: str) -> list[dict[str, Any]]:
                 "candidate_id": item.get("candidate_id"),
                 "status": item.get("status"),
                 "control_name": tuning_plan.get("control_name"),
+                "control_index": tuning_plan.get("control_index"),
                 "current_value": tuning_plan.get("current_value"),
                 "selected_value": tuning_plan.get("selected_value"),
+                "selected_leaf_value": tuning_plan.get("selected_leaf_value"),
                 "val_bpb": result.get("val_bpb"),
                 "reward": item.get("reward"),
             }
@@ -1393,39 +1401,56 @@ def _prepare_search_plan_context(
     return search_plan
 
 
-def _finalize_local_param_tune_plan(plan: SearchPlan) -> SearchPlan:
+def _finalize_local_param_tune_plan(
+    plan: SearchPlan,
+    *,
+    code_parent_train_path: Path | None = None,
+) -> SearchPlan:
     if plan.operator != "local_param_tune":
         return plan
 
     tuning_plan = plan.tuning_plan if isinstance(plan.tuning_plan, dict) else {}
-    candidate_values = tuning_plan.get("candidate_values")
-    if not isinstance(candidate_values, list):
-        candidate_values = []
-    candidate_values = candidate_values[:3]
-    if not candidate_values and tuning_plan.get("selected_value") is not None:
-        candidate_values = [tuning_plan.get("selected_value")]
-
     parent_candidate_id = _plan_search_parent_id(plan)
-    control_name = str(tuning_plan.get("control_name") or "").strip()
-    used_values: set[str] = set()
-    if control_name:
-        for trial in _tuning_trials_for_parent(parent_candidate_id):
-            if str(trial.get("control_name") or "") != control_name:
-                continue
-            selected_value = trial.get("selected_value")
-            if selected_value is not None:
-                used_values.add(_tuning_plan_value_key(selected_value))
+    previous_trials = _tuning_trials_for_parent(parent_candidate_id)
+    parent_assignments: dict[str, str] = {}
+    if code_parent_train_path is not None and code_parent_train_path.exists():
+        parent_assignments = _extract_global_upper_assignments(
+            code_parent_train_path.read_text(encoding="utf-8")
+        )
 
-    selected_value = tuning_plan.get("selected_value")
-    if candidate_values:
-        selected_value = candidate_values[0]
-        for value in candidate_values:
-            if _tuning_plan_value_key(value) not in used_values:
-                selected_value = value
-                break
+    if parent_assignments:
+        tuning_plan = normalize_tuning_plan_with_policy(
+            tuning_plan=tuning_plan,
+            parent_assignments=parent_assignments,
+            previous_trials=previous_trials,
+        )
+    else:
+        candidate_values = tuning_plan.get("candidate_values")
+        if not isinstance(candidate_values, list):
+            candidate_values = []
+        candidate_values = candidate_values[:3]
+        if not candidate_values and tuning_plan.get("selected_value") is not None:
+            candidate_values = [tuning_plan.get("selected_value")]
+        used_values: set[str] = set()
+        control_name = str(tuning_plan.get("control_name") or "").strip()
+        if control_name:
+            for trial in previous_trials:
+                if str(trial.get("control_name") or "") != control_name:
+                    continue
+                selected_value = trial.get("selected_value")
+                if selected_value is not None:
+                    used_values.add(_tuning_plan_value_key(selected_value))
 
-    tuning_plan["candidate_values"] = candidate_values
-    tuning_plan["selected_value"] = selected_value
+        selected_value = tuning_plan.get("selected_value")
+        if candidate_values:
+            selected_value = candidate_values[0]
+            for value in candidate_values:
+                if _tuning_plan_value_key(value) not in used_values:
+                    selected_value = value
+                    break
+        tuning_plan["candidate_values"] = candidate_values
+        tuning_plan["selected_value"] = selected_value
+
     plan.tuning_plan = tuning_plan
     return plan
 
@@ -1543,25 +1568,11 @@ def _changed_upper_keys(before: str, after: str) -> list[str]:
 
 
 def _assignment_value_without_comment(value: Any) -> str:
-    return str(value or "").split("#", 1)[0].strip()
+    return strip_inline_comment(value)
 
 
 def _planned_values_match(actual: Any, expected: Any) -> bool:
-    actual_text = _assignment_value_without_comment(actual)
-    expected_text = _assignment_value_without_comment(expected)
-    if actual_text == expected_text:
-        return True
-    try:
-        actual_float = float(actual_text)
-        expected_float = float(expected_text)
-    except (TypeError, ValueError):
-        return False
-    return math.isfinite(actual_float) and math.isfinite(expected_float) and math.isclose(
-        actual_float,
-        expected_float,
-        rel_tol=1e-12,
-        abs_tol=0.0,
-    )
+    return tuning_values_equal(actual, expected)
 
 
 def _mask_single_global_assignment(code: str, control_name: str) -> tuple[str, int]:
@@ -1898,6 +1909,7 @@ def _search_relation_type(operator: str) -> str:
         "exploit_best_mechanism": "exploit_after_same_direction",
         "near_miss_refine": "local_refine_near_miss",
         "local_param_tune": "local_param_tune",
+        "compose_near_miss_with_best": "compose_near_miss_with_best",
         "pivot_near_miss": "pivot_from_same_direction",
         "avoid_failed_family": "avoid_failed_family_from_same_direction",
     }.get(operator, "search_parent")
@@ -2100,8 +2112,14 @@ def _create_candidate(
                 "如果 SEARCH_PLAN.operator 是 local_param_tune，必须只修改 "
                 "SEARCH_PLAN.tuning_plan.control_name 对应的一个控制量，"
                 "并把它从 current_value 改到 selected_value；"
+                "selected_value 是完整赋值文本；如果 tuning_plan.control_index 不为 null，"
+                "也仍然只能改该 assignment 中对应 index 的元素，其它元素必须保持不变；"
                 "candidate_values 中其它值只是备选，本候选只能使用 selected_value。"
                 "不得同时修改第二个控制量或新增无关机制。\n"
+                "如果 SEARCH_PLAN.operator 是 compose_near_miss_with_best，"
+                "当前 train.py 是 current best；search_parent_id 是要合成的 near-miss。"
+                "只能把 SEARCH_PLAN 中描述的 near-miss 核心机制或控制改动移植到当前 best，"
+                "不得自由引入第三种机制。\n"
                 f"{forbidden_training_text}\n"
                 f"{forbidden_git_history_text}"
             ),
@@ -2168,7 +2186,7 @@ def _create_candidate(
                     )
                     summary_fields = _extract_structured_refine_fields(
                         summary_result.content,
-                        fallback=f"candidate {candidate_id}",
+                        f"candidate {candidate_id}",
                     )
                     if summary_result.success and _structured_fields_are_usable(
                         summary_fields
@@ -2269,7 +2287,7 @@ def _create_candidate(
             )
             summary_structured = _extract_structured_refine_fields(
                 summary_result.content,
-                fallback=fallback_desc,
+                fallback_desc,
             )
             if summary_result.success and _structured_fields_are_usable(
                 summary_structured
@@ -2412,6 +2430,22 @@ def _create_candidate(
                 if isinstance(judge_payload, dict)
                 else (judge_result.stderr or "novelty_judge_failed")
             )
+            if (
+                search_plan.operator == "compose_near_miss_with_best"
+                and isinstance(judge_payload, dict)
+            ):
+                search_parent_id = _plan_search_parent_id(search_plan)
+                code_parent_id = str(
+                    code_parent_snapshot.get("best_candidate_id") or ""
+                )
+                if (
+                    search_parent_id
+                    and search_parent_id in nearest
+                    and code_parent_id
+                    and code_parent_id != search_parent_id
+                    and duplicate_level in {"exact", "near", "same_family"}
+                ):
+                    allow_run = True
 
         judge_lineage = _lineage_updates(
             candidate_id=candidate_id,
@@ -3092,6 +3126,29 @@ def run_parallel_loop(
                             search_plan=search_plan,
                             code_parent_train_path=code_parent_train_path,
                         )
+                        search_plan = _finalize_local_param_tune_plan(
+                            search_plan,
+                            code_parent_train_path=code_parent_train_path,
+                        )
+                        ok, reason = validate_search_plan(search_plan)
+                        if not ok:
+                            _update_registry_entry(
+                                candidate_id,
+                                status="generation_failed",
+                                failure_reason=f"invalid_finalized_search_plan:{reason}"[
+                                    :200
+                                ],
+                            )
+                            _append_queue_event(
+                                "candidate_generation_failed",
+                                {
+                                    "candidate_id": candidate_id,
+                                    "reason": f"invalid_finalized_search_plan:{reason}"[
+                                        :200
+                                    ],
+                                },
+                            )
+                            continue
                         search_relation_edges = _build_relation_edges(
                             candidate_id=candidate_id,
                             search_parent_id=search_parent_id,
@@ -3520,9 +3577,13 @@ def run_parallel_loop(
                                 "code_parent_id": task.code_parent_id,
                                 "target_direction_key": task.target_direction_key,
                                 "control_name": tuning_plan.get("control_name"),
+                                "control_index": tuning_plan.get("control_index"),
                                 "current_value": tuning_plan.get("current_value"),
                                 "candidate_values": tuning_plan.get("candidate_values"),
                                 "selected_value": tuning_plan.get("selected_value"),
+                                "selected_leaf_value": tuning_plan.get(
+                                    "selected_leaf_value"
+                                ),
                                 "status": final_status,
                                 "val_bpb": exp_result.val_bpb,
                                 "reward": round(reward, 6),

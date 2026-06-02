@@ -16,12 +16,14 @@ DEFAULT_OPERATORS = (
     "exploit_best_mechanism",
     "near_miss_refine",
     "local_param_tune",
+    "compose_near_miss_with_best",
     "pivot_near_miss",
     "avoid_failed_family",
 )
 NEAR_MISS_ABS_BPB = 0.001
 LOCAL_PARAM_MAX_TRIALS_PER_PARENT = 6
 LOCAL_PARAM_MAX_CONSECUTIVE_NONIMPROVE = 2
+EXPLOIT_AFTER_KEEP_WINDOW = 12
 DEFAULT_DIRECTION_POOL = (
     "architecture.attention",
     "architecture.mlp",
@@ -97,6 +99,14 @@ def _status(item: dict[str, Any]) -> str:
     return str(item.get("status") or "").strip()
 
 
+def _candidate_num(candidate_id: Any) -> int:
+    text = str(candidate_id or "")
+    try:
+        return int(text.split("-")[-1])
+    except (TypeError, ValueError):
+        return 0
+
+
 def _is_valid_local_tuning_trial(item: dict[str, Any]) -> bool:
     if str(item.get("search_operator") or "") != "local_param_tune":
         return False
@@ -167,6 +177,10 @@ def summarize_registry(registry_items: list[dict[str, Any]]) -> dict[str, Any]:
             "near_miss_candidate_id": "",
             "near_miss_val_bpb": None,
             "near_miss_delta_bpb": None,
+            "near_miss_code_parent_id": "",
+            "near_miss_description": "",
+            "near_miss_mechanism": "",
+            "near_miss_changed_upper_keys": [],
             "near_miss_tuning_count": 0,
             "near_miss_tuning_active_count": 0,
             "near_miss_tuning_consecutive_nonimprove": 0,
@@ -192,6 +206,10 @@ def summarize_registry(registry_items: list[dict[str, Any]]) -> dict[str, Any]:
                 "near_miss_candidate_id": "",
                 "near_miss_val_bpb": None,
                 "near_miss_delta_bpb": None,
+                "near_miss_code_parent_id": "",
+                "near_miss_description": "",
+                "near_miss_mechanism": "",
+                "near_miss_changed_upper_keys": [],
                 "near_miss_tuning_count": 0,
                 "near_miss_tuning_active_count": 0,
                 "near_miss_tuning_consecutive_nonimprove": 0,
@@ -267,6 +285,10 @@ def summarize_registry(registry_items: list[dict[str, Any]]) -> dict[str, Any]:
                 "direction_key": direction,
                 "val_bpb": val_bpb,
                 "delta_bpb": delta,
+                "description": item.get("description") or "",
+                "mechanism": item.get("mechanism") or "",
+                "changed_upper_keys": item.get("changed_upper_keys") or [],
+                "code_parent_id": item.get("code_parent_id") or "",
             }
             near_misses.append(near_miss)
             stats = by_direction.setdefault(
@@ -283,6 +305,10 @@ def summarize_registry(registry_items: list[dict[str, Any]]) -> dict[str, Any]:
                     "near_miss_candidate_id": "",
                     "near_miss_val_bpb": None,
                     "near_miss_delta_bpb": None,
+                    "near_miss_code_parent_id": "",
+                    "near_miss_description": "",
+                    "near_miss_mechanism": "",
+                    "near_miss_changed_upper_keys": [],
                     "near_miss_tuning_count": 0,
                     "near_miss_tuning_active_count": 0,
                     "near_miss_tuning_consecutive_nonimprove": 0,
@@ -297,6 +323,12 @@ def summarize_registry(registry_items: list[dict[str, Any]]) -> dict[str, Any]:
                 stats["near_miss_candidate_id"] = candidate_id
                 stats["near_miss_val_bpb"] = val_bpb
                 stats["near_miss_delta_bpb"] = delta
+                stats["near_miss_code_parent_id"] = item.get("code_parent_id") or ""
+                stats["near_miss_description"] = item.get("description") or ""
+                stats["near_miss_mechanism"] = item.get("mechanism") or ""
+                stats["near_miss_changed_upper_keys"] = (
+                    item.get("changed_upper_keys") or []
+                )
 
     near_misses.sort(
         key=lambda x: (
@@ -383,7 +415,7 @@ def _operator_for_direction(stats: dict[str, Any]) -> str:
             and tune_nonimprove < LOCAL_PARAM_MAX_CONSECUTIVE_NONIMPROVE
         ):
             return "local_param_tune"
-        return "near_miss_refine"
+        return "compose_near_miss_with_best"
     if blocked_count >= 2 or discard_count >= 3:
         return "avoid_failed_family"
     if visits == 0:
@@ -411,6 +443,10 @@ def _search_parent_for_operator(operator: str, stats: dict[str, Any]) -> str | N
         return _clean_candidate_id(
             stats.get("near_miss_candidate_id") or stats.get("last_failed_candidate_id")
         )
+    if operator == "compose_near_miss_with_best":
+        return _clean_candidate_id(
+            stats.get("near_miss_candidate_id") or stats.get("last_failed_candidate_id")
+        )
     if operator == "pivot_near_miss":
         return _clean_candidate_id(
             stats.get("last_failed_candidate_id") or stats.get("last_candidate_id")
@@ -432,6 +468,13 @@ def _default_experiment_brief(search_mode: str, operator: str) -> str:
             "values. The code agent must apply only the runner-selected value for "
             "that one control and leave the mechanism family unchanged."
         )
+    if operator == "compose_near_miss_with_best":
+        return (
+            "Start from the current best train.py, not from the near-miss code. "
+            "Apply only the core change described by the near-miss search parent "
+            "to test whether that local idea composes with the current best. Do "
+            "not add a third mechanism or freely redesign the method."
+        )
     if operator == "near_miss_refine" or search_mode == "local_tune_after_mechanism":
         return (
             "Start from the near-miss parent train.py and make exactly one small "
@@ -451,6 +494,11 @@ def _default_expected_mechanism(search_mode: str, operator: str) -> str:
         return (
             "The diff should test whether a better numeric control value can turn "
             "a near-miss mechanism into an improvement without changing the mechanism."
+        )
+    if operator == "compose_near_miss_with_best":
+        return (
+            "The diff should test whether a promising near-miss mechanism or "
+            "control change composes with the current best code parent."
         )
     if operator == "near_miss_refine" or search_mode == "local_tune_after_mechanism":
         return (
@@ -476,6 +524,16 @@ def _choose_direction(summary: dict[str, Any]) -> tuple[str, dict[str, Any], flo
         if isinstance(stats, dict):
             delta = float(near_miss.get("delta_bpb") or 0.0)
             return direction, stats, round(3.0 - delta, 6)
+
+    global_best_id = str(summary.get("global_best_candidate_id") or "")
+    total_items = int(summary.get("total_items") or 0)
+    since_best = total_items - _candidate_num(global_best_id)
+    if global_best_id and 0 <= since_best <= EXPLOIT_AFTER_KEEP_WINDOW:
+        for direction, stats in by_direction.items():
+            if direction in active_directions:
+                continue
+            if str(stats.get("best_candidate_id") or "") == global_best_id:
+                return str(direction), stats, 2.75
 
     scored: list[tuple[float, str, dict[str, Any]]] = []
     for direction, stats in by_direction.items():
@@ -518,6 +576,11 @@ def _default_intent(search_mode: str, operator: str, direction: str) -> str:
             f"Choose one numeric control for the near-miss {direction} candidate "
             "and test a runner-selected candidate value while preserving the "
             "existing mechanism."
+        )
+    if operator == "compose_near_miss_with_best":
+        return (
+            f"Compose the near-miss {direction} change into the current best code "
+            "with one minimal transplant of the near-miss mechanism or control."
         )
     if operator == "pivot_near_miss":
         return (
@@ -572,6 +635,8 @@ def select_search_plan(
     search_mode = "control_tune" if operator == "control_tune" else "mechanism_search"
     if operator in {"near_miss_refine", "local_param_tune"}:
         search_mode = "local_tune_after_mechanism"
+    elif operator == "compose_near_miss_with_best":
+        search_mode = "compose_with_best"
     elif operator == "avoid_failed_family":
         search_mode = "pivot_after_failure"
     elif operator == "pivot_near_miss":
@@ -592,6 +657,10 @@ def select_search_plan(
             "near_miss_candidate_id": "",
             "near_miss_val_bpb": None,
             "near_miss_delta_bpb": None,
+            "near_miss_code_parent_id": "",
+            "near_miss_description": "",
+            "near_miss_mechanism": "",
+            "near_miss_changed_upper_keys": [],
             "near_miss_tuning_count": 0,
             "near_miss_tuning_active_count": 0,
             "near_miss_tuning_consecutive_nonimprove": 0,
@@ -605,6 +674,21 @@ def select_search_plan(
         operator, stats
     )
 
+    experiment_brief = _default_experiment_brief(search_mode, operator)
+    expected_mechanism = _default_expected_mechanism(search_mode, operator)
+    if operator == "compose_near_miss_with_best":
+        experiment_brief += (
+            "\nNear-miss source details:"
+            f"\n- candidate_id: {stats.get('near_miss_candidate_id') or ''}"
+            f"\n- code_parent_id: {stats.get('near_miss_code_parent_id') or ''}"
+            f"\n- description: {stats.get('near_miss_description') or ''}"
+            f"\n- mechanism: {stats.get('near_miss_mechanism') or ''}"
+            f"\n- changed_upper_keys: {stats.get('near_miss_changed_upper_keys') or []}"
+        )
+        expected_mechanism += (
+            " It should isolate that near-miss change on top of the current best."
+        )
+
     return SearchPlan(
         plan_id=_new_plan_id(candidate_id, operator, direction),
         parent_candidate_id=search_parent_id,
@@ -617,8 +701,8 @@ def select_search_plan(
         priority=round(priority, 6),
         search_mode=search_mode,
         search_parent_id=search_parent_id,
-        experiment_brief=_default_experiment_brief(search_mode, operator),
-        expected_mechanism=_default_expected_mechanism(search_mode, operator),
+        experiment_brief=experiment_brief,
+        expected_mechanism=expected_mechanism,
         success_interpretation="Lower val_bpb supports the selected mechanism under this parent.",
         failure_interpretation="No improvement suggests pivoting or rejecting this mechanism family.",
         stats={
@@ -654,6 +738,11 @@ def complete_plan_from_payload(plan: SearchPlan, payload: dict[str, Any] | None)
 
 def _normalize_tuning_plan(value: dict[str, Any]) -> dict[str, Any]:
     control_name = str(value.get("control_name") or "").strip()[:160]
+    control_index_raw = value.get("control_index")
+    try:
+        control_index = int(control_index_raw)
+    except (TypeError, ValueError):
+        control_index = None
     candidate_values_raw = value.get("candidate_values")
     if not isinstance(candidate_values_raw, list):
         candidate_values_raw = []
@@ -680,9 +769,11 @@ def _normalize_tuning_plan(value: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "control_name": control_name,
+        "control_index": control_index,
         "current_value": value.get("current_value"),
         "candidate_values": candidate_values,
         "selected_value": selected_value,
+        "selected_leaf_value": value.get("selected_leaf_value"),
         "rationale": str(value.get("rationale") or "").strip()[:1000],
         "expected_direction": str(value.get("expected_direction") or "").strip()[:1000],
         "stop_condition": str(value.get("stop_condition") or "").strip()[:1000],

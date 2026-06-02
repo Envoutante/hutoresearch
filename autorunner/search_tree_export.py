@@ -30,6 +30,7 @@ SEARCH_MODE_LABELS_ZH = {
     "mechanism_search": "机制搜索",
     "control_tune": "控制调参",
     "local_tune_after_mechanism": "近失点局部微调",
+    "compose_with_best": "与当前最优合成",
     "pivot_after_failure": "失败后转向",
     "verify_winner": "优胜复验",
 }
@@ -40,6 +41,7 @@ OPERATOR_LABELS_ZH = {
     "exploit_best_mechanism": "强化有效机制",
     "near_miss_refine": "近失点微调",
     "local_param_tune": "局部参数搜索",
+    "compose_near_miss_with_best": "近失点合成到最优",
     "pivot_near_miss": "近似失败转向",
     "avoid_failed_family": "避开失败族",
     "control_tune": "控制调参",
