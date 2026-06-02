@@ -267,6 +267,55 @@ def _send_qq_alert_email(subject: str, body: str) -> tuple[bool, str]:
     return True, "sent"
 
 
+def _send_runner_completion_email(
+    *,
+    completed_runs: int,
+    max_total_runs: int,
+    baseline_bpb: float,
+    start_ts: float,
+) -> str:
+    elapsed_s = int(max(0, time.time() - start_ts))
+    best_text = str(baseline_bpb if baseline_bpb != float("inf") else "inf")
+    subject = "[AutoResearch] 实验正常完成"
+    body = (
+        f"time: {_now_iso()}\n"
+        f"model: {MODEL}\n"
+        f"backend: {AGENT_BACKEND}\n"
+        f"completed_runs: {completed_runs}/{max_total_runs}\n"
+        f"best_val_bpb: {best_text}\n"
+        f"elapsed_sec: {elapsed_s}\n"
+        f"workdir: {WORKDIR}\n"
+        f"results_tsv: {_relative_path_text(RESULTS_TSV_FILE)}\n"
+        f"search_tree_html: {_relative_path_text(ARTIFACTS_DIR / 'tree' / 'search_tree.html')}\n"
+    )
+    sent, msg = _send_qq_alert_email(subject, body)
+    result = f"{'sent' if sent else 'failed'}: {msg}"[:300]
+    _append_queue_event(
+        "completion_alert_email",
+        {
+            "sent": sent,
+            "message": msg[:200],
+            "completed_runs": completed_runs,
+            "max_total_runs": max_total_runs,
+            "best_val_bpb": None if baseline_bpb == float("inf") else baseline_bpb,
+            "elapsed_sec": elapsed_s,
+        },
+    )
+    payload = {
+        "ts": _now_iso(),
+        "completed_runs": completed_runs,
+        "max_total_runs": max_total_runs,
+        "best_val_bpb": None if baseline_bpb == float("inf") else baseline_bpb,
+        "elapsed_sec": elapsed_s,
+        "alert": result,
+    }
+    (ALERTS_DIR / "completion.json").write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return result
+
+
 def _now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
 
@@ -3537,6 +3586,14 @@ def run_parallel_loop(
             "[runner] fatal abort triggered "
             f"reason={fatal_error_message} alert={fatal_alert_result}"
         )
+    else:
+        completion_alert_result = _send_runner_completion_email(
+            completed_runs=completed_runs,
+            max_total_runs=max_total_runs,
+            baseline_bpb=baseline_bpb,
+            start_ts=start_ts,
+        )
+        console.print(f"[runner] completion alert {completion_alert_result}")
 
 
 if __name__ == "__main__":
