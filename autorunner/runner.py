@@ -125,6 +125,53 @@ class FatalModelAPIError(RuntimeError):
     """模型 API 出现致命错误时，用于触发全局熔断。"""
 
 
+_NON_ERROR_NUMERIC_FIELD_RE = re.compile(
+    r"""
+    (?ix)
+    (?:
+        \b(?:tokens?_in|tokens?_out|input_tokens|output_tokens|cached_tokens|
+            total_tokens|prompt_tokens|completion_tokens|output_chars|input_chars|
+            elapsed(?:_ms)?|duration_ms|remaining|exit_code|pid|attempt|mfu)\b
+        |tok/sec
+    )
+    \s*[:=]\s*
+    ["']?[-+]?\d[\d,]*(?:\.\d+)?(?:ms|s|%)?["']?
+    """
+)
+
+
+_FATAL_MODEL_STATUS_RE = re.compile(
+    r"""
+    (?ix)
+    (
+        \b(?:http(?:\.response)?\.status(?:_code)?|http[_\s-]?status(?:[_\s-]?code)?|
+            status[_\s-]?code|response[_\s-]?status|error[_\s-]?code)\b
+        \s*[:=]\s*["']?(?:4\d{2}|5\d{2})\b
+    )
+    |
+    (
+        \bhttp/\d(?:\.\d)?\s+(?:4\d{2}|5\d{2})\b
+    )
+    |
+    (
+        \b(?:4\d{2}|5\d{2})\b
+        \s+
+        (?:bad\s+request|unauthorized|forbidden|not\s+found|too\s+many\s+requests|
+            internal\s+server\s+error|bad\s+gateway|service\s+unavailable|
+            gateway\s+timeout)
+    )
+    |
+    (
+        \b(?:api|openai|anthropic|codex|responses|request|response|server)\b
+        .*
+        \b(?:status|http|error)\b
+        .*
+        \b(?:4\d{2}|5\d{2})\b
+    )
+    """
+)
+
+
 def _has_fatal_model_error(*texts: str) -> bool:
     merged = "\n".join(str(x or "") for x in texts if x).strip()
     if not merged:
@@ -132,9 +179,25 @@ def _has_fatal_model_error(*texts: str) -> bool:
 
     lower = merged.lower()
     for line in lower.splitlines():
-        if "status" not in line and "http" not in line and "error" not in line:
+        line = _NON_ERROR_NUMERIC_FIELD_RE.sub("", line)
+        if not any(
+            marker in line
+            for marker in (
+                "status",
+                "http",
+                "error",
+                "api",
+                "openai",
+                "anthropic",
+                "codex",
+                "responses",
+                "request",
+                "response",
+                "server",
+            )
+        ):
             continue
-        if re.search(r"\b(?:4\d{2}|5\d{2})\b", line):
+        if _FATAL_MODEL_STATUS_RE.search(line):
             return True
     return False
 
