@@ -97,6 +97,41 @@ def _status(item: dict[str, Any]) -> str:
     return str(item.get("status") or "").strip()
 
 
+def _is_valid_local_tuning_trial(item: dict[str, Any]) -> bool:
+    if str(item.get("search_operator") or "") != "local_param_tune":
+        return False
+    if _status(item) in {"aborted", "blocked_duplicate", "generation_failed"}:
+        return False
+
+    tuning_plan = item.get("tuning_plan")
+    if not isinstance(tuning_plan, dict):
+        tuning_plan = {}
+    control_name = str(tuning_plan.get("control_name") or "").strip()
+    if not control_name:
+        return False
+
+    guard = item.get("tuning_guard")
+    if isinstance(guard, dict):
+        return bool(guard.get("allow_run")) and not list(guard.get("violations") or [])
+
+    changed_keys = [
+        str(x).strip()
+        for x in item.get("changed_upper_keys") or []
+        if str(x).strip()
+    ]
+    if changed_keys:
+        return set(changed_keys) == {control_name}
+
+    judge = item.get("novelty_judge")
+    if isinstance(judge, dict):
+        if judge.get("mechanism_changed") is True:
+            return False
+        if judge.get("is_pure_tuning") is False:
+            return False
+
+    return tuning_plan.get("selected_value") is not None
+
+
 def _direction(item: dict[str, Any]) -> str:
     return str(
         item.get("target_direction_key")
@@ -283,7 +318,7 @@ def summarize_registry(registry_items: list[dict[str, Any]]) -> dict[str, Any]:
         tune_items = [
             item
             for item in registry_items
-            if str(item.get("search_operator") or "") == "local_param_tune"
+            if _is_valid_local_tuning_trial(item)
             and str(item.get("search_parent_id") or item.get("parent_candidate_id") or "")
             == near_miss_id
         ]

@@ -113,6 +113,7 @@ class CandidateTask:
     rationale: str = ""
     avoid_direction_keys: list[str] | None = None
     tuning_plan: dict[str, Any] | None = None
+    tuning_guard: dict[str, Any] | None = None
 
 
 @dataclass
@@ -1218,14 +1219,54 @@ def _tuning_plan_value_key(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
 
 
+def _registry_item_is_valid_local_tuning_trial(item: dict[str, Any]) -> bool:
+    if str(item.get("search_operator") or "") != "local_param_tune":
+        return False
+    status = str(item.get("status") or "").strip()
+    if status in {"aborted", "blocked_duplicate", "generation_failed"}:
+        return False
+
+    tuning_plan = item.get("tuning_plan")
+    if not isinstance(tuning_plan, dict):
+        tuning_plan = {}
+    control_name = str(tuning_plan.get("control_name") or "").strip()
+    if not control_name:
+        return False
+
+    guard = item.get("tuning_guard")
+    if isinstance(guard, dict):
+        return bool(guard.get("allow_run")) and not list(guard.get("violations") or [])
+
+    changed_keys = [
+        str(x).strip()
+        for x in item.get("changed_upper_keys") or []
+        if str(x).strip()
+    ]
+    if changed_keys:
+        return set(changed_keys) == {control_name}
+
+    judge = item.get("novelty_judge")
+    if isinstance(judge, dict):
+        if judge.get("mechanism_changed") is True:
+            return False
+        if judge.get("is_pure_tuning") is False:
+            return False
+
+    return bool(tuning_plan.get("selected_value") is not None)
+
+
 def _tuning_trials_for_parent(parent_candidate_id: str) -> list[dict[str, Any]]:
     parent_candidate_id = str(parent_candidate_id or "").strip()
     if not parent_candidate_id:
         return []
 
     trials: list[dict[str, Any]] = []
-    for item in _load_experiment_registry():
-        if str(item.get("search_operator") or "") != "local_param_tune":
+    registry_items = _load_experiment_registry()
+    registry_by_id = {
+        str(item.get("candidate_id") or ""): item for item in registry_items
+    }
+    for item in registry_items:
+        if not _registry_item_is_valid_local_tuning_trial(item):
             continue
         if str(item.get("search_parent_id") or "") != parent_candidate_id:
             continue
@@ -1249,6 +1290,11 @@ def _tuning_trials_for_parent(parent_candidate_id: str) -> list[dict[str, Any]]:
     for item in _load_tuning_memory():
         cid = str(item.get("candidate_id") or "")
         if cid in seen:
+            continue
+        registry_item = registry_by_id.get(cid)
+        if registry_item is not None and not _registry_item_is_valid_local_tuning_trial(
+            registry_item
+        ):
             continue
         if str(item.get("parent_candidate_id") or "") != parent_candidate_id:
             continue
@@ -1445,6 +1491,186 @@ def _changed_upper_keys(before: str, after: str) -> list[str]:
         if b.get(key) != a.get(key):
             keys.append(key)
     return keys
+
+
+def _assignment_value_without_comment(value: Any) -> str:
+    return str(value or "").split("#", 1)[0].strip()
+
+
+def _planned_values_match(actual: Any, expected: Any) -> bool:
+    actual_text = _assignment_value_without_comment(actual)
+    expected_text = _assignment_value_without_comment(expected)
+    if actual_text == expected_text:
+        return True
+    try:
+        actual_float = float(actual_text)
+        expected_float = float(expected_text)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(actual_float) and math.isfinite(expected_float) and math.isclose(
+        actual_float,
+        expected_float,
+        rel_tol=1e-12,
+        abs_tol=0.0,
+    )
+
+
+def _mask_single_global_assignment(code: str, control_name: str) -> tuple[str, int]:
+    pattern = re.compile(rf"^\s*{re.escape(control_name)}\s*=")
+    masked: list[str] = []
+    count = 0
+    for raw_line in code.splitlines():
+        if pattern.match(raw_line):
+            count += 1
+            masked.append(f"{control_name} = <LOCAL_PARAM_TUNE_VALUE>")
+        else:
+            masked.append(raw_line.rstrip())
+    return "\n".join(masked).strip(), count
+
+
+def _local_tuning_value_duplicate(
+    *,
+    parent_candidate_id: str,
+    control_name: str,
+    selected_value: Any,
+    exclude_candidate_id: str,
+) -> str:
+    selected_key = _tuning_plan_value_key(selected_value)
+    for trial in _tuning_trials_for_parent(parent_candidate_id):
+        candidate_id = str(trial.get("candidate_id") or "")
+        if candidate_id == exclude_candidate_id:
+            continue
+        if str(trial.get("control_name") or "") != control_name:
+            continue
+        if _tuning_plan_value_key(trial.get("selected_value")) == selected_key:
+            return candidate_id
+    return ""
+
+
+def _validate_local_param_tune_candidate(
+    *,
+    candidate_id: str,
+    search_plan: SearchPlan,
+    base_code: str,
+    new_code: str,
+    changed_upper_keys: list[str],
+) -> dict[str, Any]:
+    tuning_plan = search_plan.tuning_plan if isinstance(search_plan.tuning_plan, dict) else {}
+    parent_candidate_id = _plan_search_parent_id(search_plan)
+    control_name = str(tuning_plan.get("control_name") or "").strip()
+    current_value = tuning_plan.get("current_value")
+    selected_value = tuning_plan.get("selected_value")
+
+    violations: list[str] = []
+    before_assignments = _extract_global_upper_assignments(base_code)
+    after_assignments = _extract_global_upper_assignments(new_code)
+    before_value = before_assignments.get(control_name) if control_name else None
+    after_value = after_assignments.get(control_name) if control_name else None
+
+    if not control_name:
+        violations.append("missing_tuning_control_name")
+    if selected_value is None:
+        violations.append("missing_selected_value")
+    if control_name and before_value is None:
+        violations.append("control_missing_in_parent_code")
+    if control_name and after_value is None:
+        violations.append("control_missing_in_candidate_code")
+    if before_value is not None and current_value is not None and not _planned_values_match(
+        before_value,
+        current_value,
+    ):
+        violations.append("parent_current_value_mismatch")
+    if after_value is not None and selected_value is not None and not _planned_values_match(
+        after_value,
+        selected_value,
+    ):
+        violations.append("candidate_selected_value_mismatch")
+
+    expected_changed_keys = [control_name] if control_name else []
+    if set(changed_upper_keys) != set(expected_changed_keys):
+        violations.append("changed_upper_keys_not_exactly_tuning_control")
+
+    masked_before, before_count = _mask_single_global_assignment(base_code, control_name)
+    masked_after, after_count = _mask_single_global_assignment(new_code, control_name)
+    if control_name and (before_count != 1 or after_count != 1):
+        violations.append("control_assignment_count_not_one")
+    only_planned_assignment_changed = (
+        control_name
+        and before_count == 1
+        and after_count == 1
+        and masked_before == masked_after
+    )
+    if not only_planned_assignment_changed:
+        violations.append("non_tuning_code_changed")
+
+    duplicate_candidate_id = ""
+    if control_name and selected_value is not None:
+        duplicate_candidate_id = _local_tuning_value_duplicate(
+            parent_candidate_id=parent_candidate_id,
+            control_name=control_name,
+            selected_value=selected_value,
+            exclude_candidate_id=candidate_id,
+        )
+        if duplicate_candidate_id:
+            violations.append("selected_value_already_tried_for_parent")
+
+    seen: set[str] = set()
+    unique_violations: list[str] = []
+    for violation in violations:
+        if violation in seen:
+            continue
+        seen.add(violation)
+        unique_violations.append(violation)
+
+    allow_run = not unique_violations
+    reason = (
+        "local_param_tune guard passed"
+        if allow_run
+        else "local_param_tune guard rejected: " + ", ".join(unique_violations)
+    )
+    return {
+        "guard_type": "local_param_tune",
+        "allow_run": allow_run,
+        "status": "pass" if allow_run else "fail",
+        "reason": reason,
+        "violations": unique_violations,
+        "parent_candidate_id": parent_candidate_id,
+        "control_name": control_name,
+        "current_value": current_value,
+        "selected_value": selected_value,
+        "actual_parent_value": _assignment_value_without_comment(before_value),
+        "actual_candidate_value": _assignment_value_without_comment(after_value),
+        "changed_upper_keys": changed_upper_keys,
+        "expected_changed_upper_keys": expected_changed_keys,
+        "duplicate_candidate_id": duplicate_candidate_id,
+        "is_duplicate_value": bool(duplicate_candidate_id),
+        "is_pure_tuning": bool(
+            only_planned_assignment_changed
+            and not any(
+                v
+                in unique_violations
+                for v in {
+                    "candidate_selected_value_mismatch",
+                    "changed_upper_keys_not_exactly_tuning_control",
+                }
+            )
+        ),
+        "mechanism_changed": not bool(only_planned_assignment_changed),
+        "innovation_type": "local_param_tune",
+    }
+
+
+def _local_param_tune_retry_guidance(guard_payload: dict[str, Any]) -> str:
+    control_name = str(guard_payload.get("control_name") or "the planned control")
+    selected_value = str(guard_payload.get("selected_value") or "selected_value")
+    reason = str(guard_payload.get("reason") or "local_param_tune guard rejected")
+    return (
+        "\n上一轮候选违反 local_param_tune 约束，不能 pivot 到新机制。"
+        f"原因：{reason}。"
+        f"本轮只能修改 {control_name} 这一处控制量，并且必须改为 {selected_value}。"
+        "不得新增 loss、模块、控制量、optimizer/data/stability 逻辑，"
+        "不得修改除该赋值行以外的任何代码。\n"
+    )
 
 
 def _normalize_text(s: str) -> str:
@@ -2061,56 +2287,83 @@ def _create_candidate(
         proposal_updates.pop("candidate_id", None)
         _update_registry_entry(candidate_id, **proposal_updates)
 
-        judge_context = _select_judge_context(
-            candidate=proposal,
-            registry_items=_load_experiment_registry(),
-        )
-        judge_result = agent.judge_novelty(
-            candidate=proposal,
-            registry_context=judge_context,
-            diff_summary=diff_summary,
-            workdir=candidate_dir,
-        )
-        _raise_if_fatal_model_error(judge_result.stderr, judge_result.content)
-        (candidate_dir / f"llm_novelty_judge_attempt_{attempt}.log").write_text(
-            judge_result.content or ""
-        )
-
-        judge_payload = _parse_json_object(judge_result.content)
+        judge_payload: dict[str, Any] | None = None
+        tuning_guard_payload: dict[str, Any] | None = None
+        nearest: list[str] = []
         allow_run = False
-        if judge_result.success and judge_payload is not None:
-            allow_run = bool(judge_payload.get("allow_run"))
-            if (
-                search_plan.search_mode == "mechanism_search"
-                and (
-                    bool(judge_payload.get("is_pure_tuning"))
-                    or judge_payload.get("mechanism_changed") is not True
-                )
-            ):
-                allow_run = False
-        duplicate_level = (
-            str(judge_payload.get("duplicate_level") or "judge_failed")
-            if judge_payload
-            else "judge_failed"
-        )
+
         if search_plan.operator == "local_param_tune":
-            if duplicate_level == "exact":
-                allow_run = False
-        elif search_plan.search_mode == "local_tune_after_mechanism" and isinstance(
-            judge_payload, dict
-        ):
-            if bool(judge_payload.get("is_duplicate")):
-                allow_run = False
-        nearest = (
-            _normalized_candidate_ids(judge_payload.get("nearest_candidate_ids"))
-            if isinstance(judge_payload, dict)
-            else []
-        )
-        reason = (
-            str(judge_payload.get("reason") or "")
-            if isinstance(judge_payload, dict)
-            else (judge_result.stderr or "novelty_judge_failed")
-        )
+            tuning_guard_payload = _validate_local_param_tune_candidate(
+                candidate_id=candidate_id,
+                search_plan=search_plan,
+                base_code=base_code,
+                new_code=new_code,
+                changed_upper_keys=changed_keys,
+            )
+            (candidate_dir / f"tuning_guard_attempt_{attempt}.log").write_text(
+                json.dumps(
+                    tuning_guard_payload,
+                    ensure_ascii=False,
+                    indent=2,
+                    default=_json_default,
+                )
+            )
+            allow_run = bool(tuning_guard_payload.get("allow_run"))
+            duplicate_level = (
+                "local_tune_value_duplicate"
+                if tuning_guard_payload.get("is_duplicate_value")
+                else "local_param_tune"
+            )
+            reason = str(tuning_guard_payload.get("reason") or "")
+        else:
+            judge_context = _select_judge_context(
+                candidate=proposal,
+                registry_items=_load_experiment_registry(),
+            )
+            judge_result = agent.judge_novelty(
+                candidate=proposal,
+                registry_context=judge_context,
+                diff_summary=diff_summary,
+                workdir=candidate_dir,
+            )
+            _raise_if_fatal_model_error(judge_result.stderr, judge_result.content)
+            (candidate_dir / f"llm_novelty_judge_attempt_{attempt}.log").write_text(
+                judge_result.content or ""
+            )
+
+            judge_payload = _parse_json_object(judge_result.content)
+            if judge_result.success and judge_payload is not None:
+                allow_run = bool(judge_payload.get("allow_run"))
+                if (
+                    search_plan.search_mode == "mechanism_search"
+                    and (
+                        bool(judge_payload.get("is_pure_tuning"))
+                        or judge_payload.get("mechanism_changed") is not True
+                    )
+                ):
+                    allow_run = False
+            duplicate_level = (
+                str(judge_payload.get("duplicate_level") or "judge_failed")
+                if judge_payload
+                else "judge_failed"
+            )
+            if search_plan.search_mode == "local_tune_after_mechanism" and isinstance(
+                judge_payload,
+                dict,
+            ):
+                if bool(judge_payload.get("is_duplicate")):
+                    allow_run = False
+            nearest = (
+                _normalized_candidate_ids(judge_payload.get("nearest_candidate_ids"))
+                if isinstance(judge_payload, dict)
+                else []
+            )
+            reason = (
+                str(judge_payload.get("reason") or "")
+                if isinstance(judge_payload, dict)
+                else (judge_result.stderr or "novelty_judge_failed")
+            )
+
         judge_lineage = _lineage_updates(
             candidate_id=candidate_id,
             search_plan=search_plan,
@@ -2149,10 +2402,12 @@ def _create_candidate(
                 rationale=search_plan.rationale,
                 avoid_direction_keys=list(search_plan.avoid_direction_keys),
                 tuning_plan=dict(search_plan.tuning_plan or {}),
+                tuning_guard=tuning_guard_payload,
             )
 
             meta_payload = asdict(task)
             meta_payload["novelty_judge"] = judge_payload
+            meta_payload["tuning_guard"] = tuning_guard_payload
             meta_payload["search_plan"] = search_plan.to_dict()
             (candidate_dir / "meta.json").write_text(
                 json.dumps(meta_payload, indent=2, ensure_ascii=False, default=str)
@@ -2162,6 +2417,7 @@ def _create_candidate(
                 candidate_id,
                 status="queued",
                 novelty_judge=judge_payload,
+                tuning_guard=tuning_guard_payload,
                 **judge_lineage,
                 failure_reason=None,
                 reward=None,
@@ -2182,9 +2438,50 @@ def _create_candidate(
                     "changed_upper_keys": changed_keys,
                     "novelty_level": duplicate_level,
                     "tuning_plan": search_plan.tuning_plan,
+                    "tuning_guard": tuning_guard_payload,
                 },
             )
             return task
+
+        if search_plan.operator == "local_param_tune":
+            failed_status = (
+                "blocked_duplicate"
+                if tuning_guard_payload
+                and tuning_guard_payload.get("is_duplicate_value")
+                else "generation_failed"
+            )
+            _update_registry_entry(
+                candidate_id,
+                status=failed_status,
+                **judge_lineage,
+                novelty_judge=None,
+                tuning_guard=tuning_guard_payload,
+                failure_reason=reason[:200],
+            )
+            _refresh_generator_guidance()
+            _append_queue_event(
+                "candidate_tuning_guard_rejected",
+                {
+                    "candidate_id": candidate_id,
+                    "attempt": attempt,
+                    "status": failed_status,
+                    "reason": reason[:300],
+                    "violations": (
+                        list(tuning_guard_payload.get("violations") or [])
+                        if isinstance(tuning_guard_payload, dict)
+                        else []
+                    ),
+                },
+            )
+            if (
+                attempt > max_duplicate_retries
+                or failed_status == "blocked_duplicate"
+            ):
+                return None
+            pivot_guidance = _local_param_tune_retry_guidance(
+                tuning_guard_payload or {}
+            )
+            continue
 
         _update_registry_entry(
             candidate_id,
@@ -3160,7 +3457,12 @@ def run_parallel_loop(
                             "discard_reason": discard_reason,
                         },
                     )
-                    if task.search_operator == "local_param_tune":
+                    tuning_guard = task.tuning_guard or {}
+                    if (
+                        task.search_operator == "local_param_tune"
+                        and bool(tuning_guard.get("allow_run"))
+                        and not list(tuning_guard.get("violations") or [])
+                    ):
                         tuning_plan = task.tuning_plan or {}
                         _append_tuning_memory(
                             {
@@ -3176,6 +3478,7 @@ def run_parallel_loop(
                                 "val_bpb": exp_result.val_bpb,
                                 "reward": round(reward, 6),
                                 "reward_source": reward_source,
+                                "tuning_guard_status": tuning_guard.get("status"),
                             }
                         )
                     _refresh_generator_guidance()
